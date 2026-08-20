@@ -1,0 +1,35 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17
+        with:
+          toolchain: nightly
+          targets: x86_64-pc-windows-msvc
+
+      - uses: swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: combined-windows-x64-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run tests
+        shell: pwsh
+        run: cargo test --workspace --lib --bins --tests
+
+      - name: Build release executables
+        shell: pwsh
+        env:
+          VERSION_NUMBER: 0.0.0-source
+        run: cargo build --locked --release --workspace

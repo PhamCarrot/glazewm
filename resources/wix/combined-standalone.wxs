@@ -1,0 +1,122 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="GlazeWM Combined"
+    Version="$(var.VERSION_NUMBER)"
+    UpgradeCode="7951FE35-84CC-4402-9005-B18969F795AA"
+    Manufacturer="Personal GlazeWM Build"
+    Language="1033"
+    Scope="perMachine"
+  >
+    <Property Id="REINSTALLMODE" Value="amus" />
+    <MajorUpgrade Schedule="afterInstallInitialize" AllowDowngrades="yes" />
+
+    <Icon Id="Combined_Icon" SourceFile="resources/assets/icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="Combined_Icon" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <UIRef Id="Custom_UI" />
+
+    <Property Id="ENABLE_DESKTOP_SHORTCUT" Secure="yes" />
+    <Property Id="ENABLE_START_MENU_SHORTCUT" Value="1" Secure="yes" />
+
+    <Feature Id="Combined_ProductFeature">
+      <ComponentRef Id="Combined_CreateInstallDir" />
+      <ComponentRef Id="Combined_InstallRootFiles" />
+      <ComponentRef Id="Combined_InstallCliFiles" />
+      <ComponentRef Id="Combined_AddDesktopShortcut" />
+      <ComponentRef Id="Combined_AddStartMenuShortcut" />
+      <ComponentRef Id="Combined_AddPathEnv" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="Combined_OrgDir" Name="Personal GlazeWM Build">
+        <Directory Id="INSTALLFOLDER" Name="GlazeWM Combined">
+          <Component Id="Combined_CreateInstallDir" Guid="*">
+            <RegistryValue
+              Root="HKLM"
+              Key="SOFTWARE\Personal GlazeWM Build\GlazeWM Combined"
+              Name="InstallDir"
+              Value="[INSTALLFOLDER]"
+              Type="string"
+              KeyPath="yes"
+            />
+          </Component>
+
+          <Component Id="Combined_InstallRootFiles" Guid="5F9388D1-56BA-4B46-9F2C-893674569BDC">
+            <File Id="Combined_RootExe" Source="$(var.EXE_DIR)/glazewm.exe" KeyPath="yes" />
+            <File Id="Combined_RootWatcherExe" Source="$(var.EXE_DIR)/glazewm-watcher.exe" />
+          </Component>
+
+          <Directory Id="Combined_CliDir" Name="cli">
+            <Component Id="Combined_InstallCliFiles" Guid="*">
+              <File
+                Id="Combined_CliExe"
+                Source="$(var.EXE_DIR)/glazewm-cli.exe"
+                Name="glazewm.exe"
+                KeyPath="yes"
+              />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="Combined_AddDesktopShortcut" Guid="*" Condition="ENABLE_DESKTOP_SHORTCUT = 1">
+        <Shortcut
+          Id="Combined_DesktopShortcut"
+          Name="GlazeWM Combined"
+          Description="Launch the personal GlazeWM combined build"
+          Target="[INSTALLFOLDER]glazewm.exe"
+        />
+        <RegistryValue
+          Root="HKLM"
+          Key="SOFTWARE\Personal GlazeWM Build\GlazeWM Combined"
+          Name="DesktopShortcutInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes"
+        />
+      </Component>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="Combined_AddStartMenuShortcut" Guid="*" Condition="ENABLE_START_MENU_SHORTCUT = 1">
+        <Shortcut
+          Id="Combined_StartMenuShortcut"
+          Name="GlazeWM Combined"
+          Description="Launch the personal GlazeWM combined build"
+          Target="[INSTALLFOLDER]glazewm.exe"
+        />
+        <RegistryValue
+          Root="HKLM"
+          Key="SOFTWARE\Personal GlazeWM Build\GlazeWM Combined"
+          Name="StartMenuShortcutInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes"
+        />
+      </Component>
+    </StandardDirectory>
+
+    <Component Id="Combined_AddPathEnv" Guid="*">
+      <Environment
+        Id="Combined_PathEnv"
+        Value="[INSTALLFOLDER]cli"
+        Name="PATH"
+        Permanent="no"
+        Part="first"
+        Action="set"
+        System="yes"
+      />
+      <RegistryValue
+        Root="HKLM"
+        Key="SOFTWARE\Personal GlazeWM Build\GlazeWM Combined"
+        Name="PathInstalled"
+        Type="integer"
+        Value="1"
+        KeyPath="yes"
+      />
+    </Component>
+  </Package>
+</Wix>
