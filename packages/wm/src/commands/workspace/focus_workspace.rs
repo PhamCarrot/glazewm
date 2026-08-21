@@ -1,7 +1,7 @@
 use anyhow::Context;
 use tracing::info;
 
-use wm_common::{WindowState, WorkspaceSwitchIrisOrigin};
+use wm_common::{WindowState, WmEvent, WorkspaceSwitchIrisOrigin};
 
 use super::activate_workspace;
 use crate::{
@@ -67,6 +67,11 @@ pub fn focus_workspace(
 
     set_focused_descendant(&container_to_focus, None);
     state.pending_sync.queue_focus_change();
+
+    // Notify IPC clients before the visual workspace transition finishes.
+    state.emit_event(WmEvent::WorkspaceUpdated {
+      updated_workspace: target_workspace.to_dto()?,
+    });
 
     // Only set up the workspace-switch slide animation when the target
     // workspace differs from what is currently displayed on its monitor.

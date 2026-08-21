@@ -54,7 +54,7 @@ pub fn activate_workspace(
   let layout = if monitor_rect.height() > monitor_rect.width() {
     WorkspaceLayout::SplitVertical
   } else {
-    WorkspaceLayout::SplitHorizontal
+    WorkspaceLayout::Bsp
   };
 
   let workspace = Workspace::new(

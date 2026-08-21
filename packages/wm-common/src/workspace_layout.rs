@@ -13,6 +13,9 @@ use crate::TilingDirection;
 #[clap(rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceLayout {
+  /// Komorebi-style BSP/dwindle layout. Each successive child splits the
+  /// remaining area, alternating between horizontal and vertical axes.
+  Bsp,
   /// Proportional splits left-to-right. Children are sized according to
   /// their `tiling_size` fraction.
   SplitHorizontal,
@@ -40,7 +43,8 @@ impl WorkspaceLayout {
   #[must_use]
   pub fn primary_direction(&self) -> TilingDirection {
     match self {
-      Self::SplitHorizontal
+      Self::Bsp
+      | Self::SplitHorizontal
       | Self::Columns
       | Self::Grid
       | Self::VerticalStack => TilingDirection::Horizontal,
@@ -111,6 +115,57 @@ impl WorkspaceLayout {
     }
 
     match self {
+      Self::Bsp => {
+        // Match komorebi's BSP layout: place one child in half of the
+        // remaining area, then alternate the split axis recursively.
+        let mut rects = Vec::with_capacity(n);
+        let mut remaining = parent_rect;
+
+        for i in 0..n {
+          if i == n - 1 {
+            rects.push(remaining);
+            break;
+          }
+
+          if i % 2 == 0 {
+            let available_w = remaining.width() - h_gap;
+            let child_w = available_w / 2;
+
+            rects.push(Rect::from_xy(
+              remaining.x(),
+              remaining.y(),
+              child_w,
+              remaining.height(),
+            ));
+
+            remaining = Rect::from_xy(
+              remaining.x() + child_w + h_gap,
+              remaining.y(),
+              available_w - child_w,
+              remaining.height(),
+            );
+          } else {
+            let available_h = remaining.height() - v_gap;
+            let child_h = available_h / 2;
+
+            rects.push(Rect::from_xy(
+              remaining.x(),
+              remaining.y(),
+              remaining.width(),
+              child_h,
+            ));
+
+            remaining = Rect::from_xy(
+              remaining.x(),
+              remaining.y() + child_h + v_gap,
+              remaining.width(),
+              available_h - child_h,
+            );
+          }
+        }
+
+        rects
+      }
       Self::SplitHorizontal => {
         // Each child gets a proportional share of the width.
         let available_w =
@@ -350,6 +405,34 @@ mod tests {
     );
     assert_eq!(rects[0], rect(0, 0, 500, 600));
     assert_eq!(rects[1], rect(500, 0, 500, 600));
+  }
+
+  #[test]
+  fn bsp_four_children_alternates_split_axis() {
+    let rects = WorkspaceLayout::Bsp.compute_rects(
+      rect(0, 0, 1000, 600),
+      &[0.25, 0.25, 0.25, 0.25],
+      10,
+      10,
+    );
+
+    assert_eq!(rects[0], rect(0, 0, 495, 600));
+    assert_eq!(rects[1], rect(505, 0, 495, 295));
+    assert_eq!(rects[2], rect(505, 305, 242, 295));
+    assert_eq!(rects[3], rect(757, 305, 243, 295));
+  }
+
+  #[test]
+  fn bsp_single_child_fills_parent() {
+    let parent = rect(20, 30, 1000, 600);
+    let rects = WorkspaceLayout::Bsp.compute_rects(
+      parent.clone(),
+      &[1.0],
+      10,
+      10,
+    );
+
+    assert_eq!(rects, vec![parent]);
   }
 
   #[test]
