@@ -1,11 +1,11 @@
 use std::{ffi::c_void, sync::OnceLock};
 
 use windows::{
+  core::{s, w},
   Win32::{
     Foundation::HWND,
     System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
   },
-  core::{s, w},
 };
 
 /// Accent state: solid-color fill, used for surrogate backdrops.
@@ -16,8 +16,9 @@ pub(crate) const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 
 /// Accent state: host backdrop -- samples live desktop content from behind
 /// the window for a `Windows.UI.Composition` host-backdrop brush to pick
-/// up, rather than blurring a solid color like `ACCENT_ENABLE_ACRYLICBLURBEHIND`.
-/// The `gradient_color` field is unused for this accent state.
+/// up, rather than blurring a solid color like
+/// `ACCENT_ENABLE_ACRYLICBLURBEHIND`. The `gradient_color` field is unused
+/// for this accent state.
 pub(crate) const ACCENT_ENABLE_HOSTBACKDROP: u32 = 5;
 
 /// `WCA_ACCENT_POLICY` attribute index for

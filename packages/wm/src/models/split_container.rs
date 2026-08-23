@@ -37,10 +37,7 @@ struct SplitContainerInner {
 }
 
 impl SplitContainer {
-  pub fn new(
-    layout: WorkspaceLayout,
-    gaps_config: GapsConfig,
-  ) -> Self {
+  pub fn new(layout: WorkspaceLayout, gaps_config: GapsConfig) -> Self {
     let split = SplitContainerInner {
       id: Uuid::new_v4(),
       parent: None,
@@ -104,10 +101,14 @@ impl PositionGetters for SplitContainer {
     let my_index = tiling_children
       .iter()
       .position(|c| c.id() == self.id())
-      .context("Split container not found among parent's tiling children.")?;
+      .context(
+        "Split container not found among parent's tiling children.",
+      )?;
 
-    let sizes: Vec<f32> =
-      tiling_children.iter().map(TilingSizeGetters::tiling_size).collect();
+    let sizes: Vec<f32> = tiling_children
+      .iter()
+      .map(TilingSizeGetters::tiling_size)
+      .collect();
 
     parent
       .layout()

@@ -8,7 +8,15 @@ use tokio::{
   sync::{broadcast, mpsc},
   task,
 };
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+  accept_hdr_async_with_config,
+  tungstenite::{
+    handshake::server::{ErrorResponse, Request, Response},
+    http::StatusCode,
+    protocol::WebSocketConfig,
+    Message,
+  },
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wm_common::{
@@ -27,11 +35,8 @@ use crate::{
 
 pub struct IpcServer {
   abort_handle: task::AbortHandle,
-  pub message_rx: mpsc::UnboundedReceiver<(
-    String,
-    mpsc::UnboundedSender<Message>,
-    broadcast::Sender<()>,
-  )>,
+  pub message_rx:
+    mpsc::Receiver<(String, mpsc::Sender<Message>, broadcast::Sender<()>)>,
   _event_rx: broadcast::Receiver<(SubscribableEvent, WmEvent)>,
   event_tx: broadcast::Sender<(SubscribableEvent, WmEvent)>,
   _unsubscribe_rx: broadcast::Receiver<Uuid>,
@@ -39,8 +44,13 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
+  const MESSAGE_QUEUE_CAPACITY: usize = 256;
+  const RESPONSE_QUEUE_CAPACITY: usize = 64;
+  const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
   pub async fn start() -> anyhow::Result<Self> {
-    let (message_tx, message_rx) = mpsc::unbounded_channel();
+    let (message_tx, message_rx) =
+      mpsc::channel(Self::MESSAGE_QUEUE_CAPACITY);
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (unsubscribe_tx, _unsubscribe_rx) = broadcast::channel(16);
 
@@ -77,20 +87,28 @@ impl IpcServer {
   async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
-    message_tx: mpsc::UnboundedSender<(
+    message_tx: mpsc::Sender<(
       String,
-      mpsc::UnboundedSender<Message>,
+      mpsc::Sender<Message>,
       broadcast::Sender<()>,
     )>,
   ) -> anyhow::Result<()> {
     info!("Incoming IPC connection from: {}.", addr);
 
-    let ws_stream = accept_async(stream)
-      .await
-      .context("Error during websocket handshake.")?;
+    let websocket_config = WebSocketConfig::default()
+      .max_message_size(Some(Self::MAX_MESSAGE_SIZE))
+      .max_frame_size(Some(Self::MAX_MESSAGE_SIZE));
+    let ws_stream = accept_hdr_async_with_config(
+      stream,
+      Self::validate_handshake,
+      Some(websocket_config),
+    )
+    .await
+    .context("Error during websocket handshake.")?;
 
     let (mut outgoing, mut incoming) = ws_stream.split();
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+    let (response_tx, mut response_rx) =
+      mpsc::channel(Self::RESPONSE_QUEUE_CAPACITY);
     let (disconnection_tx, _) = broadcast::channel(16);
 
     let res = async {
@@ -107,7 +125,7 @@ impl IpcServer {
                     message.to_text()?.to_string(),
                     response_tx.clone(),
                     disconnection_tx.clone(),
-                  ))?;
+                  )).await?;
                 }
               }
               Some(Err(err)) => bail!("WebSocket error: {}", err),
@@ -134,11 +152,15 @@ impl IpcServer {
   pub fn process_message(
     &self,
     message: String,
-    response_tx: &mpsc::UnboundedSender<Message>,
+    response_tx: &mpsc::Sender<Message>,
     disconnection_tx: &broadcast::Sender<()>,
     wm: &mut WindowManager,
     config: &mut UserConfig,
   ) -> anyhow::Result<()> {
+    if response_tx.capacity() == 0 {
+      bail!("IPC response queue is full; command was not processed.");
+    }
+
     let app_command = AppCommand::try_parse_from(
       iter::once("").chain(message.split_whitespace()),
     );
@@ -158,7 +180,7 @@ impl IpcServer {
 
     // Respond to the client with the result of the command.
     response_tx
-      .send(Self::to_client_response_msg(message, response_data)?)
+      .try_send(Self::to_client_response_msg(message, response_data)?)
       .map_err(|err| {
         anyhow::anyhow!("Failed to send response: {}", err)
       })?;
@@ -170,7 +192,7 @@ impl IpcServer {
   fn handle_app_command(
     &self,
     app_command: AppCommand,
-    response_tx: &mpsc::UnboundedSender<Message>,
+    response_tx: &mpsc::Sender<Message>,
     disconnection_tx: &broadcast::Sender<()>,
     wm: &mut WindowManager,
     config: &mut UserConfig,
@@ -288,7 +310,7 @@ impl IpcServer {
                   )
                   .and_then(|event_msg| {
                     response_tx
-                      .send(event_msg)
+                      .try_send(event_msg)
                       .map_err(anyhow::Error::from)
                   });
 
@@ -318,6 +340,22 @@ impl IpcServer {
     };
 
     Ok(response_data)
+  }
+
+  #[allow(clippy::result_large_err)]
+  fn validate_handshake(
+    request: &Request,
+    response: Response,
+  ) -> Result<Response, ErrorResponse> {
+    if request.headers().contains_key("origin") {
+      let mut rejection = ErrorResponse::new(Some(
+        "Browser-origin IPC connections are not allowed.".to_string(),
+      ));
+      *rejection.status_mut() = StatusCode::FORBIDDEN;
+      return Err(rejection);
+    }
+
+    Ok(response)
   }
 
   fn to_client_response_msg(
@@ -367,9 +405,7 @@ impl IpcServer {
       WmEvent::MonitorAdded { .. } => SubscribableEvent::MonitorAdded,
       WmEvent::MonitorUpdated { .. } => SubscribableEvent::MonitorUpdated,
       WmEvent::MonitorRemoved { .. } => SubscribableEvent::MonitorRemoved,
-      WmEvent::LayoutChanged { .. } => {
-        SubscribableEvent::LayoutChanged
-      }
+      WmEvent::LayoutChanged { .. } => SubscribableEvent::LayoutChanged,
       WmEvent::UserConfigChanged { .. } => {
         SubscribableEvent::UserConfigChanged
       }
@@ -406,5 +442,31 @@ impl IpcServer {
 impl Drop for IpcServer {
   fn drop(&mut self) {
     self.stop();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn native_ipc_handshake_without_origin_is_allowed() {
+    let request = Request::new(());
+    let response = Response::new(());
+
+    assert!(IpcServer::validate_handshake(&request, response).is_ok());
+  }
+
+  #[test]
+  fn browser_origin_ipc_handshake_is_rejected() {
+    let request = Request::builder()
+      .header("origin", "https://example.test")
+      .body(())
+      .expect("test request should be valid");
+    let response = Response::new(());
+
+    let rejection = IpcServer::validate_handshake(&request, response)
+      .expect_err("browser-origin handshake must be rejected");
+    assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
   }
 }

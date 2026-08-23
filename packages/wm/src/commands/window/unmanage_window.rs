@@ -1,9 +1,11 @@
 use anyhow::Context;
-use wm_common::{WindowState, WmEvent};
+use wm_common::{DisplayState, WindowState, WmEvent};
+#[cfg(target_os = "windows")]
+use wm_platform::NativeWindowWindowsExt;
 
 use crate::{
   commands::container::{
-    detach_container, flatten_child_split_containers,
+    attach_container, detach_container, flatten_child_split_containers,
     set_focused_descendant,
   },
   models::WindowContainer,
@@ -11,12 +13,65 @@ use crate::{
   wm_state::WmState,
 };
 
+/// Restores a still-live window after final close-message delivery fails.
+///
+/// Native visibility is recovered before attempting tree attachment. If
+/// the layout recovery fails, the application therefore remains visible
+/// and usable as an unmanaged window rather than being stranded cloaked.
+#[cfg(target_os = "windows")]
+pub fn restore_window_after_failed_close(
+  window: WindowContainer,
+  preferred_workspace_id: uuid::Uuid,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  {
+    let native = window.native();
+    if let Err(err) = native.set_cloaked(false) {
+      tracing::warn!(
+        "Failed to uncloak window {} after close delivery failure: {err}.",
+        window.id()
+      );
+    }
+    if let Err(err) = native.show() {
+      tracing::warn!(
+        "Failed to show window {} after close delivery failure: {err}.",
+        window.id()
+      );
+    }
+  }
+  window.set_display_state(DisplayState::Shown);
+
+  let target_workspace = state
+    .container_by_id(preferred_workspace_id)
+    .filter(|container| container.as_workspace().is_some())
+    .or_else(|| {
+      state
+        .focused_container()
+        .and_then(|container| container.workspace())
+        .map(Into::into)
+    })
+    .context("No workspace available to restore failed close.")?;
+
+  attach_container(&window.clone().into(), &target_workspace, None)?;
+  set_focused_descendant(&window.clone().into(), None);
+  state.window_target_positions.remove(&window.id());
+  state.pending_sync.queue_focus_change();
+  state
+    .pending_sync
+    .queue_container_to_redraw(target_workspace);
+  state.emit_event(WmEvent::WindowManaged {
+    managed_window: window.to_dto()?,
+  });
+
+  Ok(())
+}
+
 /// Detaches a closing window from the container tree and reflows its
 /// siblings without removing the active close animation.
 ///
 /// Called at the start of a close animation so sibling windows begin their
-/// reflow animations immediately, in parallel with the close surrogate. The
-/// animation state is intentionally preserved here because
+/// reflow animations immediately, in parallel with the close surrogate.
+/// The animation state is intentionally preserved here because
 /// `AnimationManager::update_internal` continues driving the surrogate and
 /// sends `WM_CLOSE` once the animation completes.
 #[cfg(target_os = "windows")]

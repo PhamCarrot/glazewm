@@ -103,8 +103,8 @@ fn create_window(rect: &Rect, composition: bool) -> crate::Result<HWND> {
   Ok(hwnd)
 }
 
-/// Applies `ACCENT_ENABLE_HOSTBACKDROP` (+ its Win11 documented equivalent,
-/// `DWMWA_USE_HOSTBACKDROPBRUSH`) to `hwnd`, required for a
+/// Applies `ACCENT_ENABLE_HOSTBACKDROP` (+ its Win11 documented
+/// equivalent, `DWMWA_USE_HOSTBACKDROPBRUSH`) to `hwnd`, required for a
 /// `CompositionBackdropBrush` to sample live desktop content instead of
 /// rendering black/opaque.
 fn apply_hostbackdrop(hwnd: HWND) {
@@ -113,7 +113,8 @@ fn apply_hostbackdrop(hwnd: HWND) {
   let value: windows::Win32::Foundation::BOOL = true.into();
   // `BOOL` is a 4-byte struct; the cast is always exact.
   #[allow(clippy::cast_possible_truncation)]
-  let size = std::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32;
+  let size =
+    std::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32;
   // SAFETY: `hwnd` is valid; `value` is a 4-byte BOOL matching `size`.
   unsafe {
     let _ = DwmSetWindowAttribute(
@@ -162,23 +163,24 @@ fn try_create_composition(
   }
 }
 
-/// A persistent backdrop window that provides an acrylic blur-behind effect
-/// for a paired managed window.
+/// A persistent backdrop window that provides an acrylic blur-behind
+/// effect for a paired managed window.
 ///
 /// Positioned at `HWND_BOTTOM` (behind all normal windows) and kept
-/// pixel-aligned with the managed window's DWM frame rect. When the managed
-/// window is semi-transparent (via the `transparency` window effect), the
-/// blurred desktop visible through the overlay shows through the window,
-/// producing a frosted-glass look.
+/// pixel-aligned with the managed window's DWM frame rect. When the
+/// managed window is semi-transparent (via the `transparency` window
+/// effect), the blurred desktop visible through the overlay shows through
+/// the window, producing a frosted-glass look.
 ///
 /// Renders via a `Windows.UI.Composition` pipeline (live host-backdrop
 /// brush, a continuously adjustable Gaussian-blur effect graph, and a
 /// continuous corner-radius clip) when available, falling back to
 /// `SetWindowCompositionAttribute` with `ACCENT_ENABLE_ACRYLICBLURBEHIND`
-/// otherwise -- e.g. pre-Windows 10 1803, or if any step of the Composition
-/// setup fails. In the fallback, `blur_amount`/`corner_radius`/`opacity`/
-/// `saturation` become no-ops (the OS gives no such knobs for SWCA
-/// acrylic) but `tint` keeps working the same as before.
+/// otherwise -- e.g. pre-Windows 10 1803, or if any step of the
+/// Composition setup fails. In the fallback,
+/// `blur_amount`/`corner_radius`/`opacity`/ `saturation` become no-ops
+/// (the OS gives no such knobs for SWCA acrylic) but `tint` keeps working
+/// the same as before.
 ///
 /// # Platform-specific
 ///
@@ -200,10 +202,11 @@ pub struct NativeBlurOverlay {
   /// Whether the overlay window is currently shown.
   ///
   /// Tracked explicitly (rather than inferred from a change in `rect`) so
-  /// that a caller re-showing the overlay after [`hide`] with an unchanged
-  /// rect still issues the `SetWindowPos` needed to reapply
-  /// `SWP_SHOWWINDOW` -- the rect-unchanged fast path in [`set_rect`] would
-  /// otherwise skip that call entirely, leaving the overlay hidden.
+  /// that a caller re-showing the overlay after [`hide`] with an
+  /// unchanged rect still issues the `SetWindowPos` needed to reapply
+  /// `SWP_SHOWWINDOW` -- the rect-unchanged fast path in [`set_rect`]
+  /// would otherwise skip that call entirely, leaving the overlay
+  /// hidden.
   ///
   /// [`hide`]: NativeBlurOverlay::hide
   /// [`set_rect`]: NativeBlurOverlay::set_rect
@@ -253,13 +256,20 @@ impl NativeBlurOverlay {
   /// are only honored when the Composition pipeline is available).
   ///
   /// The overlay is shown immediately at `HWND_BOTTOM`.
-  pub fn create(rect: &Rect, params: BlurOverlayParams) -> crate::Result<Self> {
+  pub fn create(
+    rect: &Rect,
+    params: BlurOverlayParams,
+  ) -> crate::Result<Self> {
     let (hwnd, composition) =
       if let Some((hwnd, visual)) = try_create_composition(rect, params) {
         (hwnd, Some(visual))
       } else {
         let hwnd = create_window(rect, false)?;
-        apply_swca_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, params.tint);
+        apply_swca_accent(
+          hwnd,
+          ACCENT_ENABLE_ACRYLICBLURBEHIND,
+          params.tint,
+        );
         (hwnd, None)
       };
 
@@ -303,10 +313,10 @@ impl NativeBlurOverlay {
   ///
   /// No-op if `rect` matches the last-applied rect and the overlay is
   /// already visible, to avoid redundant `SetWindowPos` calls (and the DWM
-  /// recomposite they trigger) on every sync tick for overlays that haven't
-  /// actually moved. Always issues the call when re-showing after [`hide`],
-  /// even at an unchanged rect, since that's what reapplies
-  /// `SWP_SHOWWINDOW`.
+  /// recomposite they trigger) on every sync tick for overlays that
+  /// haven't actually moved. Always issues the call when re-showing
+  /// after [`hide`], even at an unchanged rect, since that's what
+  /// reapplies `SWP_SHOWWINDOW`.
   ///
   /// [`hide`]: NativeBlurOverlay::hide
   pub fn set_rect(&mut self, rect: &Rect) {
@@ -392,11 +402,17 @@ impl NativeBlurOverlay {
     match &self.composition {
       Some(composition) => {
         if let Err(e) = composition.set_tint(tint) {
-          tracing::warn!("Blur overlay composition tint update failed: {e}.");
+          tracing::warn!(
+            "Blur overlay composition tint update failed: {e}."
+          );
         }
       }
       None => {
-        apply_swca_accent(self.hwnd(), ACCENT_ENABLE_ACRYLICBLURBEHIND, tint);
+        apply_swca_accent(
+          self.hwnd(),
+          ACCENT_ENABLE_ACRYLICBLURBEHIND,
+          tint,
+        );
       }
     }
   }

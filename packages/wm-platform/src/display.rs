@@ -303,24 +303,35 @@ impl DisplayDevice {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::EventLoop;
+  use crate::{Dispatcher, EventLoop};
+
+  struct EventLoopStopGuard<'a>(&'a Dispatcher);
+
+  impl Drop for EventLoopStopGuard<'_> {
+    fn drop(&mut self) {
+      let _ = self.0.stop_event_loop();
+    }
+  }
 
   #[test]
   fn test_nearest_display() {
     let (event_loop, dispatcher) = EventLoop::new().unwrap();
 
     let thread = std::thread::spawn(move || {
-      let display = platform_impl::nearest_display(
-        // Assumes that there is at least one window currently visible.
-        &dispatcher.visible_windows().unwrap()[0],
-        &dispatcher,
-      );
-      dispatcher.stop_event_loop().unwrap();
-      display
+      let _stop_guard = EventLoopStopGuard(&dispatcher);
+      let windows = dispatcher.visible_windows()?;
+      let Some(window) = windows.first() else {
+        // Headless and noninteractive test sessions can legitimately have
+        // no visible top-level windows. The event-loop behavior is still
+        // exercised; there is simply no native window to resolve.
+        return Ok(None);
+      };
+
+      platform_impl::nearest_display(window, &dispatcher).map(Some)
     });
 
     event_loop.run().unwrap();
-    let display = thread.join().unwrap();
-    assert!(display.is_ok());
+    let result = thread.join().expect("display test worker panicked");
+    assert!(result.is_ok());
   }
 }

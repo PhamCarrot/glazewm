@@ -109,11 +109,18 @@ impl Rect {
   /// original rectangle.
   #[must_use]
   pub fn clamp(&self, outer_rect: &Rect) -> Self {
+    let outer_width = outer_rect.width().max(0);
+    let outer_height = outer_rect.height().max(0);
+    let width = self.width().clamp(0, outer_width);
+    let height = self.height().clamp(0, outer_height);
+    let max_x = outer_rect.right - width;
+    let max_y = outer_rect.bottom - height;
+
     Self::from_xy(
-      self.left.max(outer_rect.left),
-      self.top.max(outer_rect.top),
-      self.width().min(outer_rect.width()),
-      self.height().min(outer_rect.height()),
+      self.left.clamp(outer_rect.left, max_x),
+      self.top.clamp(outer_rect.top, max_y),
+      width,
+      height,
     )
   }
 
@@ -268,16 +275,17 @@ impl Rect {
 
   /// Interpolates between this rectangle and another rectangle.
   ///
-  /// `progress` should be a value between 0.0 (this rect) and 1.0 (other rect).
+  /// `progress` should be a value between 0.0 (this rect) and 1.0 (other
+  /// rect).
   #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
   #[must_use]
   pub fn interpolate(&self, other: &Rect, progress: f32) -> Rect {
     let x = self.x() as f32 + (other.x() - self.x()) as f32 * progress;
     let y = self.y() as f32 + (other.y() - self.y()) as f32 * progress;
-    let width =
-      self.width() as f32 + (other.width() - self.width()) as f32 * progress;
-    let height =
-      self.height() as f32 + (other.height() - self.height()) as f32 * progress;
+    let width = self.width() as f32
+      + (other.width() - self.width()) as f32 * progress;
+    let height = self.height() as f32
+      + (other.height() - self.height()) as f32 * progress;
 
     Rect::from_xy(
       x.round() as i32,
@@ -313,5 +321,38 @@ mod tests {
     let r1 = Rect::from_xy(0, 0, 100, 100);
     let r2 = Rect::from_xy(100, 0, 100, 100);
     assert_eq!(r1.intersection_area(&r2), 0);
+  }
+
+  #[test]
+  fn clamp_preserves_rect_already_inside_outer_bounds() {
+    let outer = Rect::from_xy(100, 200, 800, 600);
+    let inner = Rect::from_xy(150, 250, 300, 200);
+
+    assert_eq!(inner.clamp(&outer), inner);
+  }
+
+  #[test]
+  fn clamp_moves_each_overflowing_edge_inside_outer_bounds() {
+    let outer = Rect::from_xy(100, 200, 800, 600);
+
+    assert_eq!(
+      Rect::from_xy(50, 150, 300, 200).clamp(&outer),
+      Rect::from_xy(100, 200, 300, 200),
+    );
+    assert_eq!(
+      Rect::from_xy(750, 700, 300, 200).clamp(&outer),
+      Rect::from_xy(600, 600, 300, 200),
+    );
+  }
+
+  #[test]
+  fn clamp_shrinks_oversized_or_inverted_rect_to_valid_bounds() {
+    let outer = Rect::from_xy(100, 200, 800, 600);
+
+    assert_eq!(Rect::from_xy(-500, -500, 1200, 900).clamp(&outer), outer,);
+    assert_eq!(
+      Rect::from_xy(500, 500, -10, -20).clamp(&outer),
+      Rect::from_xy(500, 500, 0, 0),
+    );
   }
 }

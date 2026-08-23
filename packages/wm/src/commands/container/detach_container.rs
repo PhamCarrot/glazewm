@@ -1,9 +1,12 @@
 use anyhow::Context;
 
-use super::{flatten_split_container, flatten_stack_container};
+use super::{
+  flatten_split_container, flatten_stack_container,
+  redistribute_tiling_size,
+};
 use crate::{
   models::Container,
-  traits::{CommonGetters, TilingSizeGetters, MIN_TILING_SIZE},
+  traits::{CommonGetters, TilingSizeGetters},
 };
 
 /// Removes a container from the tree.
@@ -51,21 +54,43 @@ pub fn detach_container(child_to_remove: Container) -> anyhow::Result<()> {
   if let Ok(child_to_remove) = child_to_remove.as_tiling_container() {
     let tiling_siblings = parent.tiling_children().collect::<Vec<_>>();
 
-    // TODO: Share logic with `resize_tiling_container`.
-    let available_size =
-      tiling_siblings.iter().fold(0.0, |sum, container| {
-        sum + container.tiling_size() - MIN_TILING_SIZE
-      });
-
-    // Adjust size of the siblings based on the freed up space.
-    for sibling in &tiling_siblings {
-      let resize_factor =
-        (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
-
-      let size_delta = resize_factor * child_to_remove.tiling_size();
-      sibling.set_tiling_size(sibling.tiling_size() + size_delta);
-    }
+    // Give the freed space to siblings in proportion to their space above
+    // the minimum. If all remaining siblings are at the minimum, share
+    // it equally rather than dividing by zero and corrupting their
+    // sizes with NaN.
+    redistribute_tiling_size(
+      &tiling_siblings,
+      child_to_remove.tiling_size(),
+    );
   }
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    models::{TilingContainer, TilingWindow, Workspace},
+    traits::{TilingSizeGetters, MIN_TILING_SIZE},
+  };
+
+  #[test]
+  fn detach_into_minimum_sibling_restores_finite_full_size() {
+    let removed = TilingWindow::mock().call();
+    let survivor = TilingWindow::mock().call();
+    let _workspace = Workspace::mock()
+      .tiling_containers(vec![
+        TilingContainer::from(removed.clone()),
+        TilingContainer::from(survivor.clone()),
+      ])
+      .call();
+    removed.set_tiling_size(0.99);
+    survivor.set_tiling_size(MIN_TILING_SIZE);
+
+    detach_container(removed.into()).unwrap();
+
+    assert_eq!(survivor.tiling_size(), 1.0);
+    assert!(survivor.tiling_size().is_finite());
+  }
 }

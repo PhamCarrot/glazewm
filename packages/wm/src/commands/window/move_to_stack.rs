@@ -1,7 +1,9 @@
 use anyhow::Context;
 
 use crate::{
-  commands::container::{move_container_within_tree, wrap_in_stack_container},
+  commands::container::{
+    move_container_within_tree, wrap_in_stack_container,
+  },
   models::{StackContainer, TilingContainer, TilingWindow},
   traits::{CommonGetters, TilingSizeGetters},
   user_config::UserConfig,
@@ -10,10 +12,10 @@ use crate::{
 
 /// Moves `window` into the named stack on its workspace.
 ///
-/// If a `StackContainer` with the given name already exists on the workspace,
-/// the window is appended to it. Otherwise a new single-window named stack is
-/// created in place of the window. If the window is already in the target
-/// stack this is a no-op.
+/// If a `StackContainer` with the given name already exists on the
+/// workspace, the window is appended to it. Otherwise a new single-window
+/// named stack is created in place of the window. If the window is already
+/// in the target stack this is a no-op.
 pub fn move_to_stack(
   window: &TilingWindow,
   name: &str,

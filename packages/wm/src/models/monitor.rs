@@ -153,3 +153,33 @@ impl std::fmt::Display for Monitor {
     )
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn detects_dpi_difference_between_source_and_target_monitors() {
+    let low_dpi_workspace = Workspace::mock().call();
+    let low_dpi_monitor = Monitor::mock()
+      .dpi(96)
+      .workspaces(vec![low_dpi_workspace.clone()])
+      .call();
+
+    let high_dpi_workspace = Workspace::mock().call();
+    let high_dpi_monitor = Monitor::mock()
+      .dpi(144)
+      .workspaces(vec![high_dpi_workspace.clone()])
+      .call();
+
+    assert!(!low_dpi_monitor
+      .has_dpi_difference(&low_dpi_workspace.into())
+      .unwrap());
+    assert!(low_dpi_monitor
+      .has_dpi_difference(&high_dpi_workspace.clone().into())
+      .unwrap());
+    assert!(high_dpi_monitor
+      .has_dpi_difference(&low_dpi_monitor.workspaces()[0].clone().into())
+      .unwrap());
+  }
+}

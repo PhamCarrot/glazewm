@@ -8,9 +8,7 @@ use wm_common::{
 };
 
 use crate::{
-  models::{
-    Monitor, NativeWindowProperties, WindowContainer, Workspace,
-  },
+  models::{Monitor, NativeWindowProperties, WindowContainer, Workspace},
   traits::{CommonGetters, WindowGetters},
 };
 
@@ -34,8 +32,8 @@ pub struct UserConfig {
   window_rules_by_event: HashMap<WindowRuleEvent, Vec<WindowRuleConfig>>,
 
   /// Pre-compiled regexes from `stack.tab_title_overrides`, paired with
-  /// their replacement strings. Built once on load and on config reload so
-  /// `sync_tab_bars` does not recompile on every platform-sync tick.
+  /// their replacement strings. Built once on load and on config reload
+  /// so `sync_tab_bars` does not recompile on every platform-sync tick.
   pub compiled_tab_title_overrides: Vec<(Regex, String)>,
 }
 
@@ -83,7 +81,11 @@ impl UserConfig {
 
     // TODO: Improve error formatting of serde_yaml errors. Something
     // similar to https://github.com/AlexanderThaller/format_serde_error
-    let config_value = serde_yaml::from_str(&config_str)?;
+    let config_value: ParsedConfig = serde_yaml::from_str(&config_str)?;
+    config_value
+      .validate()
+      .map_err(anyhow::Error::msg)
+      .context("Invalid numeric configuration.")?;
 
     Ok((config_value, config_str))
   }
@@ -218,16 +220,14 @@ impl UserConfig {
       .stack
       .tab_title_overrides
       .iter()
-      .filter_map(|o| {
-        match Regex::new(&o.regex) {
-          Ok(re) => Some((re, o.replace.clone())),
-          Err(err) => {
-            tracing::warn!(
-              "Invalid tab_title_overrides regex {:?}: {err}",
-              o.regex
-            );
-            None
-          }
+      .filter_map(|o| match Regex::new(&o.regex) {
+        Ok(re) => Some((re, o.replace.clone())),
+        Err(err) => {
+          tracing::warn!(
+            "Invalid tab_title_overrides regex {:?}: {err}",
+            o.regex
+          );
+          None
         }
       })
       .collect()
@@ -440,7 +440,10 @@ impl UserConfig {
 
 #[cfg(test)]
 mod tests {
-  use wm_common::{ParsedConfig, WindowTransitionStyle, WorkspaceSwitchStyle};
+  use wm_common::{
+    EasingFunction, ParsedConfig, WindowTransitionStyle,
+    WorkspaceSwitchStyle,
+  };
   use wm_platform::{BackdropStyle, Rect};
 
   use super::*;
@@ -451,6 +454,7 @@ mod tests {
   fn sample_config_parses() {
     let config: ParsedConfig = serde_yaml::from_str(SAMPLE_CONFIG)
       .expect("sample config should parse");
+    config.validate().expect("sample config should validate");
 
     assert_eq!(
       config.animations.window_open.style,
@@ -459,6 +463,82 @@ mod tests {
     assert_eq!(
       config.animations.workspace_switch.style,
       WorkspaceSwitchStyle::Slide
+    );
+  }
+
+  #[test]
+  fn non_finite_animation_values_are_rejected() {
+    let mut config = ParsedConfig::default();
+    config.animations.workspace_switch.opacity_incoming = f32::NAN;
+
+    let error = config
+      .validate()
+      .expect_err("NaN animation opacity must be rejected");
+    assert!(error.contains("opacity_incoming"));
+  }
+
+  #[test]
+  fn normalized_effect_values_must_stay_in_range() {
+    let mut config = ParsedConfig::default();
+    config.window_effects.focused_window.transparency.opacity.0 = 1.5;
+
+    let error = config
+      .validate()
+      .expect_err("opacity above one must be rejected");
+    assert!(error.contains("transparency.opacity"));
+  }
+
+  #[test]
+  fn non_finite_cubic_bezier_control_point_is_rejected() {
+    let yaml = r"
+animations:
+  window_move:
+    easing: 'cubic_bezier(0.2, NaN, 0.8, 1.0)'
+";
+
+    let error = serde_yaml::from_str::<ParsedConfig>(yaml)
+      .expect_err("non-finite easing must fail to parse");
+    assert!(error.to_string().contains("must be finite"));
+  }
+
+  #[test]
+  fn exact_named_easings_parse_and_round_trip() {
+    let cases = [
+      ("ease_in_quart", EasingFunction::EaseInQuart),
+      ("ease_out_quart", EasingFunction::EaseOutQuart),
+      ("ease_in_out_quart", EasingFunction::EaseInOutQuart),
+      ("ease_in_quint", EasingFunction::EaseInQuint),
+      ("ease_out_quint", EasingFunction::EaseOutQuint),
+      ("ease_in_out_quint", EasingFunction::EaseInOutQuint),
+      ("ease_in_expo", EasingFunction::EaseInExpo),
+      ("ease_out_expo", EasingFunction::EaseOutExpo),
+      ("ease_in_out_expo", EasingFunction::EaseInOutExpo),
+      ("ease_in_back", EasingFunction::EaseInBack),
+      ("ease_out_back", EasingFunction::EaseOutBack),
+      ("ease_in_out_back", EasingFunction::EaseInOutBack),
+    ];
+
+    for (name, expected) in cases {
+      let parsed: EasingFunction = serde_yaml::from_str(name)
+        .unwrap_or_else(|_| panic!("{name} should parse"));
+      assert_eq!(parsed, expected);
+
+      let serialized = serde_yaml::to_string(&parsed)
+        .expect("named easing should serialize");
+      let reparsed: EasingFunction = serde_yaml::from_str(&serialized)
+        .expect("serialized named easing should parse");
+      assert_eq!(reparsed, expected);
+    }
+
+    let overshoot_alias: EasingFunction =
+      serde_yaml::from_str("ease_out_overshoot")
+        .expect("overshoot alias should parse");
+    assert_eq!(overshoot_alias, EasingFunction::EaseOutBack);
+    assert_eq!(
+      serde_yaml::to_string(&overshoot_alias)
+        .expect("Back easing should serialize")
+        .trim(),
+      "ease_out_back"
     );
   }
 
@@ -591,9 +671,8 @@ animations:
     let config =
       test_config(vec![test_rule(InvokeCommand::Ignore, "my-launcher")]);
 
-    assert!(
-      !config.is_force_managed(&test_properties("my-launcher", "Launcher"))
-    );
+    assert!(!config
+      .is_force_managed(&test_properties("my-launcher", "Launcher")));
   }
 
   #[test]
@@ -606,8 +685,8 @@ animations:
     )));
   }
 
-  /// Configs written before the `blur_behind` -> `backdrop` key rename must
-  /// keep parsing via the `#[serde(alias = "blur_behind")]` on
+  /// Configs written before the `blur_behind` -> `backdrop` key rename
+  /// must keep parsing via the `#[serde(alias = "blur_behind")]` on
   /// `WindowEffectConfig::backdrop`.
   #[test]
   fn backdrop_key_alias_parses() {

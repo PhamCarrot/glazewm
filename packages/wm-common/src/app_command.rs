@@ -386,7 +386,6 @@ pub struct InvokeFocusCommand {
   pub recent_workspace: bool,
 }
 
-
 #[derive(Args, Clone, Debug, PartialEq, Serialize)]
 #[group(required = true, multiple = false)]
 pub struct InvokeMoveCursorCommand {

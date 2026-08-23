@@ -61,7 +61,8 @@ fn toggle_window_direction(
   }
 
   // Create a new split container to wrap the window, using the inverse of
-  // the current split direction. For non-split layouts, default to vertical.
+  // the current split direction. For non-split layouts, default to
+  // vertical.
   let new_split_layout = match parent.layout() {
     WorkspaceLayout::SplitHorizontal => WorkspaceLayout::SplitVertical,
     _ => WorkspaceLayout::SplitVertical,

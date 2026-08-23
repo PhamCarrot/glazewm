@@ -121,9 +121,14 @@ fn move_tiling_container(
     || container_to_move.tiling_siblings().count() == 0)
     && parent.is_workspace()
   {
-    if let TilingContainer::TilingWindow(window) = container_to_move.clone()
+    if let TilingContainer::TilingWindow(window) =
+      container_to_move.clone()
     {
-      return move_to_workspace_in_direction(&window.into(), direction, state);
+      return move_to_workspace_in_direction(
+        &window.into(),
+        direction,
+        state,
+      );
     }
     return Ok(());
   }
@@ -139,11 +144,9 @@ fn move_tiling_container(
     };
 
     if !target_ancestor.layout().is_split() {
-      let spatial_origin = direct_tiling_child_of(
-        &container_to_move,
-        &target_ancestor,
-      )
-      .context("No spatial-layout child for container.")?;
+      let spatial_origin =
+        direct_tiling_child_of(&container_to_move, &target_ancestor)
+          .context("No spatial-layout child for container.")?;
 
       return move_in_spatial_layout(
         spatial_origin,
@@ -191,8 +194,8 @@ fn tiling_sibling_in_direction(
 
 /// Gets the direct tiling child of `parent` that contains `container`.
 ///
-/// This lets a nested split or stack act as one visual cell when its parent
-/// uses a non-split layout.
+/// This lets a nested split or stack act as one visual cell when its
+/// parent uses a non-split layout.
 fn direct_tiling_child_of(
   container: &TilingContainer,
   parent: &DirectionContainer,
@@ -201,9 +204,7 @@ fn direct_tiling_child_of(
 
   container
     .self_and_ancestors()
-    .find(|ancestor| {
-      ancestor.parent() == Some(parent_container.clone())
-    })
+    .find(|ancestor| ancestor.parent() == Some(parent_container.clone()))
     .and_then(|ancestor| ancestor.as_tiling_container().ok())
 }
 
@@ -237,7 +238,11 @@ fn move_in_spatial_layout(
   // moving an individual window to the monitor in that direction.
   if parent.is_workspace() {
     if let TilingContainer::TilingWindow(window) = container_to_move {
-      return move_to_workspace_in_direction(&window.into(), direction, state);
+      return move_to_workspace_in_direction(
+        &window.into(),
+        direction,
+        state,
+      );
     }
   }
 
@@ -252,16 +257,18 @@ fn spatial_tiling_sibling(
 ) -> anyhow::Result<Option<TilingContainer>> {
   let origin_rect = origin.to_rect()?;
 
-  Ok(parent
-    .tiling_children()
-    .filter(|candidate| candidate.id() != origin.id())
-    .filter_map(|candidate| {
-      let candidate_rect = candidate.to_rect().ok()?;
-      directional_score(&origin_rect, &candidate_rect, direction)
-        .map(|score| (score, candidate))
-    })
-    .min_by_key(|(score, _)| *score)
-    .map(|(_, candidate)| candidate))
+  Ok(
+    parent
+      .tiling_children()
+      .filter(|candidate| candidate.id() != origin.id())
+      .filter_map(|candidate| {
+        let candidate_rect = candidate.to_rect().ok()?;
+        directional_score(&origin_rect, &candidate_rect, direction)
+          .map(|score| (score, candidate))
+      })
+      .min_by_key(|(score, _)| *score)
+      .map(|(_, candidate)| candidate),
+  )
 }
 
 /// Produces an ordering key for a candidate rectangle in `direction`.
@@ -276,7 +283,8 @@ fn directional_score(
   let origin_center = origin.center_point();
   let candidate_center = candidate.center_point();
 
-  let (primary_distance, perpendicular_distance, overlap) = match direction {
+  let (primary_distance, perpendicular_distance, overlap) = match direction
+  {
     Direction::Left => (
       origin_center.x - candidate_center.x,
       (origin_center.y - candidate_center.y).abs(),
@@ -304,11 +312,7 @@ fn directional_score(
   }
 
   let overlap_penalty = if overlap > 0 { 0 } else { 1 };
-  Some((
-    overlap_penalty,
-    primary_distance,
-    perpendicular_distance,
-  ))
+  Some((overlap_penalty, primary_distance, perpendicular_distance))
 }
 
 fn move_to_sibling_container(
@@ -466,7 +470,8 @@ fn invert_workspace_tiling_direction(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  let workspace = container_to_move.workspace().context("No workspace.")?;
+  let workspace =
+    container_to_move.workspace().context("No workspace.")?;
 
   // Get top-level tiling children of the workspace.
   let workspace_children = workspace
@@ -511,7 +516,8 @@ fn invert_workspace_tiling_direction(
   // up results in H[3 H[1 2]], and needs to be flattened to H[3 1 2].
   flatten_child_split_containers(&workspace.clone().into())?;
 
-  // Resize the container such that it and the split container are each 0.5.
+  // Resize the container such that it and the split container are each
+  // 0.5.
   resize_tiling_container(&container_to_move, 0.5);
 
   state
@@ -527,8 +533,9 @@ fn insert_into_ancestor(
   direction: &Direction,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
-  // Traverse upwards to find container whose parent is the target ancestor.
-  // Then, depending on the direction, insert before or after that container.
+  // Traverse upwards to find container whose parent is the target
+  // ancestor. Then, depending on the direction, insert before or after
+  // that container.
   let ancestor = container_to_move
     .ancestors()
     .find(|container| {

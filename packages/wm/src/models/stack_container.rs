@@ -14,9 +14,12 @@ use wm_platform::{LengthValue, Rect};
 use crate::{
   impl_common_getters, impl_container_debug,
   impl_position_getters_as_resizable, impl_tiling_size_getters,
-  models::{Container, DirectionContainer, TilingContainer, WindowContainer},
+  models::{
+    Container, DirectionContainer, TilingContainer, WindowContainer,
+  },
   traits::{
-    CommonGetters, PositionGetters, TilingDirectionGetters, TilingSizeGetters,
+    CommonGetters, PositionGetters, TilingDirectionGetters,
+    TilingSizeGetters,
   },
 };
 
@@ -32,7 +35,8 @@ struct StackContainerInner {
   gaps_config: GapsConfig,
   tab_bar_height: LengthValue,
   tab_bar_position: TabBarPosition,
-  /// Optional user-assigned name for targeting via `move-to-stack --name`.
+  /// Optional user-assigned name for targeting via `move-to-stack
+  /// --name`.
   name: Option<String>,
 }
 
@@ -95,7 +99,8 @@ impl StackContainer {
     height_lv.to_px(0, Some(scale_factor))
   }
 
-  /// Converts this `StackContainer` to a `ContainerDto` for IPC and debug logging.
+  /// Converts this `StackContainer` to a `ContainerDto` for IPC and debug
+  /// logging.
   pub fn to_dto(&self) -> anyhow::Result<ContainerDto> {
     let rect = self.to_rect()?;
     let children = self

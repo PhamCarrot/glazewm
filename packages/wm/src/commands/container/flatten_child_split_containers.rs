@@ -8,7 +8,8 @@ use crate::{
 /// parent container.
 ///
 /// Only runs for containers whose active layout is a split variant; other
-/// layouts (e.g. `Grid`, `Columns`) keep their child split containers as-is.
+/// layouts (e.g. `Grid`, `Columns`) keep their child split containers
+/// as-is.
 ///
 /// # Example
 ///
@@ -53,8 +54,7 @@ pub fn flatten_child_split_containers(
     for split_child in split_children.iter().filter(|split_child| {
       // Only collapse splits whose direction matches the parent.
       split_child.layout().is_split()
-        && split_child.tiling_direction()
-          == parent.tiling_direction()
+        && split_child.tiling_direction() == parent.tiling_direction()
     }) {
       // Additionally flatten redundant top-level split containers in
       // the child.

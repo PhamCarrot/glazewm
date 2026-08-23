@@ -25,9 +25,8 @@ pub fn toggle_stack(
 
   if let Some(stack) = parent.as_stack() {
     // Window is in a stack — remove it and re-insert after the stack.
-    let stack_parent = stack
-      .parent()
-      .context("Stack container has no parent.")?;
+    let stack_parent =
+      stack.parent().context("Stack container has no parent.")?;
 
     let stack_index = stack.index();
     let stack_focus_index = stack.focus_index();
@@ -97,7 +96,8 @@ pub fn toggle_stack(
     let gaps_config = window.gaps_config().clone();
     let tab_bar_height = config.value.stack.tab_bar_height.clone();
     let tab_bar_position = config.value.stack.tab_bar_position.clone();
-    let stack = StackContainer::new(gaps_config, tab_bar_height, tab_bar_position);
+    let stack =
+      StackContainer::new(gaps_config, tab_bar_height, tab_bar_position);
     let tiling_window: TilingContainer = window.clone().into();
 
     wrap_in_stack_container(&stack, &parent, &[tiling_window])?;

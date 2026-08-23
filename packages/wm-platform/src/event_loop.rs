@@ -65,6 +65,29 @@ mod tests {
     event_loop.run().expect("Failed to run event loop.");
 
     // Ensure the event loop is stopped.
-    assert!(handle.join().is_ok());
+    assert!(handle.join().unwrap().is_ok());
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn dropped_stopped_event_loop_does_not_stop_next_event_loop() {
+    let (first_event_loop, first_dispatcher) =
+      EventLoop::new().expect("Failed to create first event loop.");
+    first_dispatcher
+      .stop_event_loop()
+      .expect("Failed to stop first event loop.");
+    drop(first_event_loop);
+
+    let (second_event_loop, second_dispatcher) =
+      EventLoop::new().expect("Failed to create second event loop.");
+    let handle = std::thread::spawn(move || {
+      std::thread::sleep(Duration::from_millis(10));
+      second_dispatcher.stop_event_loop()
+    });
+
+    second_event_loop
+      .run()
+      .expect("Failed to run second event loop.");
+    assert!(handle.join().unwrap().is_ok());
   }
 }

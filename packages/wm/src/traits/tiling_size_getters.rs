@@ -57,9 +57,8 @@ pub trait TilingSizeGetters: CommonGetters {
         None => self.as_tiling_container()?,
       };
 
-    let parent = effective_self
-      .direction_container()
-      .context("No parent.")?;
+    let parent =
+      effective_self.direction_container().context("No parent.")?;
 
     let tiling_direction = parent.tiling_direction();
 

@@ -7,8 +7,10 @@
     Language="1033"
     Scope="perMachine"
   >
-    <Property Id="REINSTALLMODE" Value="amus" />
-    <MajorUpgrade Schedule="afterInstallInitialize" AllowDowngrades="yes" />
+    <MajorUpgrade
+      Schedule="afterInstallInitialize"
+      DowngradeErrorMessage="A newer version of GlazeWM Combined is already installed."
+    />
 
     <Icon Id="Combined_Icon" SourceFile="resources/assets/icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="Combined_Icon" />
@@ -45,13 +47,16 @@
           <Component Id="Combined_InstallRootFiles" Guid="5F9388D1-56BA-4B46-9F2C-893674569BDC">
             <File Id="Combined_RootExe" Source="$(var.EXE_DIR)/glazewm.exe" KeyPath="yes" />
             <File Id="Combined_RootWatcherExe" Source="$(var.EXE_DIR)/glazewm-watcher.exe" />
+            <File Id="Combined_DefaultConfig" Source="$(var.EXE_DIR)/config.yaml" />
+            <File Id="Combined_License" Source="$(var.EXE_DIR)/LICENSE.md" />
+            <File Id="Combined_Readme" Source="$(var.EXE_DIR)/README.md" />
           </Component>
 
           <Directory Id="Combined_CliDir" Name="cli">
             <Component Id="Combined_InstallCliFiles" Guid="*">
               <File
                 Id="Combined_CliExe"
-                Source="$(var.EXE_DIR)/glazewm-cli.exe"
+                Source="$(var.EXE_DIR)/cli/glazewm.exe"
                 Name="glazewm.exe"
                 KeyPath="yes"
               />
@@ -70,7 +75,7 @@
           Target="[INSTALLFOLDER]glazewm.exe"
         />
         <RegistryValue
-          Root="HKLM"
+          Root="HKCU"
           Key="SOFTWARE\Personal GlazeWM Build\GlazeWM Combined"
           Name="DesktopShortcutInstalled"
           Type="integer"
@@ -89,7 +94,7 @@
           Target="[INSTALLFOLDER]glazewm.exe"
         />
         <RegistryValue
-          Root="HKLM"
+          Root="HKCU"
           Key="SOFTWARE\Personal GlazeWM Build\GlazeWM Combined"
           Name="StartMenuShortcutInstalled"
           Type="integer"

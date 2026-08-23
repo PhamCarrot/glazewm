@@ -9,6 +9,10 @@ use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{LengthValue, MouseButton, RectDelta};
 use wm_platform::{NativeWindow, Rect};
 
+#[cfg(target_os = "windows")]
+use crate::commands::general::{
+  blur_overlay_params_for, upsert_blur_overlay,
+};
 use crate::{
   commands::{
     container::{flatten_split_container, move_container_within_tree},
@@ -20,8 +24,6 @@ use crate::{
   user_config::UserConfig,
   wm_state::WmState,
 };
-#[cfg(target_os = "windows")]
-use crate::commands::general::{blur_overlay_params_for, upsert_blur_overlay};
 
 #[allow(clippy::too_many_lines)]
 pub fn handle_window_moved_or_resized(
@@ -49,13 +51,14 @@ pub fn handle_window_moved_or_resized(
     if !state.is_paused && window.active_drag().is_some() {
       // Keep the acrylic blur overlay glued to the window for the whole
       // gesture. An interactive drag moves the window entirely through
-      // native OS handling, not `platform_sync`'s own `SetWindowPos` calls,
-      // and `update_drag_state` below dequeues the window from redraw once
-      // it's floating -- so without this, `sync_blur_overlays` (which only
-      // re-queries a window's rect when it's actually queued for redraw)
-      // never observes the live position, leaving the overlay frozen at the
-      // pre-drag rect while the (semi-transparent) window itself moves away
-      // from it for the rest of the drag.
+      // native OS handling, not `platform_sync`'s own `SetWindowPos`
+      // calls, and `update_drag_state` below dequeues the window
+      // from redraw once it's floating -- so without this,
+      // `sync_blur_overlays` (which only re-queries a window's rect
+      // when it's actually queued for redraw) never observes the
+      // live position, leaving the overlay frozen at the
+      // pre-drag rect while the (semi-transparent) window itself moves
+      // away from it for the rest of the drag.
       #[cfg(target_os = "windows")]
       {
         let is_focused = state

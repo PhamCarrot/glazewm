@@ -1,0 +1,397 @@
+# GlazeWM Combined configuration reference
+
+This document describes the configuration accepted by **this source tree**, including its custom DComp animations, multi-layout commands, and stack system. It was derived from `packages/wm-common/src/parsed_config.rs`, `packages/wm-common/src/app_command.rs`, the value parsers in `packages/wm-platform/src`, command handlers in `packages/wm/src/wm.rs`, and `resources/assets/sample-config.yaml`.
+
+All YAML keys are `snake_case`. Sections and fields omitted from YAML use their source defaults unless a required list item field is noted. Commands in YAML are strings without the leading `glazewm command`; from a terminal use `glazewm.exe command <command>`. Direction values are `left`, `right`, `up`, or `down`.
+
+## Value syntax used throughout
+
+- **Length**: a quoted integer with optional `px` or `%`, such as `"20px"`, `"10%"`, `"-2%"`; no unit means pixels. Command deltas may use `+`, for example `+2%`. YAML also accepts `{ amount: 20.0, unit: pixel }` or `{ amount: 0.2, unit: percentage }`, but the string form is clearer. Negative lengths parse; whether they are meaningful depends on the field.
+- **Rectangle**: `{ top: LENGTH, right: LENGTH, bottom: LENGTH, left: LENGTH }`.
+- **Color**: exactly `"#RRGGBB"` or `"#RRGGBBAA"`.
+- **Opacity**: a number from `0.0` through `1.0`, a numeric string such as `"0.95"`, or a percent such as `"95%"`. The parser does not clamp out-of-range input; stay in range.
+- **Duration/threshold**: unsigned 32-bit integer (`0` through `4294967295`) in milliseconds/pixels. There is no smaller schema maximum; use practical values.
+- **Boolean**: `true` or `false`.
+
+## Complete top-level shape
+
+```yaml
+animations: {}
+binding_modes: []
+gaps: {}
+general: {}
+keybindings: []
+stack: {}
+window_behavior: {}
+window_effects: {}
+window_rules: []
+workspaces: []
+```
+
+Unknown YAML fields are not rejected by the current Serde structs, so a typo can be silently ignored. Use the spellings below.
+
+## Animations
+
+All six children are optional. If an animation or native surrogate/capture setup fails, the implementation is designed to fall back to the final visible window state; `iris` capture failure becomes an instant workspace switch.
+
+```yaml
+animations:
+  window_move:
+    enabled: true
+    duration_ms: 150
+    easing: "ease_in_out"
+    threshold_px: 10
+  window_resize:
+    enabled: true
+    duration_ms: 150
+    easing: "ease_in_out"
+    threshold_px: 10
+  focus_change:
+    enabled: false
+    duration_ms: 200
+    easing: "cubic_bezier(0.16, 1, 0.3, 1)"
+  window_open:
+    enabled: true
+    duration_ms: 150
+    easing: "cubic_bezier(0.16, 1, 0.3, 1)"
+    style: "slide_right"
+    opacity_from: 1.0
+  window_close:
+    enabled: false
+    duration_ms: 150
+    easing: "ease_in_cubic"
+    style: "none"
+    opacity_to: 0.0
+  workspace_switch:
+    enabled: true
+    duration_ms: 250
+    easing: "cubic_bezier(0.16, 1, 0.3, 1)"
+    style: "slide"
+    direction: "horizontal"
+    iris_origin: "center"
+    opacity_outgoing: 1.0
+    opacity_incoming: 1.0
+    zoom_factor: 0.1
+```
+
+### Shared animation fields
+
+- `enabled`: switches that animation path on/off.
+- `duration_ms`: total duration. `0` is valid and effectively immediate.
+- `easing`: one of the CSS/cubic names `linear`, `ease_in`, `ease_out`, `ease_in_out`, `ease_in_cubic`, `ease_out_cubic`, `ease_in_out_cubic`; the exact power families `ease_in_quart`, `ease_out_quart`, `ease_in_out_quart`, `ease_in_quint`, `ease_out_quint`, `ease_in_out_quint`; the exact exponential family `ease_in_expo`, `ease_out_expo`, `ease_in_out_expo`; the true overshooting Back family `ease_in_back`, `ease_out_back`, `ease_in_out_back`; `ease_out_spring`; or `cubic_bezier(x1, y1, x2, y2)`. `ease_in_overshoot`, `ease_out_overshoot`, and `ease_in_out_overshoot` are aliases for the corresponding Back curves. Quart and quint are evaluated as fourth- and fifth-order power functions, Expo uses base-2 exponential formulas, and Back uses the standard `1.70158` overshoot constant. A custom curve requires exactly four floats; `x1` and `x2` must be in `[0,1]`, while the y values may exceed it for overshoot.
+- `threshold_px`: only on move/resize; changes smaller than this pixel distance do not animate.
+
+### Window and focus animation fields
+
+- `focus_change`: interpolates between the focused/non-focused transparency targets under `window_effects`; Windows only.
+- `window_open.style` and `window_close.style`: `slide_right`, `slide_left`, `slide_top`, `slide_bottom`, `none`, or `zoom`. Aliases `right`, `left`, `top`, `bottom`, and `fade` are accepted. On `window_open` only, the legacy key name `direction:` is accepted as an alias for `style:`.
+- `opacity_from` / `opacity_to`: float, intended range `0.0..=1.0`; deserialization accepts other floats, but the animation path clamps the applied opacity. `none` plus opacity creates a pure fade.
+
+### Workspace transition fields
+
+- `style`: `slide`, `fade`, `zoom`, or Windows-only `iris`.
+- `direction`: `horizontal` or `vertical`; used by `slide` only.
+- `iris_origin`: `center`, `cursor`, or `focused_window`; used by `iris` only. `focused_window` falls back to monitor center when none is available.
+- `opacity_outgoing` / `opacity_incoming`: float, intended `0.0..=1.0`; applies to all styles. Deserialization accepts other floats, but surrogate creation clamps the endpoint.
+- `zoom_factor`: float, intended `0.0..=1.0`, recommended `0.05..=0.15`; affects `slide` only. Deserialization accepts other floats, but animation setup clamps it.
+
+## General/core
+
+```yaml
+general:
+  startup_commands: []
+  shutdown_commands: []
+  config_reload_commands: []
+  focus_follows_cursor: false
+  toggle_workspace_on_refocus: true
+  cursor_jump:
+    enabled: false
+    trigger: "monitor_focus"
+  hide_method: "cloak"
+  show_all_in_taskbar: false
+```
+
+- `startup_commands`: command strings run after startup.
+- `shutdown_commands`: command strings run immediately before clean shutdown.
+- `config_reload_commands`: command strings run after a successful reload.
+- `focus_follows_cursor`: focuses the window under real pointer movement. This is independent of `cursor_jump`.
+- `toggle_workspace_on_refocus`: focusing the already-focused workspace switches to the previous workspace.
+- `cursor_jump.enabled`: moves the pointer automatically after the selected focus event.
+- `cursor_jump.trigger`: `monitor_focus` or `window_focus`.
+- `hide_method`: `cloak` (recommended Windows DWM cloak), `hide` (legacy Win32 hide), or `place_in_corner`. The last is forced on macOS.
+- `show_all_in_taskbar`: if true, windows on hidden workspaces remain represented in the Windows taskbar; ineffective with `hide`.
+
+### Gaps
+
+```yaml
+gaps:
+  scale_with_dpi: true
+  inner_gap: "20px"
+  outer_gap: { top: "60px", right: "20px", bottom: "20px", left: "20px" }
+  single_window_outer_gap: null
+```
+
+- `scale_with_dpi`: scales configured gaps for monitor DPI.
+- `inner_gap`: spacing between adjacent tiling windows.
+- `outer_gap`: edge spacing for normal workspace layouts.
+- `single_window_outer_gap`: optional replacement rectangle when exactly one tiling window exists; use `null` to disable.
+
+### Initial state
+
+```yaml
+window_behavior:
+  initial_state: "tiling"
+  state_defaults:
+    floating:
+      centered: true
+      shown_on_top: false
+    fullscreen:
+      maximized: true
+      shown_on_top: false
+```
+
+`initial_state` is `tiling` or `floating`. The child booleans become defaults for new windows and for state-changing commands when the corresponding flags are omitted.
+
+## Layouts and stacks
+
+The custom workspace layouts are runtime state selected by commands, not fields inside a `workspaces:` entry.
+
+| Layout value | Actual behavior |
+|---|---|
+| `bsp` | Recursively splits the insertion target; split axis follows the target tiling direction. |
+| `split_horizontal` | Equal-width top-level columns. |
+| `split_vertical` | Equal-height top-level rows. |
+| `columns` | Column distribution layout. |
+| `rows` | Row distribution layout. |
+| `grid` | Near-square row/column grid. |
+| `vertical_stack` | Main pane plus windows stacked vertically in the secondary area. |
+| `horizontal_stack` | Main pane plus windows stacked horizontally in the secondary area. |
+
+Only `split_horizontal`, `split_vertical`, `vertical_stack`, and `horizontal_stack` consume per-window tiling-size adjustments. Layout choice is remembered for an existing workspace during the process lifetime; there is no per-workspace YAML `layout` key.
+
+```yaml
+keybindings:
+  - commands: ["set-workspace-layout grid"]
+    bindings: ["alt+g"]
+  - commands: ["set-tiling-direction horizontal"]
+    bindings: ["alt+h"]
+  - commands: ["toggle-tiling-direction"]
+    bindings: ["alt+v"]
+```
+
+`set-tiling-direction` accepts `horizontal` or `vertical` and controls insertion direction in direction containers/BSP. `toggle-tiling-direction` flips it.
+
+### Stack tab bar
+
+```yaml
+stack:
+  tab_bar_height: "30px"
+  tab_bar_position: "top"
+  tab_bar_background: "#2d2d2d"
+  tab_active_background: "#4a4a6a"
+  tab_inactive_background: "#1e1e2e"
+  tab_text_color: "#cdd6f4"
+  tab_active_indicator_color: "#89b4fa"
+  tab_active_indicator_height: "2px"
+  tab_border_radius: "4px"
+  tab_separator_width: "1px"
+  tab_separator_color: "#3d3d3d"
+  tab_title_overrides:
+    - regex: "^(.*) - Mozilla Firefox$"
+      replace: "$1"
+```
+
+- `tab_bar_height`: `0px` disables rendering; Windows only.
+- `tab_bar_position`: `top` or `bottom`.
+- Color, indicator, radius, and separator fields control exactly the named tab visual; zero height/width disables that element.
+- `tab_title_overrides`: ordered Rust-regex replacements. Capture references such as `$1` work; omitted `replace` means empty text. Invalid regex rules are logged and skipped.
+
+Stack commands are listed under IPC/commands below. Named stacks created by `move-to-stack` are runtime containers; there is no YAML list of stack names.
+
+## Workspaces
+
+```yaml
+workspaces:
+  - name: "1"
+    display_name: "Main"
+    bind_to_monitor: 0
+    keep_alive: true
+```
+
+- `name` (required string): identifier used by focus/move commands.
+- `display_name` (optional string): presentation name for integrations/UI.
+- `bind_to_monitor` (optional unsigned integer): zero-based monitor index.
+- `keep_alive` (default `false`): retain the workspace when empty.
+
+At runtime, `update-workspace-config [--workspace NAME] --name NEW --display-name TEXT --bind-to-monitor N --keep-alive BOOL` updates one or more of these values. Without `--workspace`, it targets the subject/focused workspace. This is runtime state, not a config-file edit.
+
+## Keybindings and binding modes
+
+```yaml
+keybindings:
+  - commands:
+      - "focus --direction left"
+      - "shell-exec cmd"
+    bindings: ["alt+h", "alt+left"]
+
+binding_modes:
+  - name: "resize"
+    display_name: "Resize mode"
+    keybindings:
+      - commands: ["resize --width -2%"]
+        bindings: ["h", "left"]
+```
+
+Each keybinding's `commands` and `bindings` are lists. A binding is `+`-separated and case-insensitive. Available names are:
+
+- Letters `a`–`z`; numbers `0`–`9` (also `d0`–`d9`); `f1`–`f24`.
+- Modifiers: `cmd`, `ctrl`/`control`, `alt`/`menu`, `shift`, `win`, and left/right variants `lcmd`, `rcmd`, `lctrl`, `rctrl`, `lalt`/`lmenu`, `ralt`/`rmenu`, `lshift`, `rshift`, `lwin`, `rwin`.
+- Special/navigation: `space`, `tab`, `enter`/`return`, `delete`, `escape`, `backspace`, `left`, `right`, `up`, `down`, `home`, `end`, `page_up`, `page_down`, `insert`, `num_lock`, `scroll_lock`, `caps_lock`.
+- Numpad: `numpad0`–`numpad9`, `numpad_add`/`add`, `numpad_subtract`/`subtract`, `numpad_multiply`/`multiply`, `numpad_divide`/`divide`, `numpad_decimal`/`decimal`.
+- Media/language: `volume_up`, `volume_down`, `volume_mute`, `media_next_track`, `media_prev_track`, `media_stop`, `media_play_pause`, `print_screen`, `muhenkan`, `henkan`.
+- OEM: `oem_semicolon`, `oem_question`, `oem_tilde`, `oem_open_brackets`, `oem_pipe`, `oem_close_brackets`, `oem_quotes`, `oem_8`, `oem_102`, `oem_plus`, `oem_comma`/`comma`, `oem_minus`, `oem_period`/`period`. On Windows, a single literal key available without Shift/Alt in the active keyboard layout is also accepted.
+
+A binding mode needs `name`; `display_name` and `keybindings` are optional. Enable/disable it with `wm-enable-binding-mode --name NAME` and `wm-disable-binding-mode --name NAME`. The active mode's bindings replace the normal set. While paused, only bindings containing `wm-toggle-pause` remain active.
+
+## Window effects
+
+The same complete child structure is valid under both `focused_window` and `other_windows`:
+
+```yaml
+window_effects:
+  focused_window:
+    border: { enabled: false, color: "#8cbeff" }
+    hide_title_bar: { enabled: false }
+    corner_style: { enabled: false, style: "default" }
+    transparency: { enabled: false, opacity: "100%" }
+    backdrop:
+      enabled: false
+      style: "acrylic"
+      tint: null
+      blur_amount: 30.0
+      opacity: 1.0
+      saturation: 1.0
+  other_windows:
+    border: { enabled: false, color: "#8cbeff" }
+    hide_title_bar: { enabled: false }
+    corner_style: { enabled: false, style: "default" }
+    transparency: { enabled: false, opacity: "100%" }
+    backdrop: { enabled: false, style: "acrylic", tint: null, blur_amount: 30.0, opacity: 1.0, saturation: 1.0 }
+```
+
+- `border`: Windows 11 border highlight.
+- `hide_title_bar`: removes the native title bar; some applications may render incorrectly.
+- `corner_style.style`: `default`, `square`, `rounded`, or `small_rounded`; Windows 11.
+- `transparency.opacity`: window opacity using the opacity syntax above. `0` makes the real window transparent and effectively unfocusable.
+- `backdrop` (legacy section alias: `blur_behind`): DWM backdrop. `style` is `acrylic`, `mica`, or `mica_alt`; `tint` is null or a color. Acrylic is supported from Windows 10 1803; Mica variants require Windows 11 22H2. `blur_amount` is an unrestricted float intensity; `opacity` should be `0.0..=1.0`; `saturation` should be `0.0..=2.0`. Those three affect the custom acrylic overlay only and are ignored for Mica; if Windows.UI.Composition is unavailable, acrylic falls back to fixed OS intensity. Backdrop corner radius follows `corner_style` and has no independent key.
+
+## Window rules
+
+```yaml
+window_rules:
+  - commands: ["set-floating --centered", "set-transparency --opacity 95%"]
+    match:
+      - window_process: { equals: "notepad" }
+        window_class: { regex: "Notepad.*" }
+        window_title: { not_regex: "Private" }
+      - window_title: { includes: "Picture in Picture" }
+    on: ["manage", "title_change"]
+    run_once: true
+```
+
+- `commands` (required list): any invoke commands below.
+- `match` (required list): entries are OR alternatives; populated fields within an entry are AND conditions. Omitted process/class/title fields are wildcards.
+- Each match object must be exactly one of `{ equals: STRING }`, `{ includes: STRING }`, `{ regex: STRING }`, `{ not_equals: STRING }`, `{ not_regex: STRING }`. Comparisons are case-sensitive. Invalid regex never matches (and `not_regex` with invalid regex also returns false).
+- `on`: any of `manage`, `title_change`, `focus`; default is `[manage, title_change]`.
+- `run_once`: default `true`; prevents the same rule from rerunning for that managed window.
+- `ignore` unmanages/skips a matching window. `force-manage` is a pre-management marker that bypasses built-in manageability checks and is otherwise a no-op.
+
+## Scratchpad status
+
+This build has **no scratchpad configuration or command**. A source-wide search finds no `scratchpad`, `scratch_pad`, or `scratch-pad` schema, parser, command, or handler. Do not add a `scratchpad:` YAML section: it would be ignored as an unknown top-level key. Stacks, minimized windows, and hidden workspaces are separate features and are not scratchpads.
+
+## IPC and commands
+
+### Where command strings work
+
+Use the same command grammar in `keybindings[].commands`, `binding_modes[].keybindings[].commands`, `window_rules[].commands`, and the three general lifecycle command lists. YAML command parsing uses whitespace splitting, not shell quote parsing; avoid relying on quoted arguments with embedded spaces. `shell-exec` consumes all remaining words as the program command.
+
+From a terminal:
+
+```powershell
+glazewm.exe command focus --direction left
+glazewm.exe command --id 01234567-89ab-cdef-0123-456789abcdef set-floating --centered
+```
+
+`--id UUID` changes the subject container; otherwise the focused container is used.
+
+### Complete invoke-command list
+
+Square brackets below mean optional syntax; alternatives separated by `|` are mutually exclusive where stated.
+
+- `adjust-borders --top LENGTH [--right LENGTH --bottom LENGTH --left LENGTH]`: adjust one or more tiling borders; at least one side required.
+- `close`: request the subject window to close.
+- `focus` plus exactly one of `--direction DIR`, `--container-id UUID`, `--workspace-in-direction DIR`, `--workspace NAME`, `--monitor INDEX`, `--next-active-workspace`, `--prev-active-workspace`, `--next-workspace`, `--prev-workspace`, `--next-active-workspace-on-monitor`, `--prev-active-workspace-on-monitor`, `--recent-workspace`.
+- `force-manage`: window-rule pre-management marker described above.
+- `ignore`: unmanage/ignore the subject window.
+- `move-cursor --direction DIR`: move the cursor to the center of the currently active window. A direction argument is required by the parser, but the current handler only checks that it exists and otherwise ignores its value.
+- `move` plus exactly one of `--direction DIR`, `--workspace-in-direction DIR`, `--workspace NAME`, `--next-active-workspace`, `--prev-active-workspace`, `--next-workspace`, `--prev-workspace`, `--next-active-workspace-on-monitor`, `--prev-active-workspace-on-monitor`, `--recent-workspace`.
+- `move-workspace --direction DIR`: move the current workspace to the adjacent monitor.
+- `position --centered [--x-pos INTEGER --y-pos INTEGER]`: position a floating window; at least one option required.
+- `resize --width LENGTH [--height LENGTH]`: adjust tiling size or floating dimensions; at least one required. `size` is the same command shape.
+- `update-workspace-config [--workspace NAME] [--name STRING] [--display-name STRING] [--bind-to-monitor UINT] [--keep-alive BOOL]`: update at least one workspace setting.
+- `set-floating [--shown-on-top[=BOOL]] [--centered[=BOOL]] [--x-pos INTEGER] [--y-pos INTEGER] [--width LENGTH] [--height LENGTH]`: enter floating state. Bare boolean switches mean true; false requires `=false`.
+- `set-fullscreen [--shown-on-top[=BOOL]] [--maximized[=BOOL]]`: enter fullscreen state, using configured defaults for omitted values.
+- `set-minimized`, `set-tiling`: enter the named state.
+- `set-title-bar-visibility shown|hidden`: change native title-bar visibility.
+- `set-transparency --opacity OPACITY [--opacity-delta SIGNED_OPACITY]`: set and/or adjust opacity; at least one required. Examples: `--opacity 95%`, `--opacity-delta -5%`.
+- `shell-exec [--hide-window] PROGRAM [ARG ...]`: launch a process; `--hide-window` hides its console window.
+- `toggle-floating [--shown-on-top[=BOOL]] [--centered[=BOOL]]`, `toggle-fullscreen [--shown-on-top[=BOOL]] [--maximized[=BOOL]]`, `toggle-minimized`, `toggle-tiling`: toggle states.
+- `toggle-stack`: move the focused tiling window into/out of a stack.
+- `cycle-stack-focus [--prev]`: cycle stack children; default is next.
+- `focus-stack-index --index UINT`: focus a zero-based child index.
+- `stack-absorb-neighbor --direction DIR`: combine the directional tiling neighbor with the focused window in a stack.
+- `stack-insert`: stack with the most recently focused other tiling window, creating a stack when needed.
+- `move-to-stack --name STRING`: move into/create a named stack on the current workspace.
+- `toggle-tiling-direction`; `set-tiling-direction horizontal|vertical`.
+- `set-workspace-layout bsp|split_horizontal|split_vertical|columns|rows|grid|vertical_stack|horizontal_stack`.
+- `wm-cycle-focus [--omit-floating BOOL] [--omit-fullscreen BOOL] [--omit-minimized BOOL] [--omit-tiling BOOL]`: cycle state groups. Defaults are false, false, true, false respectively.
+- `wm-enable-binding-mode --name STRING`; `wm-disable-binding-mode --name STRING`.
+- `wm-exit`: cleanly stop the WM; `wm-redraw`: redraw all managed windows; `wm-reload-config`: reload YAML; `wm-toggle-pause`: pause/resume management.
+
+### Queries, subscriptions, and raw IPC
+
+```powershell
+glazewm.exe query app-metadata
+glazewm.exe query binding-modes
+glazewm.exe query focused
+glazewm.exe query layout
+glazewm.exe query monitors
+glazewm.exe query windows
+glazewm.exe query workspaces
+glazewm.exe query paused
+
+glazewm.exe sub --events focus_changed workspace_updated
+glazewm.exe unsub --id SUBSCRIPTION_UUID
+```
+
+`query` also has alias `q`. Subscription event values are `all`, `application_exiting`, `binding_modes_changed`, `focus_changed`, `focused_container_moved`, `monitor_added`, `monitor_updated`, `monitor_removed`, `layout_changed`, `user_config_changed`, `window_managed`, `window_unmanaged`, `workspace_activated`, `workspace_deactivated`, `workspace_updated`, and `pause_changed`.
+
+The local WebSocket IPC endpoint is fixed at `ws://127.0.0.1:6123`; there is no config key for the port. Responses are tagged with JSON `messageType` (`client_response` or `event_subscription`); event payloads use `eventType` with the values above and camelCase fields.
+
+### Process startup/config selection
+
+```powershell
+glazewm.exe start --config C:\path\to\config.yaml
+glazewm.exe start --verbose
+glazewm.exe start --quiet
+```
+
+`start` accepts `-c/--config`, `-v/--verbose`, or `-q/--quiet` (`verbose` and `quiet` conflict). With no subcommand, the executable defaults to `start`. Config precedence is command-line path, then `GLAZEWM_CONFIG_PATH`, then `%USERPROFILE%\.glzr\glazewm\config.yaml`; when the default file is absent, the embedded repository sample is created there.
+
+## Defaults and portability cautions
+
+- Every top-level section defaults if omitted, but list-item required fields (`workspace.name`, window-rule `commands`/`match`, binding-mode `name`) must be present when that item exists.
+- The embedded sample intentionally overrides some source defaults (for example `toggle_workspace_on_refocus`, cursor jump, close animation, fullscreen maximization, borders). Values labeled as defaults in this document are source defaults, not necessarily sample choices.
+- Windows-native effects and DComp animations are best-effort. Unsupported APIs should leave the real window usable; Mica has no acrylic fallback, while acrylic has a fixed-intensity fallback.
+- Runtime commands such as workspace layout/config changes do not rewrite YAML and generally do not survive a process restart unless represented by startup commands/keybindings.

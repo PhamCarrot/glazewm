@@ -1,19 +1,20 @@
 //! `Windows.UI.Composition` based acrylic blur pipeline.
 //!
-//! Replaces SWCA's fixed-intensity `ACCENT_ENABLE_ACRYLICBLURBEHIND` with a
-//! host-backdrop brush fed through a hand-implemented Gaussian-blur effect
-//! graph, giving a continuously adjustable blur radius, plus a
+//! Replaces SWCA's fixed-intensity `ACCENT_ENABLE_ACRYLICBLURBEHIND` with
+//! a host-backdrop brush fed through a hand-implemented Gaussian-blur
+//! effect graph, giving a continuously adjustable blur radius, plus a
 //! `CompositionRoundedRectangleGeometry` clip for a continuous corner
 //! radius -- neither of which SWCA/Mica can provide. Validated in
 //! `packages/composition-blur-spike` before this port; see that crate's
-//! module docs for the concrete API findings this implementation relies on.
+//! module docs for the concrete API findings this implementation relies
+//! on.
 //!
 //! # Threading
 //!
-//! A `Compositor` must be created on a thread that owns a dispatcher queue,
-//! and (confirmed empirically in the spike, not just per docs) that thread
-//! must keep pumping messages for async composition work -- e.g. the
-//! effect factory's shader-graph compile -- to ever complete.
+//! A `Compositor` must be created on a thread that owns a dispatcher
+//! queue, and (confirmed empirically in the spike, not just per docs) that
+//! thread must keep pumping messages for async composition work -- e.g.
+//! the effect factory's shader-graph compile -- to ever complete.
 //! `wm`'s main loop drives everything through `tokio::select!`/
 //! `rt.block_on`, which never pumps Win32 messages, so the entire
 //! composition pipeline (the `Compositor` itself, and every per-overlay
@@ -39,17 +40,11 @@ use windows::{
   core::{implement, ComInterface, GUID, HSTRING, PCWSTR},
   Foundation::{Numerics::Vector2, PropertyValue},
   Graphics::Effects::{
-    IGraphicsEffect, IGraphicsEffect_Impl, IGraphicsEffectSource,
-    IGraphicsEffectSource_Impl,
+    IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectSource_Impl,
+    IGraphicsEffect_Impl,
   },
-  System::{DispatcherQueue, DispatcherQueueController, DispatcherQueueHandler},
-  UI::{
-    Color,
-    Composition::{
-      CompositionBackdropBrush, CompositionColorBrush, CompositionEffectBrush,
-      CompositionEffectSourceParameter, CompositionRoundedRectangleGeometry,
-      Compositor, ContainerVisual, Desktop::DesktopWindowTarget, SpriteVisual,
-    },
+  System::{
+    DispatcherQueue, DispatcherQueueController, DispatcherQueueHandler,
   },
   Win32::{
     Foundation::{E_INVALIDARG, HWND},
@@ -60,6 +55,15 @@ use windows::{
         GRAPHICS_EFFECT_PROPERTY_MAPPING,
         GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
       },
+    },
+  },
+  UI::{
+    Color,
+    Composition::{
+      CompositionBackdropBrush, CompositionColorBrush,
+      CompositionEffectBrush, CompositionEffectSourceParameter,
+      CompositionRoundedRectangleGeometry, Compositor, ContainerVisual,
+      Desktop::DesktopWindowTarget, SpriteVisual,
     },
   },
 };
@@ -76,9 +80,10 @@ const D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED: u32 = 1;
 const D2D1_BORDER_MODE_SOFT: u32 = 0;
 
 /// `CLSID_D2D1Saturation`, the built-in D2D1 saturation-adjustment effect.
-/// Value matches `windows::Win32::Graphics::Direct2D::CLSID_D2D1Saturation`
-/// (re-declared as a local `const` so it sits next to
-/// `CLSID_D2D1_GAUSSIAN_BLUR` and follows this module's naming convention).
+/// Value matches
+/// `windows::Win32::Graphics::Direct2D::CLSID_D2D1Saturation` (re-declared
+/// as a local `const` so it sits next to `CLSID_D2D1_GAUSSIAN_BLUR` and
+/// follows this module's naming convention).
 const CLSID_D2D1_SATURATION: GUID =
   GUID::from_u128(0x5cb2_d9cf_327d_459f_a0ce_40c0_b208_6bf7);
 
@@ -88,15 +93,19 @@ const CLSID_D2D1_SATURATION: GUID =
 /// but this code never tunes.
 ///
 /// `Compositor::CreateEffectFactory` takes an `IGraphicsEffect` describing
-/// an effect graph. `Win2D`'s convenience effect types (`GaussianBlurEffect`,
-/// etc.) require the `Win2D` winmd, which `windows-rs`'s metadata-driven
-/// binding generator cannot consume -- so this hand-implements the
-/// `IGraphicsEffectD2D1Interop` COM shape directly against D2D1's built-in
-/// effects, the same approach Microsoft's own
-/// `Windows.UI.Composition-Win32-Samples` uses in C++. One instance of this
-/// type is used per built-in effect ([`CLSID_D2D1_GAUSSIAN_BLUR`],
+/// an effect graph. `Win2D`'s convenience effect types
+/// (`GaussianBlurEffect`, etc.) require the `Win2D` winmd, which
+/// `windows-rs`'s metadata-driven binding generator cannot consume -- so
+/// this hand-implements the `IGraphicsEffectD2D1Interop` COM shape
+/// directly against D2D1's built-in effects, the same approach Microsoft's
+/// own `Windows.UI.Composition-Win32-Samples` uses in C++. One instance of
+/// this type is used per built-in effect ([`CLSID_D2D1_GAUSSIAN_BLUR`],
 /// [`CLSID_D2D1_SATURATION`]) chained in `build_effect_brush`.
-#[implement(IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectD2D1Interop)]
+#[implement(
+  IGraphicsEffect,
+  IGraphicsEffectSource,
+  IGraphicsEffectD2D1Interop
+)]
 struct D2d1ScalarEffect {
   effect_id: GUID,
   source: IGraphicsEffectSource,
@@ -105,16 +114,17 @@ struct D2d1ScalarEffect {
   /// (see its doc comment for why both forms are checked).
   property_name: &'static str,
   /// Initial value baked into the effect graph at factory creation.
-  /// Runtime adjustment rebuilds the whole brush rather than mutating this
-  /// in place -- see `BlurVisual::set_blur_amount`'s doc comment for why.
+  /// Runtime adjustment rebuilds the whole brush rather than mutating
+  /// this in place -- see `BlurVisual::set_blur_amount`'s doc comment
+  /// for why.
   initial_value: f32,
   /// Additional fixed `u32` properties required by the effect's D2D1
   /// schema, in index order starting at index 1 (index 0 is always
   /// `initial_value`). Empty for saturation; Gaussian blur needs
-  /// `[D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_BORDER_MODE_SOFT]` --
-  /// `CreateEffectFactory` validates the description against D2D1's
-  /// registered schema for the effect and fails with `E_INVALIDARG` unless
-  /// all of them are present, even though only the scalar is
+  /// `[D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_BORDER_MODE_SOFT]`
+  /// -- `CreateEffectFactory` validates the description against D2D1's
+  /// registered schema for the effect and fails with `E_INVALIDARG`
+  /// unless all of them are present, even though only the scalar is
   /// runtime-adjustable here.
   extra_properties: &'static [u32],
   name: RefCell<HSTRING>,
@@ -268,10 +278,10 @@ fn init_composition_thread() -> crate::Result<CompositionThread> {
 }
 
 /// Runs `f` on the composition thread via its dispatcher queue and blocks
-/// the calling thread for the result. Used for the one-time, async-sensitive
-/// construction calls (`Compositor::new`, and per-overlay visual-tree
-/// building, which touches the effect factory) -- see the module docs for
-/// why these specifically must run there.
+/// the calling thread for the result. Used for the one-time,
+/// async-sensitive construction calls (`Compositor::new`, and per-overlay
+/// visual-tree building, which touches the effect factory) -- see the
+/// module docs for why these specifically must run there.
 fn run_on_composition_thread<T, F>(
   queue: &DispatcherQueue,
   f: F,
@@ -290,10 +300,20 @@ where
     Ok(())
   });
 
-  queue.TryEnqueue(&handler)?;
+  ensure_composition_work_queued(queue.TryEnqueue(&handler)?)?;
 
   let result = rx.recv_timeout(Duration::from_secs(5))?;
   Ok(result?)
+}
+
+fn ensure_composition_work_queued(queued: bool) -> crate::Result<()> {
+  if queued {
+    Ok(())
+  } else {
+    Err(crate::Error::Platform(
+      "Composition dispatcher rejected queued work.".to_string(),
+    ))
+  }
 }
 
 /// Unpacks an ABGR-packed tint (see `BackdropEffectConfig::acrylic_tint`)
@@ -314,7 +334,8 @@ fn unpack_abgr_tint(tint: u32) -> Color {
 /// clipped to a continuous rounded rectangle.
 pub(crate) struct BlurVisual {
   /// Binds the visual tree to the overlay's `HWND`. Kept alive but never
-  /// touched again -- dropping it would unbind composition from the window.
+  /// touched again -- dropping it would unbind composition from the
+  /// window.
   _target: DesktopWindowTarget,
 
   /// Retained (rather than just used during `create`) so
@@ -332,8 +353,8 @@ pub(crate) struct BlurVisual {
   tint_brush: CompositionColorBrush,
   rounded_geometry: CompositionRoundedRectangleGeometry,
 
-  /// Current blur amount, kept alongside `saturation` so either setter can
-  /// rebuild the full effect graph using the other's current value.
+  /// Current blur amount, kept alongside `saturation` so either setter
+  /// can rebuild the full effect graph using the other's current value.
   blur_amount: f32,
   /// Current saturation. See `blur_amount`.
   saturation: f32,
@@ -366,12 +387,12 @@ impl BlurVisual {
     })
   }
 
-  /// Resizes the visual tree's clip and both child visuals to match `rect`.
-  /// Does not reposition the `HWND` itself -- callers still issue their own
-  /// `SetWindowPos`, exactly as with the SWCA path.
+  /// Resizes the visual tree's clip and both child visuals to match
+  /// `rect`. Does not reposition the `HWND` itself -- callers still
+  /// issue their own `SetWindowPos`, exactly as with the SWCA path.
   ///
-  /// Must resize `root`/`blur_sprite`/`tint_sprite` in addition to the clip
-  /// geometry -- they're independently-sized visuals set once in
+  /// Must resize `root`/`blur_sprite`/`tint_sprite` in addition to the
+  /// clip geometry -- they're independently-sized visuals set once in
   /// `build_visual_tree` and never otherwise touched, so leaving them out
   /// here left them pinned at their creation-time size while only the clip
   /// grew, showing blur/tint over just the original area and nothing over
@@ -405,21 +426,26 @@ impl BlurVisual {
   /// `E_INVALIDARG` here, regardless of whether `GetNamedPropertyMapping`
   /// is queried with `"BlurAmount"` or `"Blur.BlurAmount"` -- consistent
   /// with `InsertScalar` needing the property to have been registered via
-  /// `Compositor::CreateEffectFactoryWithProperties`'s `animatableProperties`
-  /// list (which requires an `IIterable<HSTRING>`, not constructible from a
-  /// `Vec` in this `windows-rs` version without hand-implementing the
-  /// `WinRT` iterator interfaces) rather than the plain `CreateEffectFactory`
+  /// `Compositor::CreateEffectFactoryWithProperties`'s
+  /// `animatableProperties` list (which requires an
+  /// `IIterable<HSTRING>`, not constructible from a `Vec` in this
+  /// `windows-rs` version without hand-implementing the `WinRT` iterator
+  /// interfaces) rather than the plain `CreateEffectFactory`
   /// this code uses. Rebuilding the brush instead reuses only the
   /// `GetProperty`-based initial-value path, which is confirmed working
   /// (overlays visibly render blur from their initial `blur_amount`).
-  pub(crate) fn set_blur_amount(&mut self, value: f32) -> crate::Result<()> {
+  pub(crate) fn set_blur_amount(
+    &mut self,
+    value: f32,
+  ) -> crate::Result<()> {
     let compositor = self.compositor.clone();
     let host_backdrop = self.host_backdrop.clone();
     let saturation = self.saturation;
 
-    let effect_brush = run_on_composition_thread(&self.queue, move || {
-      build_effect_brush(&compositor, &host_backdrop, value, saturation)
-    })?;
+    let effect_brush =
+      run_on_composition_thread(&self.queue, move || {
+        build_effect_brush(&compositor, &host_backdrop, value, saturation)
+      })?;
 
     self.blur_sprite.SetBrush(&effect_brush)?;
     self.effect_brush = effect_brush;
@@ -433,14 +459,18 @@ impl BlurVisual {
   /// working in this pipeline) -- both knobs share the one effect graph,
   /// so either setter rebuilds the whole thing using the other's current
   /// stored value.
-  pub(crate) fn set_saturation(&mut self, value: f32) -> crate::Result<()> {
+  pub(crate) fn set_saturation(
+    &mut self,
+    value: f32,
+  ) -> crate::Result<()> {
     let compositor = self.compositor.clone();
     let host_backdrop = self.host_backdrop.clone();
     let blur_amount = self.blur_amount;
 
-    let effect_brush = run_on_composition_thread(&self.queue, move || {
-      build_effect_brush(&compositor, &host_backdrop, blur_amount, value)
-    })?;
+    let effect_brush =
+      run_on_composition_thread(&self.queue, move || {
+        build_effect_brush(&compositor, &host_backdrop, blur_amount, value)
+      })?;
 
     self.blur_sprite.SetBrush(&effect_brush)?;
     self.effect_brush = effect_brush;
@@ -470,7 +500,8 @@ impl BlurVisual {
 /// `DesktopWindowTarget` sizes composition visuals 1:1 against the HWND's
 /// actual client pixel size (no DPI virtualization layer here, unlike
 /// XAML/UWP) -- so this is a passthrough today. Named/kept separate from a
-/// bare cast so a future DPI-aware sizing adjustment has a single call site.
+/// bare cast so a future DPI-aware sizing adjustment has a single call
+/// site.
 #[allow(clippy::cast_precision_loss, clippy::unnecessary_wraps)]
 fn pixels_to_dips(pixels: i32) -> f32 {
   pixels as f32
@@ -486,10 +517,11 @@ fn pixels_to_dips(pixels: i32) -> f32 {
 /// single `CreateEffectFactory` call, producing one brush -- not two
 /// independently-chained brushes. `SetSourceParameter("Source", ..)` binds
 /// `host_backdrop` to the *inner* (blur) node's named parameter; the outer
-/// (saturation) node's own source is the blur node's `IGraphicsEffectSource`
-/// directly (an internal graph edge via `GetSource`, not a named
-/// parameter), and the composition engine resolves the "Source" name
-/// lookup through to it regardless of nesting depth.
+/// (saturation) node's own source is the blur node's
+/// `IGraphicsEffectSource` directly (an internal graph edge via
+/// `GetSource`, not a named parameter), and the composition engine
+/// resolves the "Source" name lookup through to it regardless of nesting
+/// depth.
 ///
 /// `exposure`, `vignette`, and `grain` were tried and dropped.
 /// `Windows.UI.Composition`'s `CreateEffectFactory` accepts a curated
@@ -520,7 +552,10 @@ fn build_effect_brush(
     source_param.cast()?,
     "BlurAmount",
     blur_amount,
-    &[D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_BORDER_MODE_SOFT],
+    &[
+      D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
+      D2D1_BORDER_MODE_SOFT,
+    ],
   )
   .into();
   let saturation_effect: IGraphicsEffect = D2d1ScalarEffect::new(
@@ -532,9 +567,11 @@ fn build_effect_brush(
     &[],
   )
   .into();
-  let effect_factory = compositor.CreateEffectFactory(&saturation_effect)?;
+  let effect_factory =
+    compositor.CreateEffectFactory(&saturation_effect)?;
   let effect_brush = effect_factory.CreateBrush()?;
-  effect_brush.SetSourceParameter(&HSTRING::from("Source"), host_backdrop)?;
+  effect_brush
+    .SetSourceParameter(&HSTRING::from("Source"), host_backdrop)?;
   Ok(effect_brush)
 }
 
@@ -558,7 +595,10 @@ fn build_visual_tree(
 
   let width = pixels_to_dips(rect.width());
   let height = pixels_to_dips(rect.height());
-  let size = Vector2 { X: width, Y: height };
+  let size = Vector2 {
+    X: width,
+    Y: height,
+  };
 
   let rounded_geometry = compositor.CreateRoundedRectangleGeometry()?;
   rounded_geometry.SetSize(size)?;
@@ -566,7 +606,8 @@ fn build_visual_tree(
     X: params.corner_radius,
     Y: params.corner_radius,
   })?;
-  let clip = compositor.CreateGeometricClipWithGeometry(&rounded_geometry)?;
+  let clip =
+    compositor.CreateGeometricClipWithGeometry(&rounded_geometry)?;
 
   let host_backdrop = compositor.CreateHostBackdropBrush()?;
   let effect_brush = build_effect_brush(
@@ -609,4 +650,15 @@ fn build_visual_tree(
     blur_amount: params.blur_amount,
     saturation: params.saturation,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ensure_composition_work_queued;
+
+  #[test]
+  fn rejected_composition_work_fails_without_waiting() {
+    assert!(ensure_composition_work_queued(false).is_err());
+    assert!(ensure_composition_work_queued(true).is_ok());
+  }
 }

@@ -7,11 +7,11 @@ use windows::{
   Win32::{
     Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
     Graphics::Dwm::{
-      DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
+      DwmGetWindowAttribute, DwmSetWindowAttribute, DWMSBT_AUTO,
+      DWMSBT_MAINWINDOW, DWMSBT_TABBEDWINDOW, DWMWA_BORDER_COLOR,
       DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
-      DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT,
-      DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL, DWMSBT_AUTO,
-      DWMSBT_MAINWINDOW, DWMSBT_TABBEDWINDOW,
+      DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE,
+      DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
     },
     System::Threading::{
       OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -30,9 +30,8 @@ use windows::{
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
         SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
         GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, GW_OWNER, HWND_NOTOPMOST,
-        HWND_TOP,
-        HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
-        LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
+        HWND_TOP, HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS,
+        LWA_ALPHA, LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
         SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
         SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
@@ -586,10 +585,10 @@ impl NativeWindow {
       return Ok(());
     }
 
-    // `SWP_NOCOPYBITS` is deliberately omitted: the window does not move or
-    // resize, so its bits are unchanged — discarding them would force a
-    // full repaint of the client area, which flickers on slow-painting
-    // apps.
+    // `SWP_NOCOPYBITS` is deliberately omitted: the window does not move
+    // or resize, so its bits are unchanged — discarding them would
+    // force a full repaint of the client area, which flickers on
+    // slow-painting apps.
     let flags = SWP_NOACTIVATE
       | SWP_ASYNCWINDOWPOS
       | SWP_SHOWWINDOW
@@ -764,8 +763,9 @@ impl NativeWindow {
     let mut alpha = u8::MAX;
     let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
 
-    // SAFETY: `self.hwnd()` is a valid window handle. `alpha` and `flag` are
-    // stack-allocated out-parameters live for the duration of the call.
+    // SAFETY: `self.hwnd()` is a valid window handle. `alpha` and `flag`
+    // are stack-allocated out-parameters live for the duration of the
+    // call.
     unsafe {
       GetLayeredWindowAttributes(
         self.hwnd(),
@@ -791,11 +791,12 @@ impl NativeWindow {
   ///
   /// `Acrylic` is a no-op here: it's applied via a persistent
   /// `NativeBlurOverlay` window instead of `DWMWA_SYSTEMBACKDROP_TYPE`, to
-  /// avoid a `WS_EX_LAYERED`/SWCA compositing conflict on the managed window
-  /// itself. Callers are expected to filter it out before calling (see
-  /// `apply_backdrop_effect` in `platform_sync.rs`), but this is not treated
-  /// as an invariant violation, since a future call site passing it through
-  /// would only silently no-op rather than panic the process.
+  /// avoid a `WS_EX_LAYERED`/SWCA compositing conflict on the managed
+  /// window itself. Callers are expected to filter it out before calling
+  /// (see `apply_backdrop_effect` in `platform_sync.rs`), but this is
+  /// not treated as an invariant violation, since a future call site
+  /// passing it through would only silently no-op rather than panic the
+  /// process.
   pub(crate) fn set_blur_behind(
     &self,
     style: Option<&BackdropStyle>,

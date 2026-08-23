@@ -1,6 +1,5 @@
 use std::sync::OnceLock;
 
-use tokio::sync::mpsc;
 use windows::Win32::{
   Foundation::HWND,
   UI::{
@@ -17,11 +16,14 @@ use windows::Win32::{
 };
 
 use super::NativeWindow;
-use crate::{Dispatcher, WindowEvent, WindowId};
+use crate::{
+  window_listener::NativeWindowEventSender, Dispatcher, WindowEvent,
+  WindowId,
+};
 
 thread_local! {
   /// Sender for window events. For use with hook procedure.
-  static EVENT_TX: OnceLock<mpsc::UnboundedSender<WindowEvent>> = const { OnceLock::new() };
+  static EVENT_TX: OnceLock<NativeWindowEventSender> = const { OnceLock::new() };
 }
 
 /// Platform-specific implementation of [`WindowEventNotification`].
@@ -37,7 +39,7 @@ pub(crate) struct WindowListener {
 impl WindowListener {
   /// Implements [`WindowListener::new`].
   pub(crate) fn new(
-    event_tx: mpsc::UnboundedSender<WindowEvent>,
+    event_tx: NativeWindowEventSender,
     dispatcher: &Dispatcher,
   ) -> crate::Result<Self> {
     let hook_handles = dispatcher.dispatch_sync(move || {
@@ -179,9 +181,7 @@ impl WindowListener {
       _ => return,
     };
 
-    if let Err(err) = event_tx.send(event) {
-      tracing::warn!("Failed to send window event: {}.", err);
-    }
+    event_tx.send(event);
   }
 }
 

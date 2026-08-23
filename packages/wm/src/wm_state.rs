@@ -1,16 +1,22 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+  collections::{HashMap, HashSet},
+  time::Instant,
+};
 
 use anyhow::Context;
 use tokio::sync::mpsc::{self};
 use tracing::warn;
 use uuid::Uuid;
-use wm_common::{BindingModeConfig, HideCorner, WindowState, WmEvent};
+use wm_common::{
+  BindingModeConfig, HideCorner, WindowState, WmEvent, WorkspaceLayout,
+};
 use wm_platform::{
-  Direction, Dispatcher, Display, NativeWindow, Point, Rect,
+  Direction, Dispatcher, Display, NativeWindow, Point, Rect, WindowId,
 };
 #[cfg(target_os = "windows")]
 use wm_platform::{
-  NativeBlurOverlay, NativeStackTabBar, NativeWindowWindowsExt, OpacityValue,
+  NativeBlurOverlay, NativeStackTabBar, NativeWindowWindowsExt,
+  OpacityValue,
 };
 
 use crate::{
@@ -42,7 +48,8 @@ pub struct WmState {
   /// Manager for window animations.
   pub animation_manager: AnimationManager,
 
-  /// Tracks the target position for each window to prevent animation restart loops.
+  /// Tracks the target position for each window to prevent animation
+  /// restart loops.
   pub window_target_positions: HashMap<Uuid, Rect>,
 
   /// Name of the most recently focused workspace.
@@ -50,6 +57,10 @@ pub struct WmState {
   /// Used for the `general.toggle_workspace_on_refocus` option on
   /// workspace focus.
   pub recent_workspace_name: Option<String>,
+
+  /// Last selected layout for workspaces that may be deactivated and
+  /// later recreated during this WM session.
+  pub workspace_layouts: HashMap<String, WorkspaceLayout>,
 
   /// The previously focused window that had focus effects applied.
   ///
@@ -70,19 +81,46 @@ pub struct WmState {
   /// `ignore` command.
   pub ignored_windows: Vec<NativeWindow>,
 
+  /// Native windows with one delayed manageability retry already queued.
+  ///
+  /// Coalesces duplicate show notifications and prevents a failing HWND
+  /// from spawning multiple retry chains.
+  pub pending_window_manage_retries: HashSet<WindowId>,
+
+  /// Sender for delayed native-window manageability retries.
+  pub window_manage_retry_tx: mpsc::UnboundedSender<(NativeWindow, u8)>,
+
   /// Whether the WM is paused.
   pub is_paused: bool,
 
   /// Whether the OS focused window is the same as the WM focused window.
   pub is_focus_synced: bool,
 
+  /// Logical focus target awaiting one post-workspace-switch cursor
+  /// refresh.
+  ///
+  /// The refresh is consumed only after a matching native foreground
+  /// event confirms focus, so focus-follows-cursor cannot race a
+  /// covered incoming window during the surrogate handoff.
+  #[cfg(target_os = "windows")]
+  pub pending_post_switch_cursor_refresh: Option<Uuid>,
+
+  /// Incoming focused window whose workspace-switch surrogate already
+  /// presented the focused effects. The matching native focus
+  /// confirmation commits those effects without restarting from the
+  /// unfocused opacity.
+  #[cfg(target_os = "windows")]
+  pub pending_presented_focus_effect_handoff: Option<Uuid>,
+
   /// Acrylic blur overlay windows keyed by managed-window UUID.
   ///
-  /// Each overlay is a `WS_POPUP` window with `ACCENT_ENABLE_ACRYLICBLURBEHIND`
-  /// applied via `SetWindowCompositionAttribute`, positioned at `HWND_BOTTOM`
-  /// flush with the managed window's DWM frame rect. When the managed window
-  /// is semi-transparent (`transparency` effect), the overlay's blurred-desktop
-  /// content shows through, producing a frosted-glass look.
+  /// Each overlay is a `WS_POPUP` window with
+  /// `ACCENT_ENABLE_ACRYLICBLURBEHIND` applied via
+  /// `SetWindowCompositionAttribute`, positioned at `HWND_BOTTOM` flush
+  /// with the managed window's DWM frame rect. When the managed window
+  /// is semi-transparent (`transparency` effect), the overlay's
+  /// blurred-desktop content shows through, producing a frosted-glass
+  /// look.
   #[cfg(target_os = "windows")]
   pub blur_overlays: HashMap<Uuid, NativeBlurOverlay>,
 
@@ -112,7 +150,8 @@ impl WmState {
     dispatcher: Dispatcher,
     event_tx: mpsc::UnboundedSender<WmEvent>,
     exit_tx: mpsc::UnboundedSender<()>,
-    animation_tick_tx: mpsc::UnboundedSender<()>,
+    animation_tick_tx: mpsc::Sender<()>,
+    window_manage_retry_tx: mpsc::UnboundedSender<(NativeWindow, u8)>,
     tab_click_tx: mpsc::UnboundedSender<(Uuid, usize)>,
   ) -> Self {
     Self {
@@ -121,6 +160,7 @@ impl WmState {
       pending_sync: PendingSync::default(),
       animation_manager: AnimationManager::new(animation_tick_tx),
       window_target_positions: HashMap::new(),
+      workspace_layouts: HashMap::new(),
       #[cfg(target_os = "windows")]
       blur_overlays: HashMap::new(),
       prev_effects_window: None,
@@ -128,8 +168,14 @@ impl WmState {
       unmanaged_or_minimized_timestamp: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
+      pending_window_manage_retries: HashSet::new(),
+      window_manage_retry_tx,
       is_paused: false,
       is_focus_synced: false,
+      #[cfg(target_os = "windows")]
+      pending_post_switch_cursor_refresh: None,
+      #[cfg(target_os = "windows")]
+      pending_presented_focus_effect_handoff: None,
       has_initialized: false,
       event_tx,
       exit_tx,
@@ -723,9 +769,9 @@ impl WmState {
 impl Drop for WmState {
   fn drop(&mut self) {
     // Commit all active resize sessions before cleaning up windows so that
-    // surrogate overlays are destroyed and windows are moved to their target
-    // positions. This prevents invisible or mispositioned windows after a
-    // crash or forced exit.
+    // surrogate overlays are destroyed and windows are moved to their
+    // target positions. This prevents invisible or mispositioned
+    // windows after a crash or forced exit.
     #[cfg(target_os = "windows")]
     for session in self.animation_manager.drain_all_sessions() {
       if let Err(err) = session.commit() {
@@ -748,7 +794,8 @@ impl Drop for WmState {
       #[cfg(target_os = "windows")]
       {
         // Uncloak before showing — a surrogate animation may have cloaked
-        // this window. Without this, the window stays invisible after exit.
+        // this window. Without this, the window stays invisible after
+        // exit.
         let _ = window.native().set_cloaked(false);
 
         if let Err(err) = window.native().show() {

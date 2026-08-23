@@ -14,7 +14,9 @@ use crate::{platform_impl, Rect};
 #[cfg(target_os = "macos")]
 use crate::{platform_impl::AXUIElementExt, ThreadBound};
 #[cfg(target_os = "windows")]
-use crate::{BackdropStyle, Color, CornerStyle, Delta, OpacityValue, RectDelta};
+use crate::{
+  BackdropStyle, Color, CornerStyle, Delta, OpacityValue, RectDelta,
+};
 
 /// Unique identifier of a window.
 ///
@@ -341,11 +343,12 @@ pub trait NativeWindowWindowsExt {
   /// `SWP_FRAMECHANGED` (issued whenever a window is resized) forces a
   /// non-client-area recalculation that can make DWM briefly composite the
   /// window at full opacity before the existing `LWA_ALPHA` value is
-  /// reasserted — a one-frame flash to solid on every resize/move/workspace-
-  /// switch landing for any window using the `transparency` effect. Calling
-  /// this immediately after such a `SetWindowPos` forces DWM to recomposite
-  /// with the correct alpha right away, closing that gap. No-op if the
-  /// window isn't currently layered.
+  /// reasserted — a one-frame flash to solid on every
+  /// resize/move/workspace- switch landing for any window using the
+  /// `transparency` effect. Calling this immediately after such a
+  /// `SetWindowPos` forces DWM to recomposite with the correct alpha
+  /// right away, closing that gap. No-op if the window isn't currently
+  /// layered.
   ///
   /// # Platform-specific
   ///
@@ -354,20 +357,23 @@ pub trait NativeWindowWindowsExt {
 
   /// Applies a DWM system-backdrop material to the window.
   ///
-  /// `Mica` and `MicaAlt` use `DWMWA_SYSTEMBACKDROP_TYPE` (Windows 11 22H2+)
-  /// and silently do nothing on unsupported builds. `None` clears any
-  /// previously applied effect.
+  /// `Mica` and `MicaAlt` use `DWMWA_SYSTEMBACKDROP_TYPE` (Windows 11
+  /// 22H2+) and silently do nothing on unsupported builds. `None` clears
+  /// any previously applied effect.
   ///
   /// `Acrylic` is handled separately via a persistent `NativeBlurOverlay`
   /// placed behind the window (see `sync_blur_overlays`) — applying SWCA
   /// directly to the managed window itself would conflict with the
-  /// `WS_EX_LAYERED` style used by the `transparency` effect, so this method
-  /// is never called with `Acrylic`.
+  /// `WS_EX_LAYERED` style used by the `transparency` effect, so this
+  /// method is never called with `Acrylic`.
   ///
   /// # Platform-specific
   ///
   /// This method is only available on Windows.
-  fn set_blur_behind(&self, style: Option<&BackdropStyle>) -> crate::Result<()>;
+  fn set_blur_behind(
+    &self,
+    style: Option<&BackdropStyle>,
+  ) -> crate::Result<()>;
 }
 
 #[cfg(target_os = "windows")]
@@ -482,7 +488,10 @@ impl NativeWindowWindowsExt for NativeWindow {
     self.inner.reassert_transparency()
   }
 
-  fn set_blur_behind(&self, style: Option<&BackdropStyle>) -> crate::Result<()> {
+  fn set_blur_behind(
+    &self,
+    style: Option<&BackdropStyle>,
+  ) -> crate::Result<()> {
     self.inner.set_blur_behind(style)
   }
 }

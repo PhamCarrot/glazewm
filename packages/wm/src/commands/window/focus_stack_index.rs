@@ -1,8 +1,6 @@
 use crate::{
-  commands::container::set_focused_descendant,
-  models::Container,
-  traits::CommonGetters,
-  wm_state::WmState,
+  commands::container::set_focused_descendant, models::Container,
+  traits::CommonGetters, wm_state::WmState,
 };
 
 /// Focuses the stack child at `index`.

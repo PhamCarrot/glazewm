@@ -2,8 +2,10 @@ use tracing::info;
 use wm_common::WmEvent;
 
 use crate::{
-  commands::container::detach_container, models::Workspace,
-  traits::CommonGetters, wm_state::WmState,
+  commands::container::detach_container,
+  models::Workspace,
+  traits::{CommonGetters, TilingDirectionGetters},
+  wm_state::WmState,
 };
 
 /// Deactivates a given workspace. This removes the container from its
@@ -11,15 +13,20 @@ use crate::{
 #[allow(clippy::needless_pass_by_value)]
 pub fn deactivate_workspace(
   workspace: Workspace,
-  state: &WmState,
+  state: &mut WmState,
 ) -> anyhow::Result<()> {
   info!("Deactivating workspace: {workspace}");
 
+  let workspace_name = workspace.config().name;
+  let workspace_layout = workspace.layout();
   detach_container(workspace.clone().into())?;
+  state
+    .workspace_layouts
+    .insert(workspace_name.clone(), workspace_layout);
 
   state.emit_event(WmEvent::WorkspaceDeactivated {
     deactivated_id: workspace.id(),
-    deactivated_name: workspace.config().name,
+    deactivated_name: workspace_name,
   });
 
   Ok(())

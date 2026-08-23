@@ -10,13 +10,15 @@ use wm_common::{
 };
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
-#[cfg(target_os = "windows")]
-use crate::commands::window::detach_window_for_close;
 use wm_platform::{
-  Dispatcher, LengthValue, PlatformEvent, RectDelta, WindowEvent,
+  Dispatcher, LengthValue, NativeWindow, PlatformEvent, RectDelta,
+  WindowEvent,
 };
 
+#[cfg(target_os = "windows")]
+use crate::commands::window::detach_window_for_close;
 use crate::{
+  animation::AnimationManager,
   commands::{
     container::{
       focus_container_by_id, focus_in_direction, set_tiling_direction,
@@ -29,15 +31,15 @@ use crate::{
     },
     monitor::focus_monitor,
     window::{
-      cycle_stack_focus, focus_stack_index, ignore_window,
-      move_to_stack, move_window_in_direction, move_window_to_workspace,
-      resize_window, set_window_position, set_window_size,
-      stack_absorb_neighbor, stack_insert, toggle_stack, update_window_state,
-      WindowPositionTarget,
+      cycle_stack_focus, focus_stack_index, ignore_window, move_to_stack,
+      move_window_in_direction, move_window_to_workspace, resize_window,
+      retry_manage_window, set_window_position, set_window_size,
+      stack_absorb_neighbor, stack_insert, toggle_stack,
+      update_window_state, WindowPositionTarget,
     },
     workspace::{
-      focus_workspace, move_workspace_in_direction,
-      set_workspace_layout, update_workspace_config,
+      focus_workspace, move_workspace_in_direction, set_workspace_layout,
+      update_workspace_config,
     },
   },
   events::{
@@ -57,7 +59,8 @@ use crate::{
 pub struct WindowManager {
   pub event_rx: mpsc::UnboundedReceiver<WmEvent>,
   pub exit_rx: mpsc::UnboundedReceiver<()>,
-  pub animation_tick_rx: mpsc::UnboundedReceiver<()>,
+  pub animation_tick_rx: mpsc::Receiver<()>,
+  pub window_manage_retry_rx: mpsc::UnboundedReceiver<(NativeWindow, u8)>,
   pub state: WmState,
   /// Receiver for tab click events routed from the event-loop thread.
   ///
@@ -74,7 +77,12 @@ impl WindowManager {
   ) -> anyhow::Result<Self> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (exit_tx, exit_rx) = mpsc::unbounded_channel();
-    let (animation_tick_tx, animation_tick_rx) = mpsc::unbounded_channel();
+    // Animation ticks are level-triggered: one pending signal is enough to
+    // redraw all current animation state. Bounding the channel prevents a
+    // busy WM loop from accumulating stale frame work.
+    let (animation_tick_tx, animation_tick_rx) = mpsc::channel(1);
+    let (window_manage_retry_tx, window_manage_retry_rx) =
+      mpsc::unbounded_channel();
     let (tab_click_tx, tab_click_rx) = mpsc::unbounded_channel();
 
     let mut state = WmState::new(
@@ -82,22 +90,53 @@ impl WindowManager {
       event_tx,
       exit_tx,
       animation_tick_tx,
+      window_manage_retry_tx,
       tab_click_tx,
     );
     state.populate(config)?;
 
     // Start animation timer if `populate` created any animations. This
-    // mirrors the `ensure_timer_running` call at the end of `process_event`
-    // for the initial population path.
-    state.animation_manager.ensure_timer_running();
+    // mirrors the `ensure_timer_running` call at the end of
+    // `process_event` for the initial population path.
+    if !state.animation_manager.ensure_timer_running() {
+      AnimationManager::recover_after_animation_failure(
+        &mut state,
+        config,
+        "animation timer startup failed during WM initialization",
+      );
+    }
 
     Ok(Self {
       event_rx,
       exit_rx,
       animation_tick_rx,
+      window_manage_retry_rx,
       state,
       tab_click_rx,
     })
+  }
+
+  pub fn process_window_manage_retry(
+    &mut self,
+    native_window: NativeWindow,
+    attempt: u8,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    retry_manage_window(native_window, attempt, &mut self.state, config)?;
+
+    if !self.state.is_paused && self.state.pending_sync.has_changes() {
+      platform_sync(&mut self.state, config)?;
+    }
+
+    if !self.state.animation_manager.ensure_timer_running() {
+      AnimationManager::recover_after_animation_failure(
+        &mut self.state,
+        config,
+        "animation timer startup failed after window manage retry",
+      );
+    }
+
+    Ok(())
   }
 
   pub fn process_event(
@@ -174,7 +213,13 @@ impl WindowManager {
       platform_sync(state, config)?;
     }
 
-    self.state.animation_manager.ensure_timer_running();
+    if !self.state.animation_manager.ensure_timer_running() {
+      AnimationManager::recover_after_animation_failure(
+        &mut self.state,
+        config,
+        "animation timer startup failed after platform event",
+      );
+    }
 
     Ok(())
   }
@@ -184,9 +229,17 @@ impl WindowManager {
     &mut self,
     config: &UserConfig,
   ) -> anyhow::Result<()> {
-    use crate::animation::AnimationManager;
-    // Access animation_manager through state to avoid double borrow
-    AnimationManager::update_internal(&mut self.state, config)
+    // Access animation_manager through state to avoid double borrow.
+    let result =
+      AnimationManager::update_internal(&mut self.state, config);
+    if let Err(err) = &result {
+      AnimationManager::recover_after_animation_failure(
+        &mut self.state,
+        config,
+        &format!("animation update failed: {err}"),
+      );
+    }
+    result
   }
 
   pub fn process_commands(
@@ -219,10 +272,16 @@ impl WindowManager {
     }
 
     // Start animation timer if animations were created by a command (e.g.
-    // startup commands or IPC commands). Without this, surrogate animations
-    // started outside of the platform event loop would never tick, leaving
-    // windows permanently cloaked.
-    self.state.animation_manager.ensure_timer_running();
+    // startup commands or IPC commands). Without this, surrogate
+    // animations started outside of the platform event loop would
+    // never tick, leaving windows permanently cloaked.
+    if !self.state.animation_manager.ensure_timer_running() {
+      AnimationManager::recover_after_animation_failure(
+        &mut self.state,
+        config,
+        "animation timer startup failed after command",
+      );
+    }
 
     Ok(new_subject_container_id)
   }
@@ -332,23 +391,35 @@ impl WindowManager {
               } else {
                 wm_platform::CornerStyle::Default.approx_radius_px()
               };
-              let blur_overlay = effect_cfg
-                .backdrop
-                .acrylic_tint()
-                .map(|tint| effect_cfg.backdrop.to_overlay_params(tint, corner_radius));
+              let blur_overlay =
+                effect_cfg.backdrop.acrylic_tint().map(|tint| {
+                  effect_cfg
+                    .backdrop
+                    .to_overlay_params(tint, corner_radius)
+                });
 
-              if let Ok(rect) = window.to_rect().and_then(|r| {
-                window.total_border_delta().map(|d| r.apply_delta(&d, None))
-              }) {
+              let recovery_workspace_id =
+                window.workspace().map(|workspace| workspace.id());
+              if let (Ok(rect), Some(recovery_workspace_id)) = (
+                window.to_rect().and_then(|r| {
+                  window
+                    .total_border_delta()
+                    .map(|d| r.apply_delta(&d, None))
+                }),
+                recovery_workspace_id,
+              ) {
                 let window_id = window.id();
 
-                // Create and show the surrogate over the still-visible window
-                // first. The surrogate captures the live window as a
-                // pixel-identical overlay, so this is invisible to the user.
+                // Create and show the surrogate over the still-visible
+                // window first. The surrogate captures the
+                // live window as a pixel-identical
+                // overlay, so this is invisible to the user.
                 {
                   let native_ref = window.native();
                   state.animation_manager.start_close_animation(
                     window_id,
+                    window.clone(),
+                    recovery_workspace_id,
                     rect,
                     effect_opacity,
                     corner_style,
@@ -358,29 +429,46 @@ impl WindowManager {
                   );
                 }
 
-                // If the surrogate was created successfully, cloak the real
-                // window — now that the surrogate is up and covering it — and
-                // detach it from the layout tree so sibling windows begin
+                // If the surrogate was created successfully, cloak the
+                // real window — now that the surrogate is
+                // up and covering it — and detach it from
+                // the layout tree so sibling windows begin
                 // their reflow animations in parallel with the close
-                // surrogate. Cloaking *after* the surrogate is shown avoids a
-                // one-frame gap where the slow `IApplicationView` cloak has
-                // hidden the window but the surrogate has not yet been
+                // surrogate. Cloaking *after* the surrogate is shown
+                // avoids a one-frame gap where the slow
+                // `IApplicationView` cloak has hidden the
+                // window but the surrogate has not yet been
                 // composited, which briefly exposes the desktop.
-                // `AnimationManager::update_internal` sends `WM_CLOSE` once the
-                // close animation finishes.
-                if state
-                  .animation_manager
-                  .has_close_animation(&window_id)
+                // `AnimationManager::update_internal` sends `WM_CLOSE`
+                // once the close animation finishes.
+                if state.animation_manager.has_close_animation(&window_id)
                 {
-                  let _ = window.native().set_cloaked(true);
-                  detach_window_for_close(window, state)?;
-                  return Ok(());
+                  let cloak_result = {
+                    let native = window.native();
+                    native.set_cloaked(true)
+                  };
+                  match cloak_result {
+                    Ok(()) => {
+                      detach_window_for_close(window, state)?;
+                      return Ok(());
+                    }
+                    Err(err) => {
+                      warn!(
+                        "Failed to cloak window {window_id} for close \
+                         animation: {err}; closing the visible real window \
+                         directly."
+                      );
+                      state
+                        .animation_manager
+                        .cancel_close_animation(&window_id);
+                    }
+                  }
                 }
               }
             }
 
-            // Fallback: animations disabled, rect unavailable, or surrogate
-            // creation failed — close immediately.
+            // Fallback: animations disabled, rect unavailable, or
+            // surrogate creation failed — close immediately.
             if let Err(err) = window.native().close() {
               warn!("Failed to close window: {:?}", err);
             }

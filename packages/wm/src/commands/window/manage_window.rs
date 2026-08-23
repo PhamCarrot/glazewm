@@ -1,10 +1,18 @@
+#[cfg(target_os = "windows")]
+use std::{
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+  },
+  time::Duration,
+};
+
 use anyhow::Context;
 use tracing::info;
 use wm_common::{WindowRuleEvent, WindowState, WmEvent};
-use wm_platform::NativeWindow;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
-use wm_platform::RectDelta;
+use wm_platform::{NativeWindow, RectDelta, WindowId};
 
 use crate::{
   commands::{
@@ -20,27 +28,197 @@ use crate::{
   wm_state::WmState,
 };
 
+const MAX_MANAGE_RETRIES: u8 = 3;
+const MANAGE_RETRY_BASE_DELAY_MS: u64 = 50;
+#[cfg(target_os = "windows")]
+const EARLY_CLOAK_TIMEOUT_MS: u64 = 250;
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EarlyWindowTraits {
+  is_child: bool,
+  is_tool_or_no_activate: bool,
+  is_owned_without_caption: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn should_early_cloak(traits: EarlyWindowTraits) -> bool {
+  !traits.is_child
+    && !traits.is_tool_or_no_activate
+    && !traits.is_owned_without_caption
+}
+
+/// Owns an early cloak until normal platform synchronization takes over.
+///
+/// Dropping the lease restores visibility. The timeout uses the same
+/// idempotent release path, so a stalled classification cannot strand an
+/// HWND even if the main event loop is temporarily blocked.
+#[cfg(target_os = "windows")]
+struct EarlyCloakLease {
+  active: Arc<AtomicBool>,
+  uncloak: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(target_os = "windows")]
+impl EarlyCloakLease {
+  fn arm(native_window: &NativeWindow) -> Option<Self> {
+    if let Err(err) = native_window.set_cloaked(true) {
+      tracing::warn!(
+        "Failed to early-cloak window {:?}; continuing visibly: {err:#}",
+        native_window.id(),
+      );
+      return None;
+    }
+
+    let window_to_restore = native_window.clone();
+    let window_id = native_window.id();
+    let uncloak: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+      if window_to_restore.is_valid() {
+        if let Err(err) = window_to_restore.set_cloaked(false) {
+          tracing::warn!(
+            "Failed to restore visibility for early-cloaked window \
+             {window_id:?}: {err:#}"
+          );
+        }
+      }
+    });
+
+    Some(Self::with_timeout(
+      uncloak,
+      Duration::from_millis(EARLY_CLOAK_TIMEOUT_MS),
+      window_id,
+    ))
+  }
+
+  fn with_timeout(
+    uncloak: Arc<dyn Fn() + Send + Sync>,
+    timeout: Duration,
+    window_id: WindowId,
+  ) -> Self {
+    let active = Arc::new(AtomicBool::new(true));
+    let timeout_active = Arc::clone(&active);
+    let timeout_uncloak = Arc::clone(&uncloak);
+
+    tokio::spawn(async move {
+      tokio::time::sleep(timeout).await;
+      if Self::release_shared(&timeout_active, &timeout_uncloak) {
+        tracing::warn!(
+          "Early classification cloak timed out for window {window_id:?}; \
+           restored visibility while management continues."
+        );
+      }
+    });
+
+    Self { active, uncloak }
+  }
+
+  fn release_shared(
+    active: &AtomicBool,
+    uncloak: &Arc<dyn Fn() + Send + Sync>,
+  ) -> bool {
+    if active.swap(false, Ordering::AcqRel) {
+      uncloak();
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Transfers visibility ownership to animation/platform synchronization.
+  fn transfer(self) {
+    self.active.store(false, Ordering::Release);
+  }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for EarlyCloakLease {
+  fn drop(&mut self) {
+    Self::release_shared(&self.active, &self.uncloak);
+  }
+}
+
 pub fn manage_window(
   native_window: NativeWindow,
   target_parent: Option<Container>,
   state: &mut WmState,
   config: &mut UserConfig,
 ) -> anyhow::Result<()> {
-  let Some(native_properties) =
-    check_is_manageable(&native_window, config).unwrap_or(None)
-  else {
+  manage_window_attempt(native_window, target_parent, state, config, 0)
+}
+
+/// Retries a native window whose initial property query failed.
+pub fn retry_manage_window(
+  native_window: NativeWindow,
+  attempt: u8,
+  state: &mut WmState,
+  config: &mut UserConfig,
+) -> anyhow::Result<()> {
+  // A stale timer is ignored if another show notification classified or
+  // managed the HWND while this retry was sleeping.
+  if !state
+    .pending_window_manage_retries
+    .remove(&native_window.id())
+  {
     return Ok(());
+  }
+
+  if !native_window.is_valid()
+    || state.window_from_native(&native_window).is_some()
+    || state.ignored_windows.contains(&native_window)
+  {
+    return Ok(());
+  }
+
+  manage_window_attempt(native_window, None, state, config, attempt)
+}
+
+fn manage_window_attempt(
+  native_window: NativeWindow,
+  target_parent: Option<Container>,
+  state: &mut WmState,
+  config: &mut UserConfig,
+  failed_attempts: u8,
+) -> anyhow::Result<()> {
+  #[cfg(target_os = "windows")]
+  let mut early_cloak = match early_cloak_candidate(&native_window) {
+    Ok(None) => {
+      state
+        .pending_window_manage_retries
+        .remove(&native_window.id());
+      return Ok(());
+    }
+    Ok(Some(true)) => EarlyCloakLease::arm(&native_window),
+    Ok(Some(false)) => None,
+    Err(err) => {
+      schedule_manage_retry(native_window, failed_attempts, state, &err);
+      return Ok(());
+    }
   };
 
-  // Cloak as early as possible to minimise the visible flash before the
-  // window is repositioned and animated. Non-tiling windows are uncloaked
-  // by `platform_sync` for their target position; tiling windows are
-  // uncloaked by the slide-in animation. Uncloaked immediately below if
-  // window rules decide to ignore the window, or if `create_window` fails.
-  #[cfg(target_os = "windows")]
-  let _ = native_window.set_cloaked(true);
-  #[cfg(target_os = "windows")]
-  let native_window_id = native_window.id();
+  let native_properties = match check_is_manageable(
+    &native_window,
+    config,
+    cfg!(target_os = "windows"),
+  ) {
+    Ok(Some(properties)) => {
+      state
+        .pending_window_manage_retries
+        .remove(&native_window.id());
+      properties
+    }
+    Ok(None) => {
+      // This window was successfully classified as intentionally
+      // unmanaged. Cancel any older delayed retry for the same HWND.
+      state
+        .pending_window_manage_retries
+        .remove(&native_window.id());
+      return Ok(());
+    }
+    Err(err) => {
+      schedule_manage_retry(native_window, failed_attempts, state, &err);
+      return Ok(());
+    }
+  };
 
   // Create the window instance. This may fail if the window handle has
   // already been destroyed, or if the WM state doesn't have a monitor/
@@ -55,14 +233,6 @@ pub fn manage_window(
     Ok(window) => window,
     Err(err) => {
       tracing::warn!("Operation failed: {:?}", err);
-
-      // The real window is still alive and was never attached to the
-      // container tree, so nothing else will ever uncloak it — undo the
-      // early cloak here so it isn't left permanently invisible.
-      #[cfg(target_os = "windows")]
-      let _ =
-        NativeWindow::from_handle(native_window_id.0).set_cloaked(false);
-
       return Ok(());
     }
   };
@@ -107,14 +277,104 @@ pub fn manage_window(
         window.into()
       },
     );
-  } else {
-    // Window was detached by an `ignore` rule — undo the early cloak so it
-    // continues to display normally without GlazeWM managing it.
+
+    // All fallible management work is complete. The existing
+    // open-animation and platform-sync paths now own when the real
+    // HWND becomes visible.
     #[cfg(target_os = "windows")]
-    let _ = window.native().set_cloaked(false);
+    if let Some(lease) = early_cloak.take() {
+      lease.transfer();
+    }
+  } else {
+    // Window was detached by an `ignore` rule. The early-cloak lease drops
+    // here and restores normal visibility.
   }
 
   Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn early_cloak_candidate(
+  native_window: &NativeWindow,
+) -> anyhow::Result<Option<bool>> {
+  use wm_platform::{
+    WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+  };
+
+  if !native_window.is_visible()? {
+    return Ok(None);
+  }
+
+  Ok(Some(should_early_cloak(EarlyWindowTraits {
+    is_child: native_window.has_window_style(WS_CHILD),
+    is_tool_or_no_activate: native_window
+      .has_window_style_ex(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW),
+    is_owned_without_caption: native_window.has_owner_window()
+      && !native_window.has_window_style(WS_CAPTION),
+  })))
+}
+
+pub fn cancel_pending_manage_retry(
+  native_window_id: WindowId,
+  state: &mut WmState,
+) -> bool {
+  remove_pending_manage_retry(
+    &mut state.pending_window_manage_retries,
+    native_window_id,
+  )
+}
+
+fn remove_pending_manage_retry(
+  pending: &mut std::collections::HashSet<WindowId>,
+  native_window_id: WindowId,
+) -> bool {
+  pending.remove(&native_window_id)
+}
+
+fn next_manage_retry_attempt(failed_attempts: u8) -> Option<u8> {
+  (failed_attempts < MAX_MANAGE_RETRIES).then_some(failed_attempts + 1)
+}
+
+fn schedule_manage_retry(
+  native_window: NativeWindow,
+  failed_attempts: u8,
+  state: &mut WmState,
+  error: &anyhow::Error,
+) {
+  let Some(attempt) = next_manage_retry_attempt(failed_attempts) else {
+    tracing::warn!(
+      "Native property queries failed after {MAX_MANAGE_RETRIES} retries for \
+       window {:?}; leaving it visible and unmanaged: {error:#}",
+      native_window.id(),
+    );
+    return;
+  };
+
+  if !state
+    .pending_window_manage_retries
+    .insert(native_window.id())
+  {
+    tracing::debug!(
+      "Manageability retry already pending for window {:?}.",
+      native_window.id()
+    );
+    return;
+  }
+
+  tracing::warn!(
+    "Failed to query native properties for window {:?}; scheduling \
+     manageability retry {attempt}/{MAX_MANAGE_RETRIES}: {error:#}",
+    native_window.id(),
+  );
+
+  let retry_tx = state.window_manage_retry_tx.clone();
+  tokio::spawn(async move {
+    tokio::time::sleep(std::time::Duration::from_millis(
+      MANAGE_RETRY_BASE_DELAY_MS * u64::from(attempt),
+    ))
+    .await;
+    let _ = retry_tx.send((native_window, attempt));
+  });
 }
 
 /// Checks if a window is manageable and retrieves its native properties.
@@ -127,8 +387,9 @@ pub fn manage_window(
 fn check_is_manageable(
   native_window: &NativeWindow,
   config: &UserConfig,
+  visibility_already_confirmed: bool,
 ) -> anyhow::Result<Option<NativeWindowProperties>> {
-  if !native_window.is_visible()? {
+  if !visibility_already_confirmed && !native_window.is_visible()? {
     return Ok(None);
   }
 
@@ -357,8 +618,8 @@ fn window_state_to_create(
 /// Rules:
 /// - For non-tiling windows: Always append to the workspace.
 /// - For tiling windows:
-///   1. Try to insert after the focused tiling window (or its parent stack)
-///      if one exists.
+///   1. Try to insert after the focused tiling window (or its parent
+///      stack) if one exists.
 ///   2. If a non-tiling window is focused, try to insert after the first
 ///      tiling window found.
 ///   3. If no tiling windows exist, append to the workspace.
@@ -407,4 +668,135 @@ fn insertion_target(
     focused_workspace.clone().into(),
     focused_workspace.child_count(),
   ))
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::HashSet;
+  #[cfg(target_os = "windows")]
+  use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+  };
+
+  #[cfg(target_os = "windows")]
+  use wm_platform::WindowId;
+
+  use super::{next_manage_retry_attempt, remove_pending_manage_retry};
+  #[cfg(target_os = "windows")]
+  use super::{should_early_cloak, EarlyCloakLease, EarlyWindowTraits};
+
+  #[test]
+  fn native_property_retries_are_bounded() {
+    assert_eq!(next_manage_retry_attempt(0), Some(1));
+    assert_eq!(next_manage_retry_attempt(1), Some(2));
+    assert_eq!(next_manage_retry_attempt(2), Some(3));
+    assert_eq!(next_manage_retry_attempt(3), None);
+  }
+
+  #[test]
+  fn destroyed_hwnd_cancels_pending_manage_retry() {
+    let destroyed = wm_platform::WindowId(42);
+    let retained = wm_platform::WindowId(84);
+    let mut pending = HashSet::from([destroyed, retained]);
+
+    assert!(remove_pending_manage_retry(&mut pending, destroyed));
+    assert!(!remove_pending_manage_retry(&mut pending, destroyed));
+    assert_eq!(pending, HashSet::from([retained]));
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn cheap_rejects_are_never_early_cloaked() {
+    assert!(!should_early_cloak(EarlyWindowTraits {
+      is_child: true,
+      ..Default::default()
+    }));
+    assert!(!should_early_cloak(EarlyWindowTraits {
+      is_tool_or_no_activate: true,
+      ..Default::default()
+    }));
+    assert!(!should_early_cloak(EarlyWindowTraits {
+      is_owned_without_caption: true,
+      ..Default::default()
+    }));
+    assert!(should_early_cloak(EarlyWindowTraits::default()));
+  }
+
+  #[cfg(target_os = "windows")]
+  fn test_uncloak_action(
+    cloaked: &Arc<AtomicBool>,
+    calls: &Arc<AtomicUsize>,
+  ) -> Arc<dyn Fn() + Send + Sync> {
+    let cloaked = Arc::clone(cloaked);
+    let calls = Arc::clone(calls);
+    Arc::new(move || {
+      cloaked.store(false, Ordering::Release);
+      calls.fetch_add(1, Ordering::AcqRel);
+    })
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn cloak_lease_restores_visibility_once_on_failure_or_repetition() {
+    let cloaked = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action = test_uncloak_action(&cloaked, &calls);
+    let active = AtomicBool::new(true);
+
+    assert!(EarlyCloakLease::release_shared(&active, &action));
+    assert!(!EarlyCloakLease::release_shared(&active, &action));
+    assert!(!cloaked.load(Ordering::Acquire));
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+  }
+
+  #[cfg(target_os = "windows")]
+  #[tokio::test]
+  async fn cloak_lease_timeout_restores_visibility() {
+    let cloaked = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let lease = EarlyCloakLease::with_timeout(
+      test_uncloak_action(&cloaked, &calls),
+      std::time::Duration::from_millis(1),
+      WindowId(42),
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!cloaked.load(Ordering::Acquire));
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    drop(lease);
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn successful_transfer_leaves_visibility_to_platform_sync() {
+    let cloaked = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let lease = EarlyCloakLease {
+      active: Arc::new(AtomicBool::new(true)),
+      uncloak: test_uncloak_action(&cloaked, &calls),
+    };
+
+    lease.transfer();
+    assert!(cloaked.load(Ordering::Acquire));
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn repeated_failed_creations_never_leave_a_cloak_owned() {
+    for _ in 0..128 {
+      let cloaked = Arc::new(AtomicBool::new(true));
+      let calls = Arc::new(AtomicUsize::new(0));
+      let lease = EarlyCloakLease {
+        active: Arc::new(AtomicBool::new(true)),
+        uncloak: test_uncloak_action(&cloaked, &calls),
+      };
+
+      drop(lease);
+      assert!(!cloaked.load(Ordering::Acquire));
+      assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+  }
 }

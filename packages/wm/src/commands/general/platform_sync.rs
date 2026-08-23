@@ -1,17 +1,18 @@
-use anyhow::Context;
 #[cfg(target_os = "windows")]
 use std::collections::HashSet;
-#[cfg(target_os = "windows")]
-use wm_common::{WindowEffectConfig, WorkspaceSwitchStyle};
+
+use anyhow::Context;
 use tracing::{debug, warn};
+#[cfg(target_os = "windows")]
+use wm_common::TabBarPosition;
 use wm_common::{
   CursorJumpTrigger, DisplayState, HideCorner, HideMethod, UniqueExt,
   WindowState, WmEvent,
 };
 #[cfg(target_os = "windows")]
-use wm_platform::NativeWindowWindowsExt;
+use wm_common::{WindowEffectConfig, WorkspaceSwitchStyle};
 #[cfg(target_os = "windows")]
-use wm_common::TabBarPosition;
+use wm_platform::NativeWindowWindowsExt;
 #[cfg(target_os = "windows")]
 use wm_platform::{
   BackdropStyle, BlurOverlayParams, CornerStyle, NativeBlurOverlay,
@@ -54,6 +55,58 @@ fn iris_max_radius(req: &IrisSwitchRequest) -> i32 {
     .ceil() as i32
 }
 
+/// Whether a per-window workspace transition has a safe visible
+/// replacement for every participant and enough direction information to
+/// animate.
+#[cfg(target_os = "windows")]
+fn should_start_workspace_switch(
+  participant_count: usize,
+  ready_surrogate_count: usize,
+  direction: i32,
+  is_no_slide: bool,
+) -> bool {
+  participant_count > 0
+    && ready_surrogate_count == participant_count
+    && (direction != 0 || is_no_slide)
+}
+
+/// Whether a visible reposition needs a compositor barrier for an alpha
+/// reassertion.
+///
+/// `SWP_FRAMECHANGED` can briefly reset an existing layered-window alpha,
+/// but opaque windows have no alpha state to race with DWM and must not
+/// pay for a blocking composition flush.
+#[cfg(target_os = "windows")]
+fn needs_transparency_composition_flush(
+  is_visible: bool,
+  effect_opacity: u8,
+) -> bool {
+  is_visible && effect_opacity < u8::MAX
+}
+
+/// Whether cloaking a surrogate-covered window still needs its own DWM
+/// warm-up barrier.
+///
+/// Workspace-switch setup commits every participating surrogate together
+/// and performs one shared flush before the redraw loop. Repeating that
+/// barrier for each incoming window only serializes compositor-frame
+/// waits. Other surrogate paths are created inside the redraw loop and
+/// retain the existing per-window safety barrier.
+#[cfg(target_os = "windows")]
+fn needs_surrogate_warmup_flush(
+  workspace_surrogate_preflushed: bool,
+) -> bool {
+  !workspace_surrogate_preflushed
+}
+
+#[cfg(target_os = "windows")]
+fn should_defer_native_focus(
+  is_workspace_switch_incoming: bool,
+  has_resize_session: bool,
+) -> bool {
+  is_workspace_switch_incoming || has_resize_session
+}
+
 pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
@@ -69,10 +122,10 @@ pub fn platform_sync(
 
   // Focus is synced after `redraw_containers` so that the workspace-switch
   // animation is already set up when `sync_focus` runs. This lets the
-  // deferral check in `sync_focus` correctly suppress `SetForegroundWindow`
-  // during the slide (the animation manager re-queues focus after it
-  // completes), preventing the OS from asynchronously uncloaking the
-  // incoming focused window mid-animation.
+  // deferral check in `sync_focus` correctly suppress
+  // `SetForegroundWindow` during the slide (the animation manager
+  // re-queues focus after it completes), preventing the OS from
+  // asynchronously uncloaking the incoming focused window mid-animation.
   if state.pending_sync.needs_focus_update() {
     sync_focus(&focused_container, state)?;
   }
@@ -90,8 +143,32 @@ pub fn platform_sync(
     // applied.
     let prev_effects_window = state.prev_effects_window.clone();
 
-    if let Ok(window) = focused_container.as_window_container() {
-      apply_window_effects(&window, true, config);
+    let focused_window = focused_container.as_window_container().ok();
+    let focus_changed =
+      prev_effects_window.as_ref().map(|window| window.id())
+        != focused_window.as_ref().map(|window| window.id());
+    let animate_focus_change =
+      config.value.animations.focus_change.enabled
+        && state.pending_sync.needs_focused_effect_update()
+        && !state.pending_sync.needs_all_effects_update()
+        && focus_changed;
+
+    // A full effect refresh (for example after config reload) should apply
+    // the new values immediately. It must not leave an old transition
+    // running with targets from the previous configuration.
+    #[cfg(target_os = "windows")]
+    if !config.value.animations.focus_change.enabled
+      || state.pending_sync.needs_all_effects_update()
+    {
+      state.animation_manager.clear_focus_opacity_animations();
+    }
+
+    if let Some(window) = focused_window {
+      apply_window_effects(&window, true, config)?;
+      #[cfg(target_os = "windows")]
+      if animate_focus_change {
+        start_focus_transparency_animation(&window, true, state, config)?;
+      }
       state.prev_effects_window = Some(window.clone());
     } else {
       state.prev_effects_window = None;
@@ -105,13 +182,17 @@ pub fn platform_sync(
       if state.pending_sync.needs_all_effects_update() {
         state.windows()
       } else {
-        prev_effects_window.into_iter().collect()
+        prev_effects_window.clone().into_iter().collect()
       }
       .into_iter()
       .filter(|window| window.id() != focused_container.id());
 
     for window in unfocused_windows {
-      apply_window_effects(&window, false, config);
+      apply_window_effects(&window, false, config)?;
+      #[cfg(target_os = "windows")]
+      if animate_focus_change {
+        start_focus_transparency_animation(&window, false, state, config)?;
+      }
     }
 
     // Re-apply animation-driven opacity for the focused window if an
@@ -120,7 +201,9 @@ pub fn platform_sync(
     // here ensures the animated opacity is visible on the first frame.
     #[cfg(target_os = "windows")]
     if let Ok(window) = focused_container.as_window_container() {
-      if let Some(anim) = state.animation_manager.get_animation(&window.id()) {
+      if let Some(anim) =
+        state.animation_manager.get_animation(&window.id())
+      {
         if let (_, Some(opacity)) = anim.current_state() {
           debug!(
             "Overriding transparency for {} with in-progress animation \
@@ -128,7 +211,14 @@ pub fn platform_sync(
             window.id(),
             opacity.to_alpha()
           );
-          let _ = window.native().set_transparency(&opacity);
+          window.native().set_transparency(&opacity).with_context(
+            || {
+              format!(
+                "Failed to restore in-progress opacity for window {}",
+                window.id()
+              )
+            },
+          )?;
         }
       }
     }
@@ -151,23 +241,29 @@ fn sync_focus(
   let native_window = focused_container.as_window_container().ok();
 
   // Defer `SetForegroundWindow` while the focused window is covered by an
-  // active surrogate (workspace-switch or resize). The OS may asynchronously
-  // remove the DWM cloak when a window becomes the foreground window,
-  // causing the slow `IApplicationView::SetCloak` path to fire on the next
-  // animation tick and blocking the frame loop. `AnimationManager::update_internal`
-  // re-queues the focus change once the animation completes and the window is
-  // uncloaked.
+  // active surrogate (workspace-switch or resize). The OS may
+  // asynchronously remove the DWM cloak when a window becomes the
+  // foreground window, causing the slow `IApplicationView::SetCloak`
+  // path to fire on the next animation tick and blocking the frame loop.
+  // `AnimationManager::update_internal` re-queues the focus change once
+  // the animation completes and the window is uncloaked.
   #[cfg(target_os = "windows")]
   if let Some(window) = &native_window {
-    let is_ws_incoming = state.animation_manager.is_workspace_switch_active()
-      && state
-        .animation_manager
-        .is_workspace_switch_incoming(&window.id());
+    let is_ws_incoming =
+      state.animation_manager.is_workspace_switch_active()
+        && state
+          .animation_manager
+          .is_workspace_switch_incoming(&window.id());
     let has_resize_session = state
       .animation_manager
       .resize_sessions
       .contains_key(&window.id());
-    if is_ws_incoming || has_resize_session {
+    if should_defer_native_focus(is_ws_incoming, has_resize_session) {
+      // Logical focus already points at the covered target, but native
+      // focus still points elsewhere. Keep focus-follows-cursor
+      // gated until cleanup requeues this operation and the matching
+      // foreground event confirms it.
+      state.is_focus_synced = false;
       return Ok(());
     }
   }
@@ -188,7 +284,13 @@ fn sync_focus(
   };
 
   if let Err(err) = result {
-    tracing::warn!("Failed to set focus: {}", err);
+    // Keep cursor-driven focus gated until a later native focus event
+    // proves that the OS and logical targets match. Returning the
+    // error also keeps `pending_sync` uncleared, so the next safe
+    // synchronization opportunity can retry instead of reporting a
+    // focus change which never happened.
+    state.is_focus_synced = false;
+    return Err(anyhow::anyhow!("Failed to set native focus: {err}"));
   }
 
   state.emit_event(WmEvent::FocusChanged {
@@ -308,7 +410,8 @@ fn redraw_containers(
           window.workspace().is_some_and(|w| w.is_displayed());
         let will_show = !is_inactive_stack_child && ws_displayed;
         let focus_pos = focus_order_index.get(&window.id()).copied();
-        // Windows to show sort higher → after rev() they are processed first.
+        // Windows to show sort higher → after rev() they are processed
+        // first.
         (will_show, focus_pos)
       });
     }
@@ -317,8 +420,8 @@ fn redraw_containers(
   };
 
   // Whether animations are skipped for this sync cycle (e.g. display
-  // setting changes). In-flight animations of redrawn windows are cancelled
-  // below so their windows snap to their target rect.
+  // setting changes). In-flight animations of redrawn windows are
+  // cancelled below so their windows snap to their target rect.
   let suppress_animations = state.pending_sync.animations_suppressed();
 
   // Workspace-switch pre-pass: create slide surrogates for all
@@ -326,12 +429,15 @@ fn redraw_containers(
   // Outgoing surrogates are shown immediately (before the real window is
   // cloaked) to eliminate the blank-frame flicker.
   #[cfg(target_os = "windows")]
+  let mut preflushed_workspace_surrogates = HashSet::new();
+  #[cfg(target_os = "windows")]
   {
     let ws_config = &config.value.animations.workspace_switch;
     if ws_config.enabled && !suppress_animations {
-      // Iris-wipe pre-pass: snapshot the monitor (still showing the outgoing
-      // workspace) and show the overlay before the real windows are switched in
-      // the redraw loop below. The hole is then driven by the animation manager.
+      // Iris-wipe pre-pass: snapshot the monitor (still showing the
+      // outgoing workspace) and show the overlay before the real
+      // windows are switched in the redraw loop below. The hole is
+      // then driven by the animation manager.
       if let Some(req) = state.pending_sync.take_iris_switch() {
         let monitor = Rect::from_xy(
           req.monitor_x,
@@ -339,9 +445,10 @@ fn redraw_containers(
           req.monitor_width,
           req.monitor_height,
         );
-        // Drop any in-flight overlay first so the new snapshot captures the
-        // real current workspace, not the previous overlay mid-wipe. This makes
-        // rapid switches play as clean successive wipes rather than nested ones.
+        // Drop any in-flight overlay first so the new snapshot captures
+        // the real current workspace, not the previous overlay
+        // mid-wipe. This makes rapid switches play as clean
+        // successive wipes rather than nested ones.
         state.animation_manager.clear_iris_switch();
         match NativeIrisOverlay::create(&monitor) {
           Ok(overlay) => {
@@ -354,10 +461,12 @@ fn redraw_containers(
               ws_config.duration_ms,
               ws_config.easing.clone(),
             );
-            // Composite the overlay (covering the outgoing workspace) before the
-            // redraw loop below switches the real windows underneath, so the
-            // switch never shows through for a frame. Without this the cover and
-            // the switch race within one frame, causing an occasional flicker.
+            // Composite the overlay (covering the outgoing workspace)
+            // before the redraw loop below switches the real
+            // windows underneath, so the switch never shows
+            // through for a frame. Without this the cover and
+            // the switch race within one frame, causing an occasional
+            // flicker.
             wm_platform::dwm_flush();
           }
           Err(err) => {
@@ -369,9 +478,10 @@ fn redraw_containers(
       }
 
       let direction = state.pending_sync.workspace_switch_direction();
-      // Only start a new workspace-switch animation when there are actually
-      // incoming/outgoing windows in this sync (i.e., this is the initial
-      // platform_sync for the switch, not a follow-up focus event).
+      // Only start a new workspace-switch animation when there are
+      // actually incoming/outgoing windows in this sync (i.e., this
+      // is the initial platform_sync for the switch, not a follow-up
+      // focus event).
       let has_ws_windows = windows_to_update.iter().any(|w| {
         let id = w.id();
         state.pending_sync.is_workspace_switch_incoming(&id)
@@ -380,8 +490,11 @@ fn redraw_containers(
 
       if has_ws_windows {
         let is_no_slide = ws_config.style.is_no_slide();
-        let mut ws_windows: Vec<(uuid::Uuid, Option<WorkspaceSurrogate>, bool)> =
-          Vec::new();
+        let mut ws_windows: Vec<(
+          uuid::Uuid,
+          Option<WorkspaceSurrogate>,
+          bool,
+        )> = Vec::new();
         let mut monitor_x = 0i32;
         let mut monitor_width = 0i32;
         let mut monitor_y = 0i32;
@@ -413,12 +526,11 @@ fn redraw_containers(
 
           let hwnd = window.native().hwnd();
 
-          let effect_cfg =
-            if window.id() == focused_container.id() {
-              &config.value.window_effects.focused_window
-            } else {
-              &config.value.window_effects.other_windows
-            };
+          let effect_cfg = if window.id() == focused_container.id() {
+            &config.value.window_effects.focused_window
+          } else {
+            &config.value.window_effects.other_windows
+          };
           let opacity = if effect_cfg.transparency.enabled {
             effect_cfg.transparency.opacity.to_alpha()
           } else {
@@ -435,16 +547,17 @@ fn redraw_containers(
           };
 
           if is_incoming {
-            let surrogate = window
-              .to_rect()
-              .and_then(|r| {
-                window.total_border_delta().map(|d| r.apply_delta(&d, None))
-              })
-              .ok()
-              .and_then(|rect| {
-                let viewport =
-                  Rect::from_xy(monitor_x, monitor_y, monitor_width, monitor_height);
-                WorkspaceSurrogate::new(
+            let surrogate = match window.to_rect().and_then(|r| {
+              window.total_border_delta().map(|d| r.apply_delta(&d, None))
+            }) {
+              Ok(rect) => {
+                let viewport = Rect::from_xy(
+                  monitor_x,
+                  monitor_y,
+                  monitor_width,
+                  monitor_height,
+                );
+                match WorkspaceSurrogate::new(
                   hwnd,
                   &rect,
                   &viewport,
@@ -452,61 +565,99 @@ fn redraw_containers(
                   ws_config.opacity_incoming,
                   &corner_style,
                   acrylic_tint,
-                )
-                .map_err(|e| {
-                  tracing::warn!(
-                    "Failed to create incoming surrogate: {e}."
-                  );
-                  e
-                })
-                .ok()
-              });
-            // Always register incoming windows even without a surrogate so
-            // `is_frozen_by_ws_animation` is true for all of them — this
-            // prevents the real window from being uncloaked before the
-            // animation ends.
+                ) {
+                  Ok(surrogate) => Some(surrogate),
+                  Err(err) => {
+                    tracing::warn!(
+                      "Failed to create incoming workspace surrogate for \
+                       {id}: {err}."
+                    );
+                    None
+                  }
+                }
+              }
+              Err(err) => {
+                tracing::warn!(
+                  "Failed to resolve incoming workspace window rect for \
+                   {id}: {err}."
+                );
+                None
+              }
+            };
             ws_windows.push((id, surrogate, true));
           } else {
-            let current = state
-              .window_target_positions
-              .get(&id)
-              .cloned()
-              .or_else(|| window.native().frame().ok())
-              .unwrap_or_else(|| Rect::from_xy(0, 0, 0, 0));
-            let viewport =
-              Rect::from_xy(monitor_x, monitor_y, monitor_width, monitor_height);
-            let surrogate = WorkspaceSurrogate::new(
-              hwnd,
-              &current,
-              &viewport,
-              opacity,
-              ws_config.opacity_outgoing,
-              &corner_style,
-              acrylic_tint,
-            )
-            .map_err(|e| {
-              tracing::warn!("Failed to create outgoing surrogate: {e}.");
-              e
-            })
-            .ok();
+            let current = if let Some(rect) =
+              state.window_target_positions.get(&id).cloned()
+            {
+              Some(rect)
+            } else {
+              match window.native().frame() {
+                Ok(rect) => Some(rect),
+                Err(err) => {
+                  tracing::warn!(
+                    "Failed to resolve outgoing workspace window rect for \
+                     {id}: {err}."
+                  );
+                  None
+                }
+              }
+            };
+            let surrogate = current.and_then(|current| {
+              let viewport = Rect::from_xy(
+                monitor_x,
+                monitor_y,
+                monitor_width,
+                monitor_height,
+              );
+              match WorkspaceSurrogate::new(
+                hwnd,
+                &current,
+                &viewport,
+                opacity,
+                ws_config.opacity_outgoing,
+                &corner_style,
+                acrylic_tint,
+              ) {
+                Ok(surrogate) => Some(surrogate),
+                Err(err) => {
+                  tracing::warn!(
+                    "Failed to create outgoing workspace surrogate for \
+                     {id}: {err}."
+                  );
+                  None
+                }
+              }
+            });
             ws_windows.push((id, surrogate, false));
           }
         }
 
-        let has_outgoing =
-          ws_windows.iter().any(|(_, _, is_incoming)| !*is_incoming);
-        let has_incoming =
-          ws_windows.iter().any(|(_, _, is_incoming)| *is_incoming);
+        let participant_count = ws_windows.len();
+        let ready_surrogate_count = ws_windows
+          .iter()
+          .filter(|(_, surrogate, _)| surrogate.is_some())
+          .count();
 
-        // For slide styles, skip when direction == 0: workspace names were not
-        // found in the config so the slide offset would be 0, placing
-        // surrogates at their target and causing an instant flash. Non-slide
-        // styles (fade/zoom) have no slide offset so direction == 0 is fine.
-        if (has_outgoing || has_incoming) && (direction != 0 || is_no_slide) {
-          // Show outgoing surrogates before flushing: real windows are still
-          // active so their DWM thumbnails are immediately warm.
-          // For stationary (non-slide) styles, also show incoming surrogates at
-          // their start opacity so DWM warms their thumbnails before the loop.
+        // For slide styles, skip when direction == 0: workspace names were
+        // not found in the config so the slide offset would be 0,
+        // placing surrogates at their target and causing an
+        // instant flash. Non-slide styles (fade/zoom) have no
+        // slide offset so direction == 0 is fine. Also require a
+        // valid visible surrogate for every participant. A partial
+        // transition must not freeze or cloak a real window that has
+        // no replacement; dropping this still-hidden vector falls back to
+        // the normal instant workspace switch below.
+        if should_start_workspace_switch(
+          participant_count,
+          ready_surrogate_count,
+          direction,
+          is_no_slide,
+        ) {
+          // Show outgoing surrogates before flushing: real windows are
+          // still active so their DWM thumbnails are immediately
+          // warm. For stationary (non-slide) styles, also show
+          // incoming surrogates at their start opacity so DWM
+          // warms their thumbnails before the loop.
           for (_, ref mut surrogate, is_incoming) in &mut ws_windows {
             if let Some(s) = surrogate {
               if !*is_incoming {
@@ -524,6 +675,27 @@ fn redraw_containers(
           // first few frames of the slide without a visible gap.
           wm_platform::dwm_flush();
 
+          // The shared barrier above covers the incoming surrogates that
+          // will enter the Frozen/cloak path below. Remember them only for
+          // this sync cycle: if an external actor unexpectedly uncloaks a
+          // window on a later tick, the normal per-window warm-up barrier
+          // runs again before it is re-cloaked.
+          preflushed_workspace_surrogates.extend(
+            ws_windows.iter().filter_map(|(id, _, is_incoming)| {
+              is_incoming.then_some(*id)
+            }),
+          );
+
+          let presented_focus_effect_handoff = focused_container
+            .as_window_container()
+            .ok()
+            .filter(|window| {
+              state
+                .pending_sync
+                .is_workspace_switch_incoming(&window.id())
+            })
+            .map(|window| window.id());
+
           state.animation_manager.start_workspace_switch(
             ws_windows,
             direction, // order_direction: +1/-1
@@ -534,9 +706,17 @@ fn redraw_containers(
             monitor_handle,
             config,
           );
+          state.pending_presented_focus_effect_handoff =
+            presented_focus_effect_handoff;
+        } else if ready_surrogate_count != participant_count {
+          tracing::warn!(
+            "Workspace-switch animation skipped: only \
+             {ready_surrogate_count}/{participant_count} participant \
+             surrogate(s) were ready; using instant switch."
+          );
         }
-        // If the incoming workspace is empty, or direction == 0 (workspace not
-        // in config), skip the animation.
+        // If the incoming workspace is empty, or direction == 0 (workspace
+        // not in config), skip the animation.
       }
     }
   }
@@ -544,9 +724,9 @@ fn redraw_containers(
   // Get monitors by their optimal hide corner.
   let monitors_by_hide_corner = state.monitors_by_hide_corner();
 
-  // Whether any window in this redraw cycle changes size. Pure translations
-  // in the same cycle then share the `window_resize` timing so all edges
-  // stay in lock-step during the relayout (see
+  // Whether any window in this redraw cycle changes size. Pure
+  // translations in the same cycle then share the `window_resize` timing
+  // so all edges stay in lock-step during the relayout (see
   // `AnimationManager::start_animation_if_needed`).
   // Set when any window's animation-completion redraw actually issues a
   // `SWP_FRAMECHANGED` reposition on a visible window this pass (see the
@@ -636,8 +816,8 @@ fn redraw_containers(
     // Capture display state before transition to detect opening windows.
     let previous_display_state = window.display_state();
 
-    // Inactive stack children are always hidden; the active child (first in
-    // child_focus_order) is the only visible window in the stack.
+    // Inactive stack children are always hidden; the active child (first
+    // in child_focus_order) is the only visible window in the stack.
     let is_inactive_stack_child = window
       .parent()
       .and_then(|p| p.as_stack().cloned())
@@ -668,7 +848,6 @@ fn redraw_containers(
       .to_rect()?
       .apply_delta(&window.total_border_delta()?, None);
 
-
     let is_visible = matches!(
       window.display_state(),
       DisplayState::Showing | DisplayState::Shown
@@ -684,27 +863,29 @@ fn redraw_containers(
       .insert(window.id(), target_rect.clone());
 
     // Floating windows are not animated in general, but we allow a single
-    // `window_move` animation when the window just crossed the tiling/floating
-    // boundary so the transition is smooth rather than a teleport.
+    // `window_move` animation when the window just crossed the
+    // tiling/floating boundary so the transition is smooth rather than
+    // a teleport.
     let is_floating = matches!(window.state(), WindowState::Floating(_));
 
     // Fullscreen windows are never animated: cloaking the real window (or
-    // covering it with a surrogate) kicks exclusive-fullscreen games out of
-    // fullscreen, reverting their resolution mode-set and re-triggering a
-    // display-settings-changed relayout in a loop.
+    // covering it with a surrogate) kicks exclusive-fullscreen games out
+    // of fullscreen, reverting their resolution mode-set and
+    // re-triggering a display-settings-changed relayout in a loop.
     let is_fullscreen =
       matches!(window.state(), WindowState::Fullscreen(_));
     let is_state_change =
       state.pending_sync.is_window_state_change(&window.id());
 
-    let is_outgoing_switch =
-      state.pending_sync.is_workspace_switch_outgoing(&window.id());
+    let is_outgoing_switch = state
+      .pending_sync
+      .is_workspace_switch_outgoing(&window.id());
 
     // True while this window is an incoming participant in the active
     // workspace-switch animation. Unlike `is_workspace_switch_incoming` on
     // `pending_sync` (cleared after the first `platform_sync`), this stays
-    // `true` for the full animation so that focus events during the slide do
-    // not prematurely uncloak the real window.
+    // `true` for the full animation so that focus events during the slide
+    // do not prematurely uncloak the real window.
     #[cfg(target_os = "windows")]
     let is_frozen_by_ws_animation = state
       .animation_manager
@@ -712,7 +893,8 @@ fn redraw_containers(
     #[cfg(not(target_os = "windows"))]
     let is_frozen_by_ws_animation = false;
 
-    // A window is resizing when its dimensions change (vs. a pure translation).
+    // A window is resizing when its dimensions change (vs. a pure
+    // translation).
     let is_resize = previous_target
       .as_ref()
       .map(|prev| {
@@ -746,25 +928,26 @@ fn redraw_containers(
       } else {
         CornerStyle::Default
       };
-      // Snapshotted onto the `ResizeSession` (rather than re-read live from
-      // config at tracking time) since the close animation's direct-drive
-      // loop runs after the window is detached from the container tree,
-      // where `effect_cfg` can no longer be recomputed.
+      // Snapshotted onto the `ResizeSession` (rather than re-read live
+      // from config at tracking time) since the close animation's
+      // direct-drive loop runs after the window is detached from the
+      // container tree, where `effect_cfg` can no longer be
+      // recomputed.
       let corner_radius = if effect_cfg.corner_style.enabled {
         effect_cfg.corner_style.style.approx_radius_px()
       } else {
         CornerStyle::Default.approx_radius_px()
       };
-      let blur_overlay = effect_cfg
-        .backdrop
-        .acrylic_tint()
-        .map(|tint| effect_cfg.backdrop.to_overlay_params(tint, corner_radius));
+      let blur_overlay = effect_cfg.backdrop.acrylic_tint().map(|tint| {
+        effect_cfg.backdrop.to_overlay_params(tint, corner_radius)
+      });
       (opacity, style, blur_overlay)
     };
 
     // Start a slide-in animation for newly appearing tiling windows.
-    // `previous_target.is_none()` is true only on the first `platform_sync`
-    // call for this window, so the slide-in starts exactly once.
+    // `previous_target.is_none()` is true only on the first
+    // `platform_sync` call for this window, so the slide-in starts
+    // exactly once.
     #[cfg(target_os = "windows")]
     if previous_target.is_none()
       && is_visible
@@ -804,12 +987,13 @@ fn redraw_containers(
     #[cfg(not(target_os = "windows"))]
     let has_slide_in = false;
 
-    // Windows frozen by an in-flight workspace-switch animation stay on the
-    // animation path regardless of suppression — the switch's surrogate
-    // teardown uncloaks them, so dropping them here would break its
-    // invariants. Fullscreen windows and suppressed cycles otherwise always
-    // take the non-animated path, which also cancels any in-flight
-    // animation (and its surrogate) via `remove_animation` below.
+    // Windows frozen by an in-flight workspace-switch animation stay on
+    // the animation path regardless of suppression — the switch's
+    // surrogate teardown uncloaks them, so dropping them here would
+    // break its invariants. Fullscreen windows and suppressed cycles
+    // otherwise always take the non-animated path, which also cancels
+    // any in-flight animation (and its surrogate) via
+    // `remove_animation` below.
     let should_use_animations = !is_outgoing_switch
       && (is_frozen_by_ws_animation
         || (!is_fullscreen
@@ -824,12 +1008,13 @@ fn redraw_containers(
     // `Ref<NativeWindow>` is obtained via `window.native()` and kept alive
     // only for the duration of that call. It must NOT outlive this block:
     // `reposition_window` (called below) may invoke
-    // `set_has_pending_dpi_adjustment`, which calls `borrow_mut` on the same
-    // `RefCell` — holding the `Ref` across that call would panic.
+    // `set_has_pending_dpi_adjustment`, which calls `borrow_mut` on the
+    // same `RefCell` — holding the `Ref` across that call would panic.
     #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     let (position_result, anim_opacity) = if should_use_animations {
-      // Incoming workspace-switch windows: the surrogate handles all visuals
-      // for the full animation duration — freeze the real window.
+      // Incoming workspace-switch windows: the surrogate handles all
+      // visuals for the full animation duration — freeze the real
+      // window.
       #[cfg(target_os = "windows")]
       let native_ref = window.native();
       #[cfg(target_os = "windows")]
@@ -872,23 +1057,26 @@ fn redraw_containers(
       AnimationPositionResult::Frozen => {
         // A surrogate overlay is covering this window. On the first frame,
         // cloak the real window (so only the surrogate is visible) and
-        // synchronously pre-position it at its target rect. Both operations
-        // are skipped on subsequent frames: they are idempotent, and repeating
-        // a blocking `SetWindowPos` cross-process every tick stalls the
-        // animation loop on slow apps and delays keybinding processing.
+        // synchronously pre-position it at its target rect. Both
+        // operations are skipped on subsequent frames: they are
+        // idempotent, and repeating a blocking `SetWindowPos`
+        // cross-process every tick stalls the animation loop on
+        // slow apps and delays keybinding processing.
         //
-        // `handle_window_hidden` is guarded against unmanaging cloaked windows
-        // so cloaking is safe. If something unclocks the window mid-animation
-        // the next tick will re-cloak and re-position it.
+        // `handle_window_hidden` is guarded against unmanaging cloaked
+        // windows so cloaking is safe. If something unclocks the
+        // window mid-animation the next tick will re-cloak and
+        // re-position it.
         //
         // For `ResizeSession`-backed animations, `pre_commit` also calls
         // `SetWindowPos` synchronously just before the surrogate drops,
         // guaranteeing the window is at `target_rect` when uncloaked.
-        // Skip the per-tick `DwmGetWindowAttribute(DWMWA_CLOAKED)` round-trip
-        // for resize-session windows whose cloak state is already known — the
-        // check only fires on the first `Frozen` frame and after session
-        // teardown. Workspace-switch frozen windows (no resize session) retain
-        // the full per-tick guard as a safety net.
+        // Skip the per-tick `DwmGetWindowAttribute(DWMWA_CLOAKED)`
+        // round-trip for resize-session windows whose cloak state
+        // is already known — the check only fires on the first
+        // `Frozen` frame and after session
+        // teardown. Workspace-switch frozen windows (no resize session)
+        // retain the full per-tick guard as a safety net.
         #[cfg(target_os = "windows")]
         let already_cloaked_by_session = state
           .animation_manager
@@ -896,16 +1084,32 @@ fn redraw_containers(
           .get(&window.id())
           .map_or(false, |s| s.is_session_cloaked());
         #[cfg(target_os = "windows")]
-        if !already_cloaked_by_session
-          && !window.native().is_cloaked().unwrap_or(false)
-        {
-          // Flush before cloaking so DWM renders one frame with the
-          // surrogate's thumbnail populated and the real window still
-          // visible. Without this, the thumbnail content may not be ready
-          // for the first composition after the cloak, producing a blank
-          // frame at animation start.
-          wm_platform::dwm_flush();
-          let _ = window.native().set_cloaked(true);
+        #[cfg(target_os = "windows")]
+        let is_cloaked = if already_cloaked_by_session {
+          true
+        } else {
+          window.native().is_cloaked().with_context(|| {
+            format!(
+              "Failed to query cloak state for window {}",
+              window.id()
+            )
+          })?
+        };
+        #[cfg(target_os = "windows")]
+        if !is_cloaked {
+          // Flush before cloaking unless workspace-switch setup already
+          // committed the complete surrogate set and waited for DWM once
+          // in this same sync cycle. Other surrogate paths still need this
+          // barrier so their thumbnail is populated before the real window
+          // disappears.
+          if needs_surrogate_warmup_flush(
+            preflushed_workspace_surrogates.contains(&window.id()),
+          ) {
+            wm_platform::dwm_flush();
+          }
+          window.native().set_cloaked(true).with_context(|| {
+            format!("Failed to cloak animated window {}", window.id())
+          })?;
 
           // Pre-position the cloaked window at its target rect so it
           // appears there when uncloaked at animation end. Posted
@@ -930,13 +1134,14 @@ fn redraw_containers(
                 | SWP_ASYNCWINDOWPOS,
             );
           } else {
-            // Growing resize sessions (both dimensions grow): pre-position the
-            // cloaked window at target asynchronously so DWM captures the
-            // correctly-sized content during the curtain-reveal. Mixed and
-            // shrinking sessions use the clip/wipe approach (thumbnail at
-            // source), and stretch sessions sample source-sized content for
-            // the whole animation — both leave the window at source until
-            // `pre_commit`.
+            // Growing resize sessions (both dimensions grow): pre-position
+            // the cloaked window at target asynchronously so
+            // DWM captures the correctly-sized content during
+            // the curtain-reveal. Mixed and shrinking sessions
+            // use the clip/wipe approach (thumbnail at
+            // source), and stretch sessions sample source-sized content
+            // for the whole animation — both leave the window
+            // at source until `pre_commit`.
             let session_flags = state
               .animation_manager
               .resize_sessions
@@ -946,10 +1151,11 @@ fn redraw_containers(
             if let Some((true, is_move_only)) = session_flags {
               // Post asynchronously: the thumbnail stays registered at
               // source dims until `sync_registration` confirms the resize
-              // landed, so a slow-to-respond app costs at most a few frames
-              // of backdrop fill in the newly revealed area — never a
-              // mis-sized capture. `pre_commit` issues a final synchronous
-              // move at animation end as a correctness guarantee.
+              // landed, so a slow-to-respond app costs at most a few
+              // frames of backdrop fill in the newly
+              // revealed area — never a mis-sized capture.
+              // `pre_commit` issues a final synchronous move
+              // at animation end as a correctness guarantee.
               use wm_platform::{
                 SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
                 SWP_NOSENDCHANGING, SWP_NOZORDER,
@@ -985,33 +1191,29 @@ fn redraw_containers(
         }
       }
       AnimationPositionResult::Apply(ref apply_rect) => {
-        // Only omit `SWP_ASYNCWINDOWPOS` when a surrogate is active for this
-        // window — adjacent windows must stay in lock-step with the overlay.
-        // For pure moves (no surrogate) async is correct and avoids blocking
-        // on the target process's message queue each frame.
-        // Also treat incoming ws-switch windows as having a surrogate when
-        // being uncloaked at animation completion. Without this, the window
+        // Only omit `SWP_ASYNCWINDOWPOS` when a surrogate is active for
+        // this window — adjacent windows must stay in lock-step
+        // with the overlay. For pure moves (no surrogate) async is
+        // correct and avoids blocking on the target process's
+        // message queue each frame. Also treat incoming ws-switch
+        // windows as having a surrogate when being uncloaked at
+        // animation completion. Without this, the window
         // would be repositioned with `SWP_ASYNCWINDOWPOS` and immediately
         // uncloaked — if its message queue is slow, it appears at its old
         // position for one frame.
         #[cfg(target_os = "windows")]
-        let has_surrogate = state
-          .animation_manager
-          .resize_sessions
-          .contains_key(&window.id())
-          || (is_visible
-            && state
-              .animation_manager
-              .is_pending_ws_cleanup_incoming(&window.id()));
+        let has_surrogate =
+          state.animation_manager.has_active_surrogate(&window.id());
         #[cfg(not(target_os = "windows"))]
         let has_surrogate = false;
 
         // Skip the `SetWindowPos` on the animation-completion redraw when
         // `pre_commit` already positioned the window at exactly this rect.
         // Repositioning again is not just redundant — `SWP_FRAMECHANGED`
-        // forces a frame recalculation and full repaint that lands right as
-        // the window is uncloaked below, flashing at the end of every
-        // move/resize animation. The uncloak and effects below still run.
+        // forces a frame recalculation and full repaint that lands right
+        // as the window is uncloaked below, flashing at the end of
+        // every move/resize animation. The uncloak and effects
+        // below still run.
         #[cfg(target_os = "windows")]
         let already_positioned = is_visible
           && state
@@ -1030,28 +1232,44 @@ fn redraw_containers(
             has_surrogate,
             config,
           ) {
+            if has_surrogate {
+              return Err(err).with_context(|| {
+                format!(
+                  "Failed to position surrogate-covered window {}",
+                  window.id()
+                )
+              });
+            }
             tracing::warn!("Failed to set window position: {}", err);
           }
 
           #[cfg(target_os = "windows")]
-          if is_visible {
+          if needs_transparency_composition_flush(
+            is_visible,
+            effect_opacity,
+          ) {
             needs_transparency_flush = true;
           }
         }
 
-        // Uncloak after repositioning so the window is revealed at the correct
-        // position. This undoes `set_cloaked(true)` from the `Frozen` branch
-        // for non-`HideMethod::Cloak` configurations (that method already
-        // calls `set_cloaked` internally inside `reposition_window`).
+        // Uncloak after repositioning so the window is revealed at the
+        // correct position. This undoes `set_cloaked(true)` from
+        // the `Frozen` branch for non-`HideMethod::Cloak`
+        // configurations (that method already calls `set_cloaked`
+        // internally inside `reposition_window`).
         #[cfg(target_os = "windows")]
-        if is_visible {
-          let _ = window.native().set_cloaked(false);
+        if is_visible && has_surrogate {
+          window.native().set_cloaked(false).with_context(|| {
+            format!("Failed to uncloak animated window {}", window.id())
+          })?;
 
-          // Hide the workspace-switch surrogate thumbnail immediately after
-          // uncloaking so both changes land in the same DWM composition frame.
-          // Deferring the hide until after the full main loop would leave the
+          // Hide the workspace-switch surrogate thumbnail immediately
+          // after uncloaking so both changes land in the same
+          // DWM composition frame. Deferring the hide until
+          // after the full main loop would leave the
           // thumbnail visible during the remaining window processing time,
-          // producing a multi-frame double-blend when transparency is enabled.
+          // producing a multi-frame double-blend when transparency is
+          // enabled.
           state
             .animation_manager
             .hide_pending_ws_cleanup_surrogate(window.id());
@@ -1062,13 +1280,21 @@ fn redraw_containers(
         // updates it directly each frame.
         #[cfg(target_os = "windows")]
         if let Some(ref opacity) = anim_opacity {
-          let _ = window.native().set_transparency(opacity);
+          window.native().set_transparency(opacity).with_context(
+            || {
+              format!(
+                "Failed to apply animated opacity to window {}",
+                window.id()
+              )
+            },
+          )?;
         }
       }
     }
 
-    // Mark fullscreen windows as fullscreen on every redraw (including during animations)
-    // to ensure browser fullscreen APIs work correctly.
+    // Mark fullscreen windows as fullscreen on every redraw (including
+    // during animations) to ensure browser fullscreen APIs work
+    // correctly.
     let is_transitioning_fullscreen =
       match (window.prev_state(), window.state()) {
         (Some(_), WindowState::Fullscreen(s)) if !s.maximized => true,
@@ -1121,12 +1347,12 @@ fn redraw_containers(
   // never reaches `platform_sync` (closing windows are detached from the
   // layout tree), so skip them here to avoid a duplicate upsert this tick.
   //
-  // Repositions are batched into one `DeferWindowPos` transaction (separate
-  // from the surrogate batch `flush_surrogate_updates` just committed above)
-  // rather than each overlay issuing its own synchronous `SetWindowPos` --
-  // that per-window cost scales with tick rate, which is most visible on
-  // high-refresh-rate displays where the animation manager ticks in
-  // lockstep with vsync.
+  // Repositions are batched into one `DeferWindowPos` transaction
+  // (separate from the surrogate batch `flush_surrogate_updates` just
+  // committed above) rather than each overlay issuing its own
+  // synchronous `SetWindowPos` -- that per-window cost scales with tick
+  // rate, which is most visible on high-refresh-rate displays where the
+  // animation manager ticks in lockstep with vsync.
   #[cfg(target_os = "windows")]
   {
     let mut blur_batch = SurrogateBatch::new();
@@ -1164,11 +1390,11 @@ fn redraw_containers(
   #[cfg(target_os = "windows")]
   sync_tab_bars(state, config);
 
-  // Force one composited frame reflecting every `reassert_transparency` call
-  // made above, deterministically closing the race against DWM's own
-  // compositor thread instead of leaving it to scheduling luck. One flush
-  // covers every window that completed an animation this pass, rather than
-  // blocking once per window.
+  // Force one composited frame reflecting every `reassert_transparency`
+  // call made above, deterministically closing the race against DWM's
+  // own compositor thread instead of leaving it to scheduling luck. One
+  // flush covers every window that completed an animation this pass,
+  // rather than blocking once per window.
   #[cfg(target_os = "windows")]
   if needs_transparency_flush {
     wm_platform::dwm_flush();
@@ -1185,9 +1411,10 @@ fn reposition_window(
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   z_order: &WindowZOrder,
   is_visible: bool,
-  // When true, `SWP_ASYNCWINDOWPOS` is omitted so that adjacent windows move
-  // synchronously with the surrogate overlay (both hit DWM in the same frame),
-  // preventing a one-frame gap between the overlay and its neighbours.
+  // When true, `SWP_ASYNCWINDOWPOS` is omitted so that adjacent windows
+  // move synchronously with the surrogate overlay (both hit DWM in the
+  // same frame), preventing a one-frame gap between the overlay and its
+  // neighbours.
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   has_surrogate: bool,
   config: &UserConfig,
@@ -1265,14 +1492,20 @@ fn reposition_window(
         window.native().restore(Some(rect))?;
       }
 
-      // During animation frames, omit `SWP_ASYNCWINDOWPOS` so that adjacent
-      // windows are repositioned synchronously. This keeps their on-screen
-      // position in lock-step with surrogate overlays (which update DWM
-      // directly via `UpdateLayeredWindow`), closing the blank gap that
-      // appears when async repositioning lags one frame behind the surrogate.
+      // During animation frames, omit `SWP_ASYNCWINDOWPOS` so that
+      // adjacent windows are repositioned synchronously. This keeps
+      // their on-screen position in lock-step with surrogate
+      // overlays (which update DWM directly via
+      // `UpdateLayeredWindow`), closing the blank gap that
+      // appears when async repositioning lags one frame behind the
+      // surrogate.
       let mut swp_flags = SWP_NOACTIVATE
         | SWP_NOSENDCHANGING
-        | if has_surrogate { Default::default() } else { SWP_ASYNCWINDOWPOS };
+        | if has_surrogate {
+          Default::default()
+        } else {
+          SWP_ASYNCWINDOWPOS
+        };
 
       match &window.state() {
         WindowState::Minimized => {
@@ -1374,7 +1607,7 @@ fn apply_window_effects(
   window: &WindowContainer,
   is_focused: bool,
   config: &UserConfig,
-) {
+) -> anyhow::Result<()> {
   let window_effects = &config.value.window_effects;
 
   // LINT: `effect_config` is only used on Windows.
@@ -1413,7 +1646,7 @@ fn apply_window_effects(
   if window_effects.focused_window.transparency.enabled
     || window_effects.other_windows.transparency.enabled
   {
-    apply_transparency_effect(window, effect_config);
+    apply_transparency_effect(window, effect_config)?;
   }
 
   #[cfg(target_os = "windows")]
@@ -1422,6 +1655,39 @@ fn apply_window_effects(
   {
     apply_backdrop_effect(window, effect_config);
   }
+
+  Ok(())
+}
+
+/// Commits the effect state already presented by an incoming workspace
+/// surrogate without starting a second focus-opacity transition.
+///
+/// The previously focused window is committed to its unfocused effect
+/// first, matching the normal focused-effect update path. Updating
+/// `prev_effects_window` before the post-switch cursor refresh ensures a
+/// genuine cursor-selected focus change can animate normally afterward.
+#[cfg(target_os = "windows")]
+pub fn commit_presented_focus_effect_handoff(
+  window: &WindowContainer,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let previous = state.prev_effects_window.clone();
+
+  state
+    .animation_manager
+    .clear_focus_opacity_animation(&window.id());
+  apply_window_effects(window, true, config)?;
+
+  if let Some(previous) = previous.filter(|w| w.id() != window.id()) {
+    state
+      .animation_manager
+      .clear_focus_opacity_animation(&previous.id());
+    apply_window_effects(&previous, false, config)?;
+  }
+
+  state.prev_effects_window = Some(window.clone());
+  Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1479,13 +1745,8 @@ fn apply_corner_effect(
 fn apply_transparency_effect(
   window: &WindowContainer,
   effect_config: &WindowEffectConfig,
-) {
-  let transparency = if effect_config.transparency.enabled {
-    &effect_config.transparency.opacity
-  } else {
-    // Reset the transparency to default.
-    &OpacityValue::from_alpha(u8::MAX)
-  };
+) -> anyhow::Result<()> {
+  let transparency = configured_transparency(effect_config);
 
   debug!(
     "Applying transparency to {}: alpha={}.",
@@ -1493,7 +1754,65 @@ fn apply_transparency_effect(
     transparency.to_alpha()
   );
 
-  _ = window.native().set_transparency(transparency);
+  window
+    .native()
+    .set_transparency(&transparency)
+    .with_context(|| {
+      format!("Failed to set transparency for {}", window.id())
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn configured_transparency(
+  effect_config: &WindowEffectConfig,
+) -> OpacityValue {
+  if effect_config.transparency.enabled {
+    effect_config.transparency.opacity.clone()
+  } else {
+    // Disabled transparency means fully opaque.
+    OpacityValue::from_alpha(u8::MAX)
+  }
+}
+
+#[cfg(target_os = "windows")]
+fn start_focus_transparency_animation(
+  window: &WindowContainer,
+  is_focused: bool,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let effects = &config.value.window_effects;
+  let (fallback_effect, target_effect) = if is_focused {
+    (&effects.other_windows, &effects.focused_window)
+  } else {
+    (&effects.focused_window, &effects.other_windows)
+  };
+
+  let fallback_start = configured_transparency(fallback_effect);
+  let target = configured_transparency(target_effect);
+  let Ok(rect) = window.to_rect() else {
+    return Ok(());
+  };
+  let animation = &config.value.animations.focus_change;
+  let start = state.animation_manager.start_focus_opacity_animation(
+    window.id(),
+    rect,
+    fallback_start,
+    target,
+    animation.duration_ms,
+    animation.easing.clone(),
+  );
+
+  // `apply_window_effects` set the target opacity just above. Restore the
+  // transition's first value before DWM presents this frame.
+  window.native().set_transparency(&start).with_context(|| {
+    format!(
+      "Failed to set initial focus opacity for window {}",
+      window.id()
+    )
+  })?;
+
+  Ok(())
 }
 
 /// Creates, updates, or destroys tab bar overlay windows for all
@@ -1564,7 +1883,10 @@ fn sync_tab_bars(state: &mut WmState, config: &UserConfig) {
             .fold(raw_title, |t, (re, rep)| {
               re.replace_all(&t, rep.as_str()).into_owned()
             });
-          TabInfo { title, hwnd: w.native().id().0 }
+          TabInfo {
+            title,
+            hwnd: w.native().id().0,
+          }
         })
         .collect();
 
@@ -1598,9 +1920,7 @@ fn sync_tab_bars(state: &mut WmState, config: &UserConfig) {
     inactive: stack_cfg.tab_inactive_background.clone(),
     text: stack_cfg.tab_text_color.clone(),
     indicator: stack_cfg.tab_active_indicator_color.clone(),
-    indicator_height: stack_cfg
-      .tab_active_indicator_height
-      .to_px(0, None),
+    indicator_height: stack_cfg.tab_active_indicator_height.to_px(0, None),
     border_radius: stack_cfg.tab_border_radius.to_px(0, None),
     separator_width: stack_cfg.tab_separator_width.to_px(0, None),
     separator: stack_cfg.tab_separator_color.clone(),
@@ -1677,16 +1997,16 @@ fn apply_backdrop_effect(
 ///
 /// Used by the workspace-switch live-tracking driver in
 /// `AnimationManager::update_internal`, which always has a definite
-/// up-to-date rect from the surrogate it's following each tick and so needs
-/// no conditional re-query -- unlike `sync_blur_overlays` below, which only
-/// re-queries `frame()` (a cross-process call) when the window is actually
-/// being redrawn this tick.
+/// up-to-date rect from the surrogate it's following each tick and so
+/// needs no conditional re-query -- unlike `sync_blur_overlays` below,
+/// which only re-queries `frame()` (a cross-process call) when the window
+/// is actually being redrawn this tick.
 ///
 /// Takes the overlay map directly (rather than `&mut WmState`) so callers
 /// already holding an unrelated borrow into other `WmState` fields -- e.g.
 /// the workspace-switch driver, which calls this while still borrowing
-/// `state.animation_manager.workspace_switch` for `rect` itself -- can pass
-/// `&mut state.blur_overlays` without a borrow-checker conflict.
+/// `state.animation_manager.workspace_switch` for `rect` itself -- can
+/// pass `&mut state.blur_overlays` without a borrow-checker conflict.
 #[cfg(target_os = "windows")]
 pub(crate) fn upsert_blur_overlay(
   overlays: &mut std::collections::HashMap<uuid::Uuid, NativeBlurOverlay>,
@@ -1715,14 +2035,14 @@ pub(crate) fn upsert_blur_overlay(
   }
 }
 
-/// Resolves `window`'s acrylic overlay params from its focused/other-window
-/// backdrop config, or `None` when backdrop isn't configured/enabled or
-/// isn't set to `BackdropStyle::Acrylic` for it.
+/// Resolves `window`'s acrylic overlay params from its
+/// focused/other-window backdrop config, or `None` when backdrop isn't
+/// configured/enabled or isn't set to `BackdropStyle::Acrylic` for it.
 ///
 /// Shared by [`sync_blur_overlays`] (the per-tick static path) and the
-/// interactive-drag tracker in `handle_window_moved_or_resized`, which needs
-/// the same params to keep the overlay live while the OS drags the window
-/// outside of `GlazeWM`'s own redraw pipeline.
+/// interactive-drag tracker in `handle_window_moved_or_resized`, which
+/// needs the same params to keep the overlay live while the OS drags the
+/// window outside of `GlazeWM`'s own redraw pipeline.
 #[cfg(target_os = "windows")]
 pub(crate) fn blur_overlay_params_for(
   is_focused: bool,
@@ -1759,20 +2079,22 @@ pub(crate) fn blur_overlay_params_for(
 /// kept alive) for windows on inactive workspaces so it can be re-shown
 /// instantly when the workspace becomes active again.
 ///
-/// During animations, surrogates carry the acrylic effect directly via SWCA
-/// so blur is visible throughout the animation. The static overlay is hidden
-/// while a surrogate is active and restored once the animation completes.
+/// During animations, surrogates carry the acrylic effect directly via
+/// SWCA so blur is visible throughout the animation. The static overlay is
+/// hidden while a surrogate is active and restored once the animation
+/// completes.
 ///
 /// The tint is re-evaluated for every window on every tick (cheap: it
 /// no-ops internally unless the resolved value changed, e.g. on focus
 /// change). The window's on-screen rect, however, is only re-queried via
-/// `frame()` -- a cross-process `DwmGetWindowAttribute` call -- for windows
-/// actually queued for redraw this tick (or on first creation). GlazeWM owns
-/// all positioning of managed windows through that same redraw queue, so a
-/// window that isn't in it this tick cannot have moved; skipping the query
-/// avoids a `DwmGetWindowAttribute` round-trip per acrylic window per tick
-/// for windows unrelated to whatever triggered this sync (e.g. other
-/// monitors/workspaces during a workspace-switch animation elsewhere).
+/// `frame()` -- a cross-process `DwmGetWindowAttribute` call -- for
+/// windows actually queued for redraw this tick (or on first creation).
+/// GlazeWM owns all positioning of managed windows through that same
+/// redraw queue, so a window that isn't in it this tick cannot have moved;
+/// skipping the query avoids a `DwmGetWindowAttribute` round-trip per
+/// acrylic window per tick for windows unrelated to whatever triggered
+/// this sync (e.g. other monitors/workspaces during a workspace-switch
+/// animation elsewhere).
 #[cfg(target_os = "windows")]
 fn sync_blur_overlays(
   state: &mut WmState,
@@ -1783,12 +2105,16 @@ fn sync_blur_overlays(
   let mut wanted_ids = std::collections::HashSet::new();
   let mut batch = SurrogateBatch::new();
 
-  // `containers_to_redraw()` may hold an ancestor (e.g. a whole workspace on
-  // a workspace switch) rather than each window individually -- mirror the
-  // same descendant expansion `redraw_containers` uses via `windows_to_redraw`
-  // so a window whose ancestor was queued still counts as redrawing.
-  let redrawing_ids: std::collections::HashSet<_> =
-    state.windows_to_redraw().iter().map(CommonGetters::id).collect();
+  // `containers_to_redraw()` may hold an ancestor (e.g. a whole workspace
+  // on a workspace switch) rather than each window individually --
+  // mirror the same descendant expansion `redraw_containers` uses via
+  // `windows_to_redraw` so a window whose ancestor was queued still
+  // counts as redrawing.
+  let redrawing_ids: std::collections::HashSet<_> = state
+    .windows_to_redraw()
+    .iter()
+    .map(CommonGetters::id)
+    .collect();
 
   for window in &all_windows {
     let is_focused = window.id() == focused_container.id();
@@ -1799,39 +2125,44 @@ fn sync_blur_overlays(
 
     wanted_ids.insert(window.id());
 
-    // Windows with a `Live`-mode (acrylic-tinted) workspace-switch surrogate
-    // are owned entirely by the per-tick tracker in
+    // Windows with a `Live`-mode (acrylic-tinted) workspace-switch
+    // surrogate are owned entirely by the per-tick tracker in
     // `AnimationManager::update_internal` for the whole slide plus the
     // `pending_ws_cleanup` grace tick -- it updates tint/blur_amount/
-    // corner_radius/rect every tick using the surrogate's own live position,
-    // which this function cannot do since it isn't invoked on most mid-slide
-    // ticks (only when `platform_sync` itself runs). Leave these overlays
-    // untouched here entirely: falling through to the hide logic below would
-    // hide them out from under the tracker, since the outgoing workspace's
-    // `!is_displayed()` flips true the instant the switch command runs, well
-    // before the animation completes.
-    // Windows with an active or fading `ResizeSession` (move/resize/open/
-    // close) are likewise owned entirely by the trackers in `platform_sync`'s
-    // post-flush loop, `AnimationManager::update_internal`'s close direct-
-    // drive loop, and its `pending_session_cleanup` fade-tail loop -- same
+    // corner_radius/rect every tick using the surrogate's own live
+    // position, which this function cannot do since it isn't invoked
+    // on most mid-slide ticks (only when `platform_sync` itself runs).
+    // Leave these overlays untouched here entirely: falling through to
+    // the hide logic below would hide them out from under the tracker,
+    // since the outgoing workspace's `!is_displayed()` flips true the
+    // instant the switch command runs, well before the animation
+    // completes. Windows with an active or fading `ResizeSession`
+    // (move/resize/open/ close) are likewise owned entirely by the
+    // trackers in `platform_sync`'s post-flush loop,
+    // `AnimationManager::update_internal`'s close direct- drive loop,
+    // and its `pending_session_cleanup` fade-tail loop -- same
     // reasoning as the workspace-switch case above.
     if state.animation_manager.has_live_ws_surrogate(&window.id())
-      || state.animation_manager.has_live_resize_tracker(&window.id())
+      || state
+        .animation_manager
+        .has_live_resize_tracker(&window.id())
     {
       continue;
     }
 
-    // Hide the static overlay while some other kind of surrogate/session is
-    // active for this window without a live blur tracker of its own (e.g.
-    // blur-behind not configured for it). When such a surrogate is running,
-    // the real window is cloaked at its target rect; reading frame() would
-    // return the target position while the surrogate is still mid-animation,
-    // causing the overlay to jump ahead.
+    // Hide the static overlay while some other kind of surrogate/session
+    // is active for this window without a live blur tracker of its own
+    // (e.g. blur-behind not configured for it). When such a surrogate
+    // is running, the real window is cloaked at its target rect;
+    // reading frame() would return the target position while the
+    // surrogate is still mid-animation, causing the overlay to jump
+    // ahead.
     //
     // Also hide for windows on inactive workspaces; keep the entry alive
     // so it can be re-shown immediately when the workspace returns.
-    let should_hide = state.animation_manager.has_active_surrogate(&window.id())
-      || !window.workspace().is_some_and(|ws| ws.is_displayed());
+    let should_hide =
+      state.animation_manager.has_active_surrogate(&window.id())
+        || !window.workspace().is_some_and(|ws| ws.is_displayed());
 
     if should_hide {
       if let Some(overlay) = state.blur_overlays.get_mut(&window.id()) {
@@ -1851,9 +2182,10 @@ fn sync_blur_overlays(
         // Always re-query and re-show when the overlay isn't currently
         // visible, even if this window isn't part of this tick's redraw --
         // otherwise an overlay hidden on some earlier tick (e.g. while a
-        // surrogate was active) stays hidden indefinitely once `should_hide`
-        // clears, unless this exact window happens to be redrawn again for
-        // an unrelated reason (see `is_visible` doc comment).
+        // surrogate was active) stays hidden indefinitely once
+        // `should_hide` clears, unless this exact window happens
+        // to be redrawn again for an unrelated reason (see
+        // `is_visible` doc comment).
         if is_redrawing || !overlay.is_visible() {
           // Use the DWM extended frame bounds so the overlay sits flush
           // with the window's visible edge, clipping the invisible resize
@@ -1880,7 +2212,10 @@ fn sync_blur_overlays(
             e.insert(overlay);
           }
           Err(err) => {
-            debug!("Blur overlay creation failed for {}: {err}.", window.id());
+            debug!(
+              "Blur overlay creation failed for {}: {err}.",
+              window.id()
+            );
           }
         }
       }
@@ -1891,4 +2226,54 @@ fn sync_blur_overlays(
   state.blur_overlays.retain(|id, _| wanted_ids.contains(id));
 
   batch.commit();
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+  use super::{
+    needs_surrogate_warmup_flush, needs_transparency_composition_flush,
+    should_defer_native_focus, should_start_workspace_switch,
+  };
+
+  #[test]
+  fn workspace_switch_requires_every_surrogate() {
+    assert!(!should_start_workspace_switch(2, 1, 1, false));
+    assert!(!should_start_workspace_switch(1, 0, 1, false));
+  }
+
+  #[test]
+  fn workspace_switch_starts_when_every_surrogate_is_ready() {
+    assert!(should_start_workspace_switch(2, 2, 1, false));
+    assert!(should_start_workspace_switch(2, 2, 0, true));
+  }
+
+  #[test]
+  fn slide_workspace_switch_still_requires_a_direction() {
+    assert!(!should_start_workspace_switch(2, 2, 0, false));
+    assert!(!should_start_workspace_switch(0, 0, 1, false));
+  }
+
+  #[test]
+  fn opaque_repositions_do_not_require_a_compositor_flush() {
+    assert!(!needs_transparency_composition_flush(true, u8::MAX));
+    assert!(!needs_transparency_composition_flush(false, 128));
+    assert!(needs_transparency_composition_flush(true, 254));
+  }
+
+  #[test]
+  fn preflushed_workspace_surrogates_skip_per_window_warmup() {
+    assert!(!needs_surrogate_warmup_flush(true));
+  }
+
+  #[test]
+  fn ordinary_surrogates_keep_per_window_warmup() {
+    assert!(needs_surrogate_warmup_flush(false));
+  }
+
+  #[test]
+  fn surrogate_covered_focus_is_deferred_until_handoff() {
+    assert!(should_defer_native_focus(true, false));
+    assert!(should_defer_native_focus(false, true));
+    assert!(!should_defer_native_focus(false, false));
+  }
 }

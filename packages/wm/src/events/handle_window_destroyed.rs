@@ -3,7 +3,10 @@ use tracing::info;
 use wm_platform::WindowId;
 
 use crate::{
-  commands::{window::unmanage_window, workspace::deactivate_workspace},
+  commands::{
+    window::{cancel_pending_manage_retry, unmanage_window},
+    workspace::deactivate_workspace,
+  },
   traits::{CommonGetters, WindowGetters},
   wm_state::WmState,
 };
@@ -12,10 +15,21 @@ pub fn handle_window_destroyed(
   native_window_id: WindowId,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
+  // A destroyed HWND cannot become manageable. Cancel a sleeping retry now
+  // instead of waiting for its timer to wake and rediscover invalidity.
+  cancel_pending_manage_retry(native_window_id, state);
+
   let found_window = state
     .windows()
     .into_iter()
     .find(|window| window.native().id() == native_window_id);
+
+  #[cfg(target_os = "windows")]
+  if found_window.as_ref().is_some_and(|window| {
+    state.pending_presented_focus_effect_handoff == Some(window.id())
+  }) {
+    state.pending_presented_focus_effect_handoff = None;
+  }
 
   // Unmanage the window if it's currently managed.
   if let Some(window) = found_window {

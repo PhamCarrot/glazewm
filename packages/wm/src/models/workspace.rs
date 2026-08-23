@@ -7,8 +7,7 @@ use std::{
 use anyhow::Context;
 use uuid::Uuid;
 use wm_common::{
-  ContainerDto, GapsConfig, WorkspaceConfig, WorkspaceDto,
-  WorkspaceLayout,
+  ContainerDto, GapsConfig, WorkspaceConfig, WorkspaceDto, WorkspaceLayout,
 };
 use wm_platform::{Rect, RectDelta};
 

@@ -9,8 +9,8 @@ use crate::{
 
 /// Inserts a `StackContainer` into the tree, adopting the given children.
 ///
-/// Mirrors `wrap_in_split_container`, but for `StackContainer` (no direction
-/// parameter needed).
+/// Mirrors `wrap_in_split_container`, but for `StackContainer` (no
+/// direction parameter needed).
 pub fn wrap_in_stack_container(
   stack: &StackContainer,
   target_parent: &Container,

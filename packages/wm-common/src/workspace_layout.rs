@@ -4,11 +4,35 @@ use wm_platform::Rect;
 
 use crate::TilingDirection;
 
+/// Returns an effective gap and the remaining axis length. Positive gaps
+/// are capped so they can never consume more space than the parent
+/// contains.
+fn bounded_gap_and_available(
+  total_length: i32,
+  requested_gap: i32,
+  gap_count: usize,
+) -> (i32, i32) {
+  if gap_count == 0 {
+    return (0, total_length);
+  }
+
+  #[allow(clippy::cast_possible_wrap)]
+  let gap_count = gap_count as i32;
+  let max_gap = total_length.max(0) / gap_count;
+  let effective_gap = requested_gap.min(max_gap);
+  let available = i64::from(total_length)
+    - i64::from(effective_gap) * i64::from(gap_count);
+
+  #[allow(clippy::cast_possible_truncation)]
+  let available = available.clamp(0, i64::from(i32::MAX)) as i32;
+  (effective_gap, available)
+}
+
 /// Algorithm used to position the direct tiling children of a container.
 ///
 /// Applied by both `Workspace` and `SplitContainer` via `LayoutGetters`.
-/// Adding a new layout only requires adding a variant here and implementing
-/// `compute_rects`.
+/// Adding a new layout only requires adding a variant here and
+/// implementing `compute_rects`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ValueEnum)]
 #[clap(rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -29,7 +53,8 @@ pub enum WorkspaceLayout {
   /// Rectangular grid with as-square-as-possible cells.
   Grid,
   /// First child occupies the left portion (ratio controlled by its
-  /// `tiling_size`); remaining children are stacked vertically on the right.
+  /// `tiling_size`); remaining children are stacked vertically on the
+  /// right.
   VerticalStack,
   /// First child occupies the top portion (ratio controlled by its
   /// `tiling_size`); remaining children are stacked horizontally at the
@@ -48,9 +73,9 @@ impl WorkspaceLayout {
       | Self::Columns
       | Self::Grid
       | Self::VerticalStack => TilingDirection::Horizontal,
-      Self::SplitVertical
-      | Self::Rows
-      | Self::HorizontalStack => TilingDirection::Vertical,
+      Self::SplitVertical | Self::Rows | Self::HorizontalStack => {
+        TilingDirection::Vertical
+      }
     }
   }
 
@@ -78,7 +103,8 @@ impl WorkspaceLayout {
     )
   }
 
-  /// Returns the inverse of a split layout, or `self` for non-split layouts.
+  /// Returns the inverse of a split layout, or `self` for non-split
+  /// layouts.
   #[must_use]
   pub fn inverse(&self) -> Self {
     match self {
@@ -90,8 +116,8 @@ impl WorkspaceLayout {
 
   /// Computes the bounding rect for each direct tiling child.
   ///
-  /// `tiling_sizes` must contain one entry per tiling child, in tree order.
-  /// Returns one `Rect` per child in the same order.
+  /// `tiling_sizes` must contain one entry per tiling child, in tree
+  /// order. Returns one `Rect` per child in the same order.
   ///
   /// `h_gap` is the gap applied between horizontally adjacent children;
   /// `v_gap` is the gap applied between vertically adjacent children.
@@ -128,7 +154,8 @@ impl WorkspaceLayout {
           }
 
           if i % 2 == 0 {
-            let available_w = remaining.width() - h_gap;
+            let (effective_gap, available_w) =
+              bounded_gap_and_available(remaining.width(), h_gap, 1);
             let child_w = available_w / 2;
 
             rects.push(Rect::from_xy(
@@ -139,13 +166,14 @@ impl WorkspaceLayout {
             ));
 
             remaining = Rect::from_xy(
-              remaining.x() + child_w + h_gap,
+              remaining.x() + child_w + effective_gap,
               remaining.y(),
               available_w - child_w,
               remaining.height(),
             );
           } else {
-            let available_h = remaining.height() - v_gap;
+            let (effective_gap, available_h) =
+              bounded_gap_and_available(remaining.height(), v_gap, 1);
             let child_h = available_h / 2;
 
             rects.push(Rect::from_xy(
@@ -157,7 +185,7 @@ impl WorkspaceLayout {
 
             remaining = Rect::from_xy(
               remaining.x(),
-              remaining.y() + child_h + v_gap,
+              remaining.y() + child_h + effective_gap,
               remaining.width(),
               available_h - child_h,
             );
@@ -168,8 +196,8 @@ impl WorkspaceLayout {
       }
       Self::SplitHorizontal => {
         // Each child gets a proportional share of the width.
-        let available_w =
-          parent_rect.width() - h_gap * (n as i32 - 1);
+        let (h_gap, available_w) =
+          bounded_gap_and_available(parent_rect.width(), h_gap, n - 1);
         let mut x = parent_rect.x();
         tiling_sizes
           .iter()
@@ -181,12 +209,8 @@ impl WorkspaceLayout {
             } else {
               (available_w as f32 * size).round() as i32
             };
-            let rect = Rect::from_xy(
-              x,
-              parent_rect.y(),
-              w,
-              parent_rect.height(),
-            );
+            let rect =
+              Rect::from_xy(x, parent_rect.y(), w, parent_rect.height());
             x += w + h_gap;
             rect
           })
@@ -194,8 +218,8 @@ impl WorkspaceLayout {
       }
       Self::SplitVertical => {
         // Each child gets a proportional share of the height.
-        let available_h =
-          parent_rect.height() - v_gap * (n as i32 - 1);
+        let (v_gap, available_h) =
+          bounded_gap_and_available(parent_rect.height(), v_gap, n - 1);
         let mut y = parent_rect.y();
         tiling_sizes
           .iter()
@@ -207,12 +231,8 @@ impl WorkspaceLayout {
               // Match original floor truncation for vertical splits.
               (size * available_h as f32) as i32
             };
-            let rect = Rect::from_xy(
-              parent_rect.x(),
-              y,
-              parent_rect.width(),
-              h,
-            );
+            let rect =
+              Rect::from_xy(parent_rect.x(), y, parent_rect.width(), h);
             y += h + v_gap;
             rect
           })
@@ -220,8 +240,8 @@ impl WorkspaceLayout {
       }
       Self::Columns => {
         // Equal-width columns.
-        let available_w =
-          parent_rect.width() - h_gap * (n as i32 - 1);
+        let (h_gap, available_w) =
+          bounded_gap_and_available(parent_rect.width(), h_gap, n - 1);
         let col_w = available_w / n as i32;
         let mut x = parent_rect.x();
         (0..n)
@@ -231,12 +251,8 @@ impl WorkspaceLayout {
             } else {
               col_w
             };
-            let rect = Rect::from_xy(
-              x,
-              parent_rect.y(),
-              w,
-              parent_rect.height(),
-            );
+            let rect =
+              Rect::from_xy(x, parent_rect.y(), w, parent_rect.height());
             x += w + h_gap;
             rect
           })
@@ -244,8 +260,8 @@ impl WorkspaceLayout {
       }
       Self::Rows => {
         // Equal-height rows.
-        let available_h =
-          parent_rect.height() - v_gap * (n as i32 - 1);
+        let (v_gap, available_h) =
+          bounded_gap_and_available(parent_rect.height(), v_gap, n - 1);
         let row_h = available_h / n as i32;
         let mut y = parent_rect.y();
         (0..n)
@@ -255,12 +271,8 @@ impl WorkspaceLayout {
             } else {
               row_h
             };
-            let rect = Rect::from_xy(
-              parent_rect.x(),
-              y,
-              parent_rect.width(),
-              h,
-            );
+            let rect =
+              Rect::from_xy(parent_rect.x(), y, parent_rect.width(), h);
             y += h + v_gap;
             rect
           })
@@ -270,10 +282,10 @@ impl WorkspaceLayout {
         // Arrange children in a roughly-square grid.
         let cols = (n as f64).sqrt().ceil() as usize;
         let rows = n.div_ceil(cols);
-        let available_w =
-          parent_rect.width() - h_gap * (cols as i32 - 1);
-        let available_h =
-          parent_rect.height() - v_gap * (rows as i32 - 1);
+        let (h_gap, available_w) =
+          bounded_gap_and_available(parent_rect.width(), h_gap, cols - 1);
+        let (v_gap, available_h) =
+          bounded_gap_and_available(parent_rect.height(), v_gap, rows - 1);
         let cell_w = available_w / cols as i32;
         let cell_h = available_h / rows as i32;
 
@@ -306,13 +318,16 @@ impl WorkspaceLayout {
 
         let main_ratio = tiling_sizes[0];
         // One h_gap between the main area and the stack column.
-        let available_w = parent_rect.width() - h_gap;
-        let main_w =
-          (available_w as f32 * main_ratio).round() as i32;
+        let (h_gap, available_w) =
+          bounded_gap_and_available(parent_rect.width(), h_gap, 1);
+        let main_w = (available_w as f32 * main_ratio).round() as i32;
         let stack_w = available_w - main_w;
         let n_stack = n - 1;
-        let stack_available_h =
-          parent_rect.height() - v_gap * (n_stack as i32 - 1);
+        let (v_gap, stack_available_h) = bounded_gap_and_available(
+          parent_rect.height(),
+          v_gap,
+          n_stack - 1,
+        );
         let stack_child_h = stack_available_h / n_stack as i32;
 
         let mut rects = Vec::with_capacity(n);
@@ -346,13 +361,16 @@ impl WorkspaceLayout {
 
         let main_ratio = tiling_sizes[0];
         // One v_gap between the main area and the stack row.
-        let available_h = parent_rect.height() - v_gap;
-        let main_h =
-          (available_h as f32 * main_ratio).round() as i32;
+        let (v_gap, available_h) =
+          bounded_gap_and_available(parent_rect.height(), v_gap, 1);
+        let main_h = (available_h as f32 * main_ratio).round() as i32;
         let stack_h = available_h - main_h;
         let n_stack = n - 1;
-        let stack_available_w =
-          parent_rect.width() - h_gap * (n_stack as i32 - 1);
+        let (h_gap, stack_available_w) = bounded_gap_and_available(
+          parent_rect.width(),
+          h_gap,
+          n_stack - 1,
+        );
         let stack_child_w = stack_available_w / n_stack as i32;
 
         let mut rects = Vec::with_capacity(n);
@@ -425,12 +443,8 @@ mod tests {
   #[test]
   fn bsp_single_child_fills_parent() {
     let parent = rect(20, 30, 1000, 600);
-    let rects = WorkspaceLayout::Bsp.compute_rects(
-      parent.clone(),
-      &[1.0],
-      10,
-      10,
-    );
+    let rects =
+      WorkspaceLayout::Bsp.compute_rects(parent.clone(), &[1.0], 10, 10);
 
     assert_eq!(rects, vec![parent]);
   }
@@ -488,5 +502,84 @@ mod tests {
     assert_eq!(rects[0], rect(0, 0, 500, 600)); // main
     assert_eq!(rects[1], rect(500, 0, 500, 300)); // stack[0]
     assert_eq!(rects[2], rect(500, 300, 500, 300)); // stack[1]
+  }
+
+  #[test]
+  fn oversized_positive_gaps_keep_all_layout_rects_nonnegative_and_contained(
+  ) {
+    let parent = rect(10, 20, 40, 30);
+    let layouts = [
+      WorkspaceLayout::Bsp,
+      WorkspaceLayout::SplitHorizontal,
+      WorkspaceLayout::SplitVertical,
+      WorkspaceLayout::Columns,
+      WorkspaceLayout::Rows,
+      WorkspaceLayout::Grid,
+      WorkspaceLayout::VerticalStack,
+      WorkspaceLayout::HorizontalStack,
+    ];
+
+    for layout in layouts {
+      let rects = layout.compute_rects(
+        parent.clone(),
+        &[0.25, 0.25, 0.25, 0.25],
+        100,
+        100,
+      );
+
+      assert_eq!(rects.len(), 4, "layout: {layout:?}");
+      for child in rects {
+        assert!(child.width() >= 0, "layout: {layout:?}, rect: {child:?}");
+        assert!(
+          child.height() >= 0,
+          "layout: {layout:?}, rect: {child:?}"
+        );
+        assert!(
+          parent.contains_rect(&child),
+          "layout: {layout:?}, rect: {child:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn proportional_layouts_preserve_minimum_tiling_ratio() {
+    let parent = rect(0, 0, 1000, 1000);
+
+    let horizontal = WorkspaceLayout::SplitHorizontal.compute_rects(
+      parent.clone(),
+      &[0.01, 0.99],
+      0,
+      0,
+    );
+    assert_eq!(horizontal[0].width(), 10);
+    assert_eq!(horizontal[1].width(), 990);
+
+    let vertical = WorkspaceLayout::SplitVertical.compute_rects(
+      parent.clone(),
+      &[0.01, 0.99],
+      0,
+      0,
+    );
+    assert_eq!(vertical[0].height(), 10);
+    assert_eq!(vertical[1].height(), 990);
+
+    let vertical_stack = WorkspaceLayout::VerticalStack.compute_rects(
+      parent.clone(),
+      &[0.01, 0.99],
+      0,
+      0,
+    );
+    assert_eq!(vertical_stack[0].width(), 10);
+    assert_eq!(vertical_stack[1].width(), 990);
+
+    let horizontal_stack = WorkspaceLayout::HorizontalStack.compute_rects(
+      parent,
+      &[0.01, 0.99],
+      0,
+      0,
+    );
+    assert_eq!(horizontal_stack[0].height(), 10);
+    assert_eq!(horizontal_stack[1].height(), 990);
   }
 }

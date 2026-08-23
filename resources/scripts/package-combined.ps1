@@ -14,13 +14,14 @@ function Assert-LastExitCode {
   }
 }
 
-function Ensure-WixExtension {
+function Assert-WixExtension {
   param([Parameter(Mandatory = $true)][string]$Extension)
 
   $installedExtensions = (& wix extension list 2>&1) -join "`n"
+  Assert-LastExitCode 'Listing WiX extensions'
+
   if ($installedExtensions -notmatch [regex]::Escape($Extension)) {
-    & wix extension add "$Extension/5"
-    Assert-LastExitCode "Installing WiX extension $Extension"
+    throw "WiX extension $Extension/5 is required. Install it explicitly before packaging."
   }
 }
 
@@ -31,6 +32,7 @@ try {
   $releaseName = "glazewm-combined-v$VersionNumber-windows-x64"
   $outDir = Join-Path $repoRoot 'out'
   $stageDir = Join-Path $outDir $releaseName
+  $stageCliDir = Join-Path $stageDir 'cli'
   $zipPath = Join-Path $outDir "$releaseName.zip"
   $msiPath = Join-Path $outDir "$releaseName.msi"
 
@@ -39,25 +41,29 @@ try {
   }
 
   New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+  New-Item -ItemType Directory -Path $stageCliDir -Force | Out-Null
   New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
   $env:VERSION_NUMBER = $VersionNumber
 
-  Write-Host 'Running test suite...'
-  & cargo test --workspace --lib --bins --tests
-  Assert-LastExitCode 'Cargo tests'
+  Write-Host 'Running focused release checks...'
+  & cargo test -p wm-common
+  Assert-LastExitCode 'wm-common tests'
+  & cargo test -p wm
+  Assert-LastExitCode 'wm tests'
+  & cargo check -p wm-platform
+  Assert-LastExitCode 'wm-platform check'
 
   Write-Host 'Building optimized Windows binaries...'
   & cargo build --locked --release --workspace
   Assert-LastExitCode 'Cargo release build'
 
-  $requiredFiles = @(
+  $rootBinaries = @(
     'target\release\glazewm.exe',
-    'target\release\glazewm-cli.exe',
     'target\release\glazewm-watcher.exe'
   )
 
-  foreach ($relativePath in $requiredFiles) {
+  foreach ($relativePath in $rootBinaries) {
     $sourcePath = Join-Path $repoRoot $relativePath
     if (!(Test-Path -LiteralPath $sourcePath)) {
       throw "Required build output is missing: $sourcePath"
@@ -65,10 +71,17 @@ try {
     Copy-Item -LiteralPath $sourcePath -Destination $stageDir -Force
   }
 
+  $cliSourcePath = Join-Path $repoRoot 'target\release\glazewm-cli.exe'
+  if (!(Test-Path -LiteralPath $cliSourcePath)) {
+    throw "Required build output is missing: $cliSourcePath"
+  }
+  Copy-Item -LiteralPath $cliSourcePath `
+    -Destination (Join-Path $stageCliDir 'glazewm.exe') -Force
+
   Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE.md') -Destination $stageDir -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination $stageDir -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot 'resources\assets\sample-config.yaml') `
-    -Destination (Join-Path $stageDir 'config.example.yaml') -Force
+    -Destination (Join-Path $stageDir 'config.yaml') -Force
 
   if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
@@ -77,24 +90,12 @@ try {
   Write-Host 'Creating portable ZIP...'
   Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
 
-  if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) {
-    throw '.NET SDK is required to install WiX. Install it from https://dotnet.microsoft.com/download'
-  }
-
-  $installedSdks = (& dotnet --list-sdks 2>$null) -join "`n"
-  if ([string]::IsNullOrWhiteSpace($installedSdks)) {
-    throw '.NET is installed, but no .NET SDK was found. Install a current .NET SDK before building the MSI.'
-  }
-
   if (!(Get-Command wix -ErrorAction SilentlyContinue)) {
-    Write-Host 'Installing WiX Toolset 5...'
-    & dotnet tool install --global wix --version 5.0.0
-    Assert-LastExitCode 'Installing WiX Toolset'
-    $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
+    throw 'WiX Toolset 5 is required to build the MSI. Install it explicitly or use the portable ZIP created above.'
   }
 
-  Ensure-WixExtension 'WixToolset.UI.wixext'
-  Ensure-WixExtension 'WixToolset.Util.wixext'
+  Assert-WixExtension 'WixToolset.UI.wixext'
+  Assert-WixExtension 'WixToolset.Util.wixext'
 
   Write-Host 'Creating unsigned x64 MSI...'
   & wix build `

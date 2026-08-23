@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Context;
 use tracing::info;
 use wm_common::{WmEvent, WorkspaceConfig, WorkspaceLayout};
@@ -51,11 +53,11 @@ pub fn activate_workspace(
 
   let monitor_rect = target_monitor.to_rect()?;
 
-  let layout = if monitor_rect.height() > monitor_rect.width() {
-    WorkspaceLayout::SplitVertical
-  } else {
-    WorkspaceLayout::Bsp
-  };
+  let layout = workspace_layout_for_activation(
+    &workspace_config.name,
+    &monitor_rect,
+    &state.workspace_layouts,
+  );
 
   let workspace = Workspace::new(
     workspace_config.clone(),
@@ -79,6 +81,23 @@ pub fn activate_workspace(
   });
 
   Ok(())
+}
+
+fn workspace_layout_for_activation(
+  workspace_name: &str,
+  monitor_rect: &wm_platform::Rect,
+  remembered_layouts: &HashMap<String, WorkspaceLayout>,
+) -> WorkspaceLayout {
+  remembered_layouts
+    .get(workspace_name)
+    .cloned()
+    .unwrap_or_else(|| {
+      if monitor_rect.height() > monitor_rect.width() {
+        WorkspaceLayout::SplitVertical
+      } else {
+        WorkspaceLayout::Bsp
+      }
+    })
 }
 
 /// Gets config for the workspace to activate.
@@ -112,4 +131,47 @@ fn workspace_config(
   };
 
   found_config.cloned()
+}
+
+#[cfg(test)]
+mod tests {
+  use wm_platform::Rect;
+
+  use super::*;
+
+  #[test]
+  fn activation_restores_remembered_workspace_layout() {
+    let mut remembered = HashMap::new();
+    remembered.insert("dev".to_string(), WorkspaceLayout::Grid);
+
+    let layout = workspace_layout_for_activation(
+      "dev",
+      &Rect::from_xy(0, 0, 1920, 1080),
+      &remembered,
+    );
+
+    assert_eq!(layout, WorkspaceLayout::Grid);
+  }
+
+  #[test]
+  fn activation_uses_orientation_default_without_remembered_layout() {
+    let remembered = HashMap::new();
+
+    assert_eq!(
+      workspace_layout_for_activation(
+        "landscape",
+        &Rect::from_xy(0, 0, 1920, 1080),
+        &remembered,
+      ),
+      WorkspaceLayout::Bsp,
+    );
+    assert_eq!(
+      workspace_layout_for_activation(
+        "portrait",
+        &Rect::from_xy(0, 0, 1080, 1920),
+        &remembered,
+      ),
+      WorkspaceLayout::SplitVertical,
+    );
+  }
 }

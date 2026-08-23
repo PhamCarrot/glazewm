@@ -155,16 +155,18 @@ fn spatial_tiling_sibling(
 ) -> anyhow::Result<Option<TilingContainer>> {
   let origin_rect = origin.to_rect()?;
 
-  Ok(parent
-    .tiling_children()
-    .filter(|candidate| candidate.id() != origin.id())
-    .filter_map(|candidate| {
-      let candidate_rect = candidate.to_rect().ok()?;
-      directional_score(&origin_rect, &candidate_rect, direction)
-        .map(|score| (score, candidate))
-    })
-    .min_by_key(|(score, _)| *score)
-    .map(|(_, candidate)| candidate))
+  Ok(
+    parent
+      .tiling_children()
+      .filter(|candidate| candidate.id() != origin.id())
+      .filter_map(|candidate| {
+        let candidate_rect = candidate.to_rect().ok()?;
+        directional_score(&origin_rect, &candidate_rect, direction)
+          .map(|score| (score, candidate))
+      })
+      .min_by_key(|(score, _)| *score)
+      .map(|(_, candidate)| candidate),
+  )
 }
 
 /// Produces an ordering key for a candidate rectangle in `direction`.
@@ -176,7 +178,8 @@ fn directional_score(
   let origin_center = origin.center_point();
   let candidate_center = candidate.center_point();
 
-  let (primary_distance, perpendicular_distance, overlap) = match direction {
+  let (primary_distance, perpendicular_distance, overlap) = match direction
+  {
     Direction::Left => (
       origin_center.x - candidate_center.x,
       (origin_center.y - candidate_center.y).abs(),
@@ -204,11 +207,7 @@ fn directional_score(
   }
 
   let overlap_penalty = if overlap > 0 { 0 } else { 1 };
-  Some((
-    overlap_penalty,
-    primary_distance,
-    perpendicular_distance,
-  ))
+  Some((overlap_penalty, primary_distance, perpendicular_distance))
 }
 
 /// Gets a focus target outside of the current workspace in the given

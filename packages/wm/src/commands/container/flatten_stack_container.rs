@@ -7,8 +7,8 @@ use crate::{
   traits::{CommonGetters, TilingSizeGetters},
 };
 
-/// Removes a `StackContainer` from the tree and moves its children into the
-/// parent container.
+/// Removes a `StackContainer` from the tree and moves its children into
+/// the parent container.
 ///
 /// The children will be resized to fit the size of the stack container.
 #[allow(clippy::needless_pass_by_value)]
@@ -17,17 +17,15 @@ pub fn flatten_stack_container(
 ) -> anyhow::Result<()> {
   let parent = stack.parent().context("No parent.")?;
 
-  let updated_children =
-    stack.children().into_iter().inspect(|child| {
-      *child.borrow_parent_mut() = Some(parent.clone());
+  let updated_children = stack.children().into_iter().inspect(|child| {
+    *child.borrow_parent_mut() = Some(parent.clone());
 
-      // Resize tiling children to fit the size of the stack container.
-      if let Ok(tiling_child) = child.as_tiling_container() {
-        tiling_child.set_tiling_size(
-          stack.tiling_size() * tiling_child.tiling_size(),
-        );
-      }
-    });
+    // Resize tiling children to fit the size of the stack container.
+    if let Ok(tiling_child) = child.as_tiling_container() {
+      tiling_child
+        .set_tiling_size(stack.tiling_size() * tiling_child.tiling_size());
+    }
+  });
 
   let index = stack.index();
   let focus_index = stack.focus_index();

@@ -1,8 +1,6 @@
 use crate::{
-  commands::container::set_focused_descendant,
-  models::Container,
-  traits::CommonGetters,
-  wm_state::WmState,
+  commands::container::set_focused_descendant, models::Container,
+  traits::CommonGetters, wm_state::WmState,
 };
 
 /// Cycles focus to the next or previous window within the focused window's
@@ -31,7 +29,8 @@ pub fn cycle_stack_focus(
     return Ok(());
   }
 
-  // Find the position of the currently focused child (front of focus order).
+  // Find the position of the currently focused child (front of focus
+  // order).
   let focused_id = stack
     .borrow_child_focus_order()
     .front()

@@ -355,8 +355,12 @@ impl Dispatcher {
   /// After calling this method, all subsequent calls to `dispatch_async()`
   /// and `dispatch_sync()` will return `Error::EventLoopStopped`.
   pub fn stop_event_loop(&self) -> crate::Result<()> {
-    // Set stopped flag to prevent new dispatches.
-    self.stopped.store(true, Ordering::SeqCst);
+    // Set the stopped flag once to prevent duplicate platform stop
+    // messages. This also makes shutdown safe when both the owner and
+    // a dispatcher attempt to stop the same loop.
+    if self.stopped.swap(true, Ordering::SeqCst) {
+      return Ok(());
+    }
 
     // Signal platform-specific event loop to stop.
     if let Some(source) = &self.source {

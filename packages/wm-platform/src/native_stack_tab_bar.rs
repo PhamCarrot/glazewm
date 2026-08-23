@@ -9,22 +9,23 @@ use windows::{
     Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
       BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW,
-      EndPaint, FillRect, GetStockObject, HBRUSH, InvalidateRect,
-      NULL_PEN, RoundRect, SelectObject, SetBkMode, SetTextColor,
-      CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, DT_END_ELLIPSIS,
-      DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, OUT_DEFAULT_PRECIS,
-      PAINTSTRUCT, TRANSPARENT,
+      EndPaint, FillRect, GetStockObject, InvalidateRect, RoundRect,
+      SelectObject, SetBkMode, SetTextColor, CLIP_DEFAULT_PRECIS,
+      DEFAULT_CHARSET, DEFAULT_QUALITY, DT_END_ELLIPSIS, DT_NOPREFIX,
+      DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HBRUSH, NULL_PEN,
+      OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
       CreateWindowExW, DefWindowProcW, DestroyWindow, DrawIconEx,
       GetClassLongPtrW, GetSystemMetrics, GetWindowLongPtrW, KillTimer,
-      LoadCursorW, PostMessageW, RegisterClassW, SetTimer, SetWindowLongPtrW,
-      SetWindowPos, ShowWindow, CREATESTRUCTW, DI_NORMAL, GCLP_HICONSM,
-      GWLP_USERDATA, HICON, IDC_ARROW, SM_CXSMICON, SW_HIDE, SWP_NOACTIVATE,
-      SWP_SHOWWINDOW, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
-      WM_LBUTTONDOWN, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-      WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+      LoadCursorW, PostMessageW, RegisterClassW, SetTimer,
+      SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW,
+      DI_NORMAL, GCLP_HICONSM, GWLP_USERDATA, HICON, IDC_ARROW,
+      SM_CXSMICON, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_APP,
+      WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
+      WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+      WS_POPUP, WS_VISIBLE,
     },
   },
 };
@@ -73,7 +74,8 @@ pub struct TabBarColors {
   pub separator: Color,
 }
 
-/// Payload sent via `WM_UPDATE_TABS` to update the tab bar from any thread.
+/// Payload sent via `WM_UPDATE_TABS` to update the tab bar from any
+/// thread.
 struct TabUpdate {
   tabs: Vec<TabInfo>,
   active_index: usize,
@@ -101,30 +103,31 @@ struct TabBarState {
 
 /// A GDI-painted tab bar overlay for a `StackContainer`.
 ///
-/// The window is a `WS_POPUP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` overlay
-/// created on the event-loop thread. Tab state is updated from the tokio
-/// thread via `PostMessageW(WM_UPDATE_TABS)` (fire-and-forget). Click events
-/// are routed back through the `on_click` closure, which is expected to send
-/// a message on a tokio channel.
+/// The window is a `WS_POPUP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
+/// overlay created on the event-loop thread. Tab state is updated from the
+/// tokio thread via `PostMessageW(WM_UPDATE_TABS)` (fire-and-forget).
+/// Click events are routed back through the `on_click` closure, which is
+/// expected to send a message on a tokio channel.
 ///
 /// `update` deduplicates posts by caching the last-applied rect, active
-/// index, tab keys, and colors. During animations `platform_sync` runs every
-/// frame, but the tab bar content does not change, so redundant GDI repaints
-/// are skipped until something actually differs.
+/// index, tab keys, and colors. During animations `platform_sync` runs
+/// every frame, but the tab bar content does not change, so redundant GDI
+/// repaints are skipped until something actually differs.
 ///
-/// The active-tab indicator slides smoothly between tabs using a `WM_TIMER`
-/// driven animation internal to the WNDPROC.
+/// The active-tab indicator slides smoothly between tabs using a
+/// `WM_TIMER` driven animation internal to the WNDPROC.
 ///
 /// # Platform-specific
 ///
 /// Only available on Windows.
 pub struct NativeStackTabBar {
   hwnd: isize,
-  /// Rect from the last posted `WM_UPDATE_TABS`, or `None` after `hide()`.
+  /// Rect from the last posted `WM_UPDATE_TABS`, or `None` after
+  /// `hide()`.
   ///
-  /// Reset to `None` by `hide()` so the next `update()` always re-posts even
-  /// when rect and tab state are unchanged (needed to re-show the window after
-  /// a workspace-switch hide).
+  /// Reset to `None` by `hide()` so the next `update()` always re-posts
+  /// even when rect and tab state are unchanged (needed to re-show the
+  /// window after a workspace-switch hide).
   last_rect: Option<Rect>,
   /// Active-tab index from the last post.
   last_active_index: usize,
@@ -135,8 +138,8 @@ pub struct NativeStackTabBar {
 }
 
 // SAFETY: `hwnd` is a valid Win32 window handle that can be passed between
-// threads. All WNDPROC processing happens on the event-loop thread. We only
-// store the raw handle value here so that we can post messages to it.
+// threads. All WNDPROC processing happens on the event-loop thread. We
+// only store the raw handle value here so that we can post messages to it.
 unsafe impl Send for NativeStackTabBar {}
 
 impl NativeStackTabBar {
@@ -153,8 +156,9 @@ impl NativeStackTabBar {
     colors: TabBarColors,
     on_click: Box<dyn Fn(usize) + Send + 'static>,
   ) -> crate::Result<Self> {
-    // Snapshot the creation state for the dedup cache so the first `update`
-    // call with identical content does not post a redundant `WM_UPDATE_TABS`.
+    // Snapshot the creation state for the dedup cache so the first
+    // `update` call with identical content does not post a redundant
+    // `WM_UPDATE_TABS`.
     let initial_rect = rect.clone();
     let initial_tab_keys: Vec<(isize, String)> =
       tabs.iter().map(|t| (t.hwnd, t.title.clone())).collect();
@@ -165,8 +169,7 @@ impl NativeStackTabBar {
     } else {
       0
     };
-    let initial_indicator_x =
-      active_index as f32 * tab_width as f32;
+    let initial_indicator_x = active_index as f32 * tab_width as f32;
 
     let state = Box::new(TabBarState {
       tabs,
@@ -184,43 +187,44 @@ impl NativeStackTabBar {
     let state_ptr_val = Box::into_raw(state) as usize;
     let rect = rect.clone();
 
-    let hwnd = dispatcher.dispatch_sync(move || -> crate::Result<isize> {
-      ensure_class_registered();
+    let hwnd =
+      dispatcher.dispatch_sync(move || -> crate::Result<isize> {
+        ensure_class_registered();
 
-      let state_ptr = state_ptr_val as *mut TabBarState;
+        let state_ptr = state_ptr_val as *mut TabBarState;
 
-      // SAFETY: Creating a valid top-level popup window with known-good
-      // parameters. `state_ptr` is valid for the duration of the window's
-      // lifetime and is freed in `WM_DESTROY`.
-      let handle = unsafe {
-        CreateWindowExW(
-          WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-          w!("GlazeWM_TabBar"),
-          w!(""),
-          WS_POPUP | WS_VISIBLE,
-          rect.left,
-          rect.top,
-          rect.width(),
-          rect.height(),
-          None,
-          None,
-          GetModuleHandleW(None).unwrap_or_default(),
-          Some(state_ptr.cast()),
-        )
-      };
+        // SAFETY: Creating a valid top-level popup window with known-good
+        // parameters. `state_ptr` is valid for the duration of the
+        // window's lifetime and is freed in `WM_DESTROY`.
+        let handle = unsafe {
+          CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("GlazeWM_TabBar"),
+            w!(""),
+            WS_POPUP | WS_VISIBLE,
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
+            None,
+            None,
+            GetModuleHandleW(None).unwrap_or_default(),
+            Some(state_ptr.cast()),
+          )
+        };
 
-      if handle.0 == 0 {
-        // Window creation failed — free state to avoid a leak.
-        // SAFETY: We just allocated this pointer and creation failed, so
-        // no other code has taken ownership.
-        unsafe { drop(Box::from_raw(state_ptr)) };
-        return Err(crate::Error::Platform(
-          "Failed to create tab bar window.".to_string(),
-        ));
-      }
+        if handle.0 == 0 {
+          // Window creation failed — free state to avoid a leak.
+          // SAFETY: We just allocated this pointer and creation failed, so
+          // no other code has taken ownership.
+          unsafe { drop(Box::from_raw(state_ptr)) };
+          return Err(crate::Error::Platform(
+            "Failed to create tab bar window.".to_string(),
+          ));
+        }
 
-      Ok(handle.0)
-    })??;
+        Ok(handle.0)
+      })??;
 
     Ok(Self {
       hwnd,
@@ -291,8 +295,8 @@ impl NativeStackTabBar {
   /// Hides the tab bar window without destroying it.
   ///
   /// Clears the cached rect so the next `update()` call always re-posts,
-  /// causing `WM_UPDATE_TABS` to reposition and re-show the window even when
-  /// the tab content has not changed since the hide.
+  /// causing `WM_UPDATE_TABS` to reposition and re-show the window even
+  /// when the tab content has not changed since the hide.
   pub fn hide(&mut self) {
     self.last_rect = None;
     // SAFETY: `self.hwnd` is a valid window handle.
@@ -307,7 +311,8 @@ impl Drop for NativeStackTabBar {
     // Post WM_CLOSE so the event loop destroys the window and its state.
     // SAFETY: `self.hwnd` is a valid window handle.
     unsafe {
-      let _ = PostMessageW(HWND(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+      let _ =
+        PostMessageW(HWND(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
     }
   }
 }
@@ -321,9 +326,7 @@ fn ensure_class_registered() {
       // and WM_PAINT draws the entire client area.
       hbrBackground: HBRUSH::default(),
       // SAFETY: IDC_ARROW is a valid system cursor resource.
-      hCursor: unsafe {
-        LoadCursorW(None, IDC_ARROW).unwrap_or_default()
-      },
+      hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
       ..Default::default()
     };
 
@@ -363,7 +366,8 @@ unsafe fn paint_tab_bar(hwnd: HWND, state: &TabBarState) {
   }
 
   // Draw the full bar background.
-  let bg_brush = CreateSolidBrush(COLORREF(state.colors.background.to_bgr()));
+  let bg_brush =
+    CreateSolidBrush(COLORREF(state.colors.background.to_bgr()));
   let full_rect = RECT {
     left: 0,
     top: 0,
@@ -487,8 +491,7 @@ unsafe fn paint_tab_bar(hwnd: HWND, state: &TabBarState) {
     // cross-process message required. `SendMessageW(WM_GETICON)` would
     // block the Win32 event loop while the target app processes the
     // message, freezing all window management until it responds.
-    let hicon =
-      HICON(GetClassLongPtrW(icon_hwnd, GCLP_HICONSM) as isize);
+    let hicon = HICON(GetClassLongPtrW(icon_hwnd, GCLP_HICONSM) as isize);
 
     let text_x = if hicon.0 != 0 {
       let icon_y = (height - icon_size) / 2;
@@ -615,7 +618,10 @@ unsafe extern "system" fn tab_bar_wnd_proc(
         GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TabBarState;
       if !state_ptr.is_null() {
         let state = &*state_ptr;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        #[allow(
+          clippy::cast_possible_truncation,
+          clippy::cast_possible_wrap
+        )]
         let x = (lparam.0 & 0xFFFF) as i16 as i32;
         let n_tabs = state.tabs.len();
         if n_tabs > 0 {
@@ -644,7 +650,8 @@ unsafe extern "system" fn tab_bar_wnd_proc(
         state.rect = update.rect;
         state.colors = update.colors;
 
-        // Kick off a sliding indicator animation when the active tab changes.
+        // Kick off a sliding indicator animation when the active tab
+        // changes.
         let tab_w = if n_tabs > 0 {
           state.rect.width() / n_tabs as i32
         } else {
@@ -657,16 +664,19 @@ unsafe extern "system" fn tab_bar_wnd_proc(
           state.indicator_from_x = state.indicator_cur_x;
           state.indicator_target_x = new_target;
           state.indicator_anim_start = Some(Instant::now());
-          // Fire at ~60 fps; the timer stops itself when the animation ends.
+          // Fire at ~60 fps; the timer stops itself when the animation
+          // ends.
           let _ = SetTimer(hwnd, INDICATOR_TIMER_ID, 16, None);
         } else if prev_active != state.active_index {
-          // Active tab snapped to the same position — just update without animation.
+          // Active tab snapped to the same position — just update without
+          // animation.
           state.indicator_cur_x = new_target;
           state.indicator_target_x = new_target;
         }
 
         // Reposition and show in one call so the bar is never visible with
-        // stale content at a new position (eliminates flicker on tab switch).
+        // stale content at a new position (eliminates flicker on tab
+        // switch).
         let _ = SetWindowPos(
           hwnd,
           HWND(0),
