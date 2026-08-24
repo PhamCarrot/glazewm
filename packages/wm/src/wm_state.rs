@@ -796,17 +796,28 @@ impl Drop for WmState {
         // Uncloak before showing — a surrogate animation may have cloaked
         // this window. Without this, the window stays invisible after
         // exit.
-        let _ = window.native().set_cloaked(false);
+        if let Err(err) = window.native().set_cloaked(false) {
+          warn!("Failed to uncloak window on cleanup: {err:?}");
+        }
 
         if let Err(err) = window.native().show() {
           warn!("Failed to show window: {:?}", err);
         }
 
-        let _ = window.native().set_taskbar_visibility(true);
-        let _ = window.native().set_border_color(None);
-        let _ = window
+        if let Err(err) = window.native().set_taskbar_visibility(true) {
+          warn!(
+            "Failed to restore taskbar visibility on cleanup: {err:?}"
+          );
+        }
+        if let Err(err) = window.native().set_border_color(None) {
+          warn!("Failed to reset border color on cleanup: {err:?}");
+        }
+        if let Err(err) = window
           .native()
-          .set_transparency(&OpacityValue::from_alpha(u8::MAX));
+          .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+        {
+          warn!("Failed to restore opacity on cleanup: {err:?}");
+        }
       }
     }
   }

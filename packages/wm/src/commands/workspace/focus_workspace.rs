@@ -221,6 +221,14 @@ fn workspace_switch_direction(
     .map(|w| w.name.as_str())
     .collect();
 
+  workspace_switch_direction_in_order(target_name, focused_name, &names)
+}
+
+fn workspace_switch_direction_in_order(
+  target_name: &str,
+  focused_name: &str,
+  names: &[&str],
+) -> i32 {
   let target_idx = names.iter().position(|n| *n == target_name);
   let focused_idx = names.iter().position(|n| *n == focused_name);
 
@@ -242,9 +250,40 @@ fn iris_origin_point(
   center: (i32, i32),
   focused: &Container,
 ) -> (i32, i32) {
+  let cursor = if matches!(origin, WorkspaceSwitchIrisOrigin::Cursor) {
+    wm_platform::cursor_position()
+  } else {
+    None
+  };
+  let focused_rect =
+    if matches!(origin, WorkspaceSwitchIrisOrigin::FocusedWindow) {
+      focused
+        .as_window_container()
+        .ok()
+        .and_then(|w| w.to_rect().ok())
+    } else {
+      None
+    };
+
+  iris_origin_from_inputs(
+    origin,
+    monitor_bounds,
+    center,
+    cursor,
+    focused_rect.as_ref(),
+  )
+}
+
+fn iris_origin_from_inputs(
+  origin: &WorkspaceSwitchIrisOrigin,
+  monitor_bounds: &wm_platform::Rect,
+  center: (i32, i32),
+  cursor: Option<(i32, i32)>,
+  focused_rect: Option<&wm_platform::Rect>,
+) -> (i32, i32) {
   match origin {
     WorkspaceSwitchIrisOrigin::Center => center,
-    WorkspaceSwitchIrisOrigin::Cursor => wm_platform::cursor_position()
+    WorkspaceSwitchIrisOrigin::Cursor => cursor
       .filter(|&(x, y)| {
         x >= monitor_bounds.x()
           && x < monitor_bounds.x() + monitor_bounds.width()
@@ -252,11 +291,82 @@ fn iris_origin_point(
           && y < monitor_bounds.y() + monitor_bounds.height()
       })
       .unwrap_or(center),
-    WorkspaceSwitchIrisOrigin::FocusedWindow => focused
-      .as_window_container()
-      .ok()
-      .and_then(|w| w.to_rect().ok())
-      .map(|r| (r.x() + r.width() / 2, r.y() + r.height() / 2))
-      .unwrap_or(center),
+    WorkspaceSwitchIrisOrigin::FocusedWindow => focused_rect
+      .map_or(center, |r| (r.x() + r.width() / 2, r.y() + r.height() / 2)),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn workspace_order_controls_slide_direction() {
+    let names = ["1", "2", "3"];
+    assert_eq!(workspace_switch_direction_in_order("3", "1", &names), 1);
+    assert_eq!(workspace_switch_direction_in_order("1", "3", &names), -1);
+    assert_eq!(workspace_switch_direction_in_order("2", "2", &names), 0);
+    assert_eq!(
+      workspace_switch_direction_in_order("missing", "1", &names),
+      0
+    );
+  }
+
+  #[test]
+  fn iris_origins_use_requested_point_and_safe_fallbacks() {
+    let bounds = wm_platform::Rect::from_xy(100, 200, 1_000, 800);
+    let center = (600, 600);
+    let focused = wm_platform::Rect::from_xy(250, 300, 400, 200);
+
+    assert_eq!(
+      iris_origin_from_inputs(
+        &WorkspaceSwitchIrisOrigin::Center,
+        &bounds,
+        center,
+        Some((300, 400)),
+        Some(&focused),
+      ),
+      center
+    );
+    assert_eq!(
+      iris_origin_from_inputs(
+        &WorkspaceSwitchIrisOrigin::Cursor,
+        &bounds,
+        center,
+        Some((300, 400)),
+        None,
+      ),
+      (300, 400)
+    );
+    assert_eq!(
+      iris_origin_from_inputs(
+        &WorkspaceSwitchIrisOrigin::Cursor,
+        &bounds,
+        center,
+        Some((99, 400)),
+        None,
+      ),
+      center
+    );
+    assert_eq!(
+      iris_origin_from_inputs(
+        &WorkspaceSwitchIrisOrigin::FocusedWindow,
+        &bounds,
+        center,
+        None,
+        Some(&focused),
+      ),
+      (450, 400)
+    );
+    assert_eq!(
+      iris_origin_from_inputs(
+        &WorkspaceSwitchIrisOrigin::FocusedWindow,
+        &bounds,
+        center,
+        None,
+        None,
+      ),
+      center
+    );
   }
 }

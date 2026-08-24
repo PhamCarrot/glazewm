@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use std::{ffi::c_void, os::windows::io::AsRawSocket};
 use std::{iter, net::SocketAddr};
 
 use anyhow::{bail, Context};
@@ -33,6 +35,21 @@ use crate::{
   wm::WindowManager,
 };
 
+#[cfg(target_os = "windows")]
+const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+  #[cfg(test)]
+  fn GetHandleInformation(handle: *mut c_void, flags: *mut u32) -> i32;
+  fn SetHandleInformation(
+    handle: *mut c_void,
+    mask: u32,
+    flags: u32,
+  ) -> i32;
+}
+
 pub struct IpcServer {
   abort_handle: task::AbortHandle,
   pub message_rx:
@@ -56,6 +73,7 @@ impl IpcServer {
 
     let server_addr = format!("127.0.0.1:{DEFAULT_IPC_PORT}");
     let server = TcpListener::bind(server_addr.clone()).await?;
+    Self::prevent_listener_inheritance(&server)?;
     info!("IPC server started on: '{}'.", server_addr);
 
     let task = task::spawn(async move {
@@ -82,6 +100,31 @@ impl IpcServer {
       #[allow(clippy::used_underscore_binding)]
       _unsubscribe_rx,
     })
+  }
+
+  #[cfg(target_os = "windows")]
+  fn prevent_listener_inheritance(
+    server: &TcpListener,
+  ) -> anyhow::Result<()> {
+    let handle = usize::try_from(server.as_raw_socket())
+      .context("IPC listener handle does not fit in a pointer.")?
+      as *mut c_void;
+    let result =
+      unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+
+    if result == 0 {
+      return Err(std::io::Error::last_os_error())
+        .context("Failed to make the IPC listener non-inheritable.");
+    }
+
+    Ok(())
+  }
+
+  #[cfg(not(target_os = "windows"))]
+  fn prevent_listener_inheritance(
+    _server: &TcpListener,
+  ) -> anyhow::Result<()> {
+    Ok(())
   }
 
   async fn handle_connection(
@@ -126,6 +169,12 @@ impl IpcServer {
                     response_tx.clone(),
                     disconnection_tx.clone(),
                   )).await?;
+                } else if message.is_close() {
+                  // Complete the WebSocket close handshake before dropping
+                  // the TCP stream. Short-lived CLI clients use this path
+                  // after receiving their response.
+                  outgoing.close().await?;
+                  break Ok(());
                 }
               }
               Some(Err(err)) => bail!("WebSocket error: {}", err),
@@ -142,9 +191,9 @@ impl IpcServer {
 
     info!("IPC disconnection from: {}.", addr);
 
-    if let Err(err) = disconnection_tx.send(()) {
-      warn!("Failed to broadcast disconnection: {}", err);
-    }
+    // One-shot query/command clients have no disconnection subscribers.
+    // Sending to zero receivers is therefore an expected no-op.
+    let _ = disconnection_tx.send(());
 
     res
   }
@@ -468,5 +517,34 @@ mod tests {
     let rejection = IpcServer::validate_handshake(&request, response)
       .expect_err("browser-origin handshake must be rejected");
     assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
+  }
+
+  #[cfg(target_os = "windows")]
+  #[tokio::test]
+  async fn ipc_listener_handle_is_explicitly_non_inheritable() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+      .await
+      .expect("test listener should bind");
+    let handle = usize::try_from(listener.as_raw_socket())
+      .expect("test listener handle should fit in a pointer")
+      as *mut c_void;
+
+    let set_result = unsafe {
+      SetHandleInformation(
+        handle,
+        HANDLE_FLAG_INHERIT,
+        HANDLE_FLAG_INHERIT,
+      )
+    };
+    assert_ne!(set_result, 0, "test should set inheritance first");
+
+    IpcServer::prevent_listener_inheritance(&listener)
+      .expect("listener inheritance should be cleared");
+
+    let mut flags = 0u32;
+    let get_result =
+      unsafe { GetHandleInformation(handle, &raw mut flags) };
+    assert_ne!(get_result, 0, "test should read listener flags");
+    assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
   }
 }

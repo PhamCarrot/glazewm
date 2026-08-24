@@ -16,7 +16,6 @@ use wm_platform::{
 };
 
 #[cfg(target_os = "windows")]
-use crate::commands::window::detach_window_for_close;
 use crate::{
   animation::AnimationManager,
   commands::{
@@ -359,8 +358,6 @@ impl WindowManager {
           Ok(window) => {
             #[cfg(target_os = "windows")]
             if config.value.animations.window_close.enabled {
-              use wm_platform::NativeWindowWindowsExt;
-
               let effect_cfg = if window.id()
                 == state
                   .focused_container()
@@ -410,10 +407,9 @@ impl WindowManager {
               ) {
                 let window_id = window.id();
 
-                // Create and show the surrogate over the still-visible
-                // window first. The surrogate captures the
-                // live window as a pixel-identical
-                // overlay, so this is invisible to the user.
+                // Register the transparent surrogate over the
+                // still-visible window first. The animation manager
+                // stages the visibility transfer on later ticks.
                 {
                   let native_ref = window.native();
                   state.animation_manager.start_close_animation(
@@ -429,40 +425,12 @@ impl WindowManager {
                   );
                 }
 
-                // If the surrogate was created successfully, cloak the
-                // real window — now that the surrogate is
-                // up and covering it — and detach it from
-                // the layout tree so sibling windows begin
-                // their reflow animations in parallel with the close
-                // surrogate. Cloaking *after* the surrogate is shown
-                // avoids a one-frame gap where the slow
-                // `IApplicationView` cloak has hidden the
-                // window but the surrogate has not yet been
-                // composited, which briefly exposes the desktop.
-                // `AnimationManager::update_internal` sends `WM_CLOSE`
-                // once the close animation finishes.
+                // The animation manager keeps the real window visible
+                // through the surrogate's readiness ticks, then cloaks
+                // and detaches it without blocking this command path.
                 if state.animation_manager.has_close_animation(&window_id)
                 {
-                  let cloak_result = {
-                    let native = window.native();
-                    native.set_cloaked(true)
-                  };
-                  match cloak_result {
-                    Ok(()) => {
-                      detach_window_for_close(window, state)?;
-                      return Ok(());
-                    }
-                    Err(err) => {
-                      warn!(
-                        "Failed to cloak window {window_id} for close \
-                         animation: {err}; closing the visible real window \
-                         directly."
-                      );
-                      state
-                        .animation_manager
-                        .cancel_close_animation(&window_id);
-                    }
-                  }
+                  return Ok(());
                 }
               }
             }

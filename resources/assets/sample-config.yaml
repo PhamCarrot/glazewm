@@ -72,7 +72,8 @@ animations:
     # Motion style. Options:
     #   'slide' (default) - workspaces slide along the 'direction' axis
     #   'fade'            - pure crossfade; both workspaces stay in place
-    #   'zoom'            - outgoing shrinks to monitor center, incoming expands
+    #   'zoom'            - each outgoing window shrinks to its own center;
+    #                       each incoming window expands from its own center
     #   'iris'            - a frozen snapshot of the old workspace stays on top
     #                       while a circular hole grows from 'iris_origin',
     #                       revealing the new workspace beneath (Windows only)
@@ -172,6 +173,14 @@ gaps:
     bottom: "20px"
     left: "20px"
 
+  # Optional replacement for outer_gap when exactly one tiling window is
+  # present. Uncomment all five lines to enable it; null disables it.
+  # single_window_outer_gap:
+  #   top: "80px"
+  #   right: "80px"
+  #   bottom: "80px"
+  #   left: "80px"
+
 stack:
   # Height of the tab bar shown for stacked windows (0px = disabled).
   # ** Only rendered on Windows.
@@ -186,6 +195,22 @@ stack:
   tab_active_background: "#4a4a6a"
   tab_inactive_background: "#1e1e2e"
   tab_text_color: "#cdd6f4"
+
+  # Active-tab indicator, tab shape, and separators. A zero height/width
+  # disables the corresponding element.
+  tab_active_indicator_color: "#89b4fa"
+  tab_active_indicator_height: "2px"
+  tab_border_radius: "4px"
+  tab_separator_width: "1px"
+  tab_separator_color: "#3d3d3d"
+
+  # Ordered regex replacements for tab titles. Each replacement receives
+  # the result of the previous one; $1, $2, ... refer to capture groups.
+  # Uncomment the example rule to remove a Firefox title suffix.
+  tab_title_overrides: []
+  # tab_title_overrides:
+  #   - regex: "^(.*) - Mozilla Firefox$"
+  #     replace: "$1"
 
 window_effects:
   # Visual effects to apply to the focused window.
@@ -225,6 +250,9 @@ window_effects:
       enabled: false
       # Allowed values: 'acrylic', 'mica', 'mica_alt'.
       style: "acrylic"
+      # Optional #RRGGBB or #RRGGBBAA tint. null uses the safe platform
+      # default; tint alpha blends the flat color over the blur.
+      tint: null
       # Blur radius/intensity of the acrylic overlay's live blur (acrylic
       # only -- Mica/MicaAlt have no adjustable blur). Requires the
       # Windows.UI.Composition rendering pipeline; silently ignored if
@@ -260,6 +288,7 @@ window_effects:
     backdrop:
       enabled: false
       style: "acrylic"
+      tint: null
       blur_amount: 30.0
       opacity: 1.0
       saturation: 1.0
@@ -290,6 +319,12 @@ window_behavior:
 
 workspaces:
   - name: "1"
+    # Optional display label used by integrations and status bars.
+    # display_name: "Main"
+    # Optional zero-based monitor binding. Leave unset for normal placement.
+    # bind_to_monitor: 0
+    # Keep this workspace alive even when it contains no windows.
+    # keep_alive: true
   - name: "2"
   - name: "3"
   - name: "4"
@@ -301,6 +336,10 @@ workspaces:
 
 window_rules:
   - commands: ["ignore"]
+    # Events: 'manage', 'title_change', and 'focus'. These are the defaults.
+    on: ["manage", "title_change"]
+    # Run this rule at most once for each managed window.
+    run_once: true
     match:
       # Ignores any Zebar windows.
       - window_process: { equals: "zebar" }
@@ -325,6 +364,10 @@ window_rules:
       - window_process: { equals: "POWERPNT" }
         window_class: { not_regex: "PPTFrameClass" }
       - window_process: { equals: "CleanShot X" }
+
+      # Other supported string match operators:
+      # - window_title: { includes: "Settings" }
+      # - window_title: { not_equals: "Private" }
 
   # Example: auto-stack browser windows into a named stack on open.
   # Requires `stack.tab_bar_height` to be non-zero for the tab bar to show.

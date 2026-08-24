@@ -980,10 +980,13 @@ fn redraw_containers(
       .animation_manager
       .resize_sessions
       .contains_key(&window.id())
-      && state
+      && (state
         .animation_manager
-        .get_animation(&window.id())
-        .map_or(false, |a| !a.is_complete());
+        .is_open_handoff_pending(&window.id())
+        || state
+          .animation_manager
+          .get_animation(&window.id())
+          .map_or(false, |a| !a.is_complete()));
     #[cfg(not(target_os = "windows"))]
     let has_slide_in = false;
 

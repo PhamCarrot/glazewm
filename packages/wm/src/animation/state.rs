@@ -93,6 +93,15 @@ impl WindowAnimationState {
     self
   }
 
+  /// Re-anchors the lazy animation clock to the next rendered frame.
+  ///
+  /// Open/close handoffs use this after their nonblocking thumbnail
+  /// readiness stage so the hidden preparation ticks do not consume any
+  /// visual animation duration.
+  pub fn restart_on_next_frame(&self) {
+    self.start_time.set(None);
+  }
+
   /// Gets the eased progress in [0.0, 1.0] at an explicit `now` instant.
   ///
   /// Allows callers to supply a predictive timestamp (e.g. vsync wake-up

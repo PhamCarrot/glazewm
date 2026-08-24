@@ -1,6 +1,13 @@
 # GlazeWM Combined configuration reference
 
-This document describes the configuration accepted by **this source tree**, including its custom DComp animations, multi-layout commands, and stack system. It was derived from `packages/wm-common/src/parsed_config.rs`, `packages/wm-common/src/app_command.rs`, the value parsers in `packages/wm-platform/src`, command handlers in `packages/wm/src/wm.rs`, and `resources/assets/sample-config.yaml`.
+This is the complete user-facing reference for the configuration accepted by **this build**. It covers every top-level YAML section, every child key, accepted values, source defaults, hard limits, commands usable from configuration, and the custom DComp animation, multi-layout, and stack features. It was checked against `packages/wm-common/src/parsed_config.rs`, `packages/wm-common/src/app_command.rs`, the primitive parsers in `packages/wm-platform/src/models`, command handlers in `packages/wm/src`, and `resources/assets/sample-config.yaml`.
+
+Two complete Linux-rice-inspired examples are provided separately:
+
+- `resources/assets/examples/config-mon4sm-inspired.yaml`
+- `resources/assets/examples/config-maxhu08-inspired.yaml`
+
+They are GlazeWM configurations, not Hyprland files. Each translates only behavior this Windows build can represent and documents every approximation inline.
 
 All YAML keys are `snake_case`. Sections and fields omitted from YAML use their source defaults unless a required list item field is noted. Commands in YAML are strings without the leading `glazewm command`; from a terminal use `glazewm.exe command <command>`. Direction values are `left`, `right`, `up`, or `down`.
 
@@ -9,8 +16,8 @@ All YAML keys are `snake_case`. Sections and fields omitted from YAML use their 
 - **Length**: a quoted integer with optional `px` or `%`, such as `"20px"`, `"10%"`, `"-2%"`; no unit means pixels. Command deltas may use `+`, for example `+2%`. YAML also accepts `{ amount: 20.0, unit: pixel }` or `{ amount: 0.2, unit: percentage }`, but the string form is clearer. Negative lengths parse; whether they are meaningful depends on the field.
 - **Rectangle**: `{ top: LENGTH, right: LENGTH, bottom: LENGTH, left: LENGTH }`.
 - **Color**: exactly `"#RRGGBB"` or `"#RRGGBBAA"`.
-- **Opacity**: a number from `0.0` through `1.0`, a numeric string such as `"0.95"`, or a percent such as `"95%"`. The parser does not clamp out-of-range input; stay in range.
-- **Duration/threshold**: unsigned 32-bit integer (`0` through `4294967295`) in milliseconds/pixels. There is no smaller schema maximum; use practical values.
+- **Opacity**: a number from `0.0` through `1.0`, a numeric string such as `"0.95"`, or a percent such as `"95%"`. Full configuration validation rejects non-finite or out-of-range values; they are not silently clamped.
+- **Duration/threshold**: unsigned 32-bit integer (`0` through `4294967295`) in milliseconds/pixels. This is the hard parser range, not a sensible animation range. For visible animation, approximately `80..700` ms is practical; `0` is immediate.
 - **Boolean**: `true` or `false`.
 
 ## Complete top-level shape
@@ -29,6 +36,111 @@ workspaces: []
 ```
 
 Unknown YAML fields are not rejected by the current Serde structs, so a typo can be silently ignored. Use the spellings below.
+
+## Hard limits and practical ranges
+
+| Value | Hard accepted range | Practical guidance |
+|---|---:|---|
+| `duration_ms` | `0..=4294967295` (`u32`) | `80..250` feels quick; `250..500` is expressive; above `700` usually feels slow. |
+| `threshold_px` | `0..=4294967295` (`u32`) | `0` animates every change; `5..20` suppresses tiny layout noise. |
+| Animation opacity fields | finite `0.0..=1.0` | `0.0` fully transparent; `1.0` fully opaque. |
+| Transparency opacity | finite `0.0..=1.0`, or equivalent `0%..100%` | Avoid `0` for normal windows because the window becomes effectively unfocusable. |
+| Workspace `zoom_factor` | finite `0.0..=1.0` | `0.03..0.15` gives subtle depth; `1.0` collapses to a point. |
+| Bézier `x1`, `x2` | finite `0.0..=1.0` | Required so time remains solvable and monotonic. |
+| Bézier `y1`, `y2` | any finite `f32` | Values below `0` or above `1` create undershoot/overshoot. |
+| Backdrop `opacity` | finite `0.0..=1.0` | Applies to the acrylic overlay, not the real window. |
+| Backdrop `blur_amount` | any finite `f32` | `0..100` is a useful experimental range; source default is `30`. |
+| Backdrop `saturation` | any finite `f32` | D2D behavior is defined most usefully around `0.0..=2.0`; source default is `1`. |
+| Workspace monitor index | `0..=4294967295` (`u32`) | Zero-based; it must identify a monitor that exists to be useful. |
+| Command monitor/index values | platform `usize`/declared integer type | Use existing zero-based indices. |
+
+`NaN`, positive infinity, and negative infinity are rejected for every animation/effect float covered by full validation. Length values currently have no equivalent finite/range validation; use ordinary finite values.
+
+## Source-default checklist
+
+These are defaults from the Rust structs when a key or section is omitted. The embedded sample config deliberately overrides several of them.
+
+| YAML path | Source default | Accepted type/values |
+|---|---|---|
+| `animations.window_move.enabled` | `true` | Boolean |
+| `animations.window_move.duration_ms` | `150` | `u32` milliseconds |
+| `animations.window_move.easing` | `ease_in_out` | Easing string |
+| `animations.window_move.threshold_px` | `10` | `u32` pixels |
+| `animations.window_resize.enabled` | `true` | Boolean |
+| `animations.window_resize.duration_ms` | `150` | `u32` milliseconds |
+| `animations.window_resize.easing` | `ease_in_out` | Easing string |
+| `animations.window_resize.threshold_px` | `10` | `u32` pixels |
+| `animations.focus_change.enabled` | `false` | Boolean |
+| `animations.focus_change.duration_ms` | `200` | `u32` milliseconds |
+| `animations.focus_change.easing` | `cubic_bezier(0.16, 1, 0.3, 1)` | Easing string |
+| `animations.window_open.enabled` | `true` | Boolean |
+| `animations.window_open.duration_ms` | `150` | `u32` milliseconds |
+| `animations.window_open.easing` | `cubic_bezier(0.16, 1, 0.3, 1)` | Easing string |
+| `animations.window_open.style` | `slide_right` | Window-transition style |
+| `animations.window_open.opacity_from` | `1.0` | Finite `0.0..=1.0` |
+| `animations.window_close.enabled` | `false` | Boolean |
+| `animations.window_close.duration_ms` | `150` | `u32` milliseconds |
+| `animations.window_close.easing` | `ease_in_cubic` | Easing string |
+| `animations.window_close.style` | `none` | Window-transition style |
+| `animations.window_close.opacity_to` | `0.0` | Finite `0.0..=1.0` |
+| `animations.workspace_switch.enabled` | `true` | Boolean |
+| `animations.workspace_switch.duration_ms` | `250` | `u32` milliseconds |
+| `animations.workspace_switch.easing` | `cubic_bezier(0.16, 1, 0.3, 1)` | Easing string |
+| `animations.workspace_switch.style` | `slide` | `slide`, `fade`, `zoom`, `iris` |
+| `animations.workspace_switch.direction` | `horizontal` | `horizontal`, `vertical` |
+| `animations.workspace_switch.iris_origin` | `center` | `center`, `cursor`, `focused_window` |
+| `animations.workspace_switch.opacity_outgoing` | `1.0` | Finite `0.0..=1.0` |
+| `animations.workspace_switch.opacity_incoming` | `1.0` | Finite `0.0..=1.0` |
+| `animations.workspace_switch.zoom_factor` | `0.1` | Finite `0.0..=1.0` |
+| `general.startup_commands` | `[]` | Command-string list |
+| `general.shutdown_commands` | `[]` | Command-string list |
+| `general.config_reload_commands` | `[]` | Command-string list |
+| `general.focus_follows_cursor` | `false` | Boolean |
+| `general.toggle_workspace_on_refocus` | `true` | Boolean |
+| `general.cursor_jump.enabled` | `false` | Boolean |
+| `general.cursor_jump.trigger` | `monitor_focus` | `monitor_focus`, `window_focus` |
+| `general.hide_method` | `cloak` on Windows | `cloak`, `hide`, `place_in_corner` |
+| `general.show_all_in_taskbar` | `false` | Boolean |
+| `gaps.scale_with_dpi` | `true` | Boolean |
+| `gaps.inner_gap` | `0px` | Length |
+| `gaps.outer_gap.*` | `0px` each side | Rectangle of lengths |
+| `gaps.single_window_outer_gap` | `null` | Rectangle or `null` |
+| `window_behavior.initial_state` | `tiling` | `tiling`, `floating` |
+| `window_behavior.state_defaults.floating.centered` | `true` | Boolean |
+| `window_behavior.state_defaults.floating.shown_on_top` | `false` | Boolean |
+| `window_behavior.state_defaults.fullscreen.maximized` | `true` | Boolean |
+| `window_behavior.state_defaults.fullscreen.shown_on_top` | `false` | Boolean |
+| `window_effects.*.border.enabled` | `false` | Boolean |
+| `window_effects.*.border.color` | `#8cbeffff` | Color |
+| `window_effects.*.hide_title_bar.enabled` | `false` | Boolean |
+| `window_effects.*.corner_style.enabled` | `false` | Boolean |
+| `window_effects.*.corner_style.style` | `default` | `default`, `square`, `rounded`, `small_rounded` |
+| `window_effects.*.transparency.enabled` | `false` | Boolean |
+| `window_effects.*.transparency.opacity` | `1.0` | Opacity |
+| `window_effects.*.backdrop.enabled` | `false` | Boolean |
+| `window_effects.*.backdrop.style` | `acrylic` | `acrylic`, `mica`, `mica_alt` |
+| `window_effects.*.backdrop.tint` | `null` | Color or `null` |
+| `window_effects.*.backdrop.blur_amount` | `30.0` | Finite float |
+| `window_effects.*.backdrop.opacity` | `1.0` | Finite `0.0..=1.0` |
+| `window_effects.*.backdrop.saturation` | `1.0` | Finite float |
+| `stack.tab_bar_height` | `0px` | Length; zero disables tab bar |
+| `stack.tab_bar_position` | `top` | `top`, `bottom` |
+| `stack.tab_bar_background` | `#2d2d2d` | Color |
+| `stack.tab_active_background` | `#4a4a6a` | Color |
+| `stack.tab_inactive_background` | `#1e1e2e` | Color |
+| `stack.tab_text_color` | `#cdd6f4` | Color |
+| `stack.tab_active_indicator_color` | `#89b4fa` | Color |
+| `stack.tab_active_indicator_height` | `2px` | Length |
+| `stack.tab_border_radius` | `4px` | Length |
+| `stack.tab_separator_width` | `1px` | Length |
+| `stack.tab_separator_color` | `#3d3d3d` | Color |
+| `stack.tab_title_overrides` | `[]` | List of `{ regex, replace }` |
+| `binding_modes` | `[]` | Binding-mode list |
+| `keybindings` | `[]` | Keybinding list |
+| `window_rules` | `[]` | Window-rule list |
+| `workspaces` | `[]` | Workspace list |
+
+For `window_effects.*`, replace `*` with either `focused_window` or `other_windows`; both children have the same complete schema and defaults.
 
 ## Animations
 
@@ -85,15 +197,19 @@ animations:
 
 - `focus_change`: interpolates between the focused/non-focused transparency targets under `window_effects`; Windows only.
 - `window_open.style` and `window_close.style`: `slide_right`, `slide_left`, `slide_top`, `slide_bottom`, `none`, or `zoom`. Aliases `right`, `left`, `top`, `bottom`, and `fade` are accepted. On `window_open` only, the legacy key name `direction:` is accepted as an alias for `style:`.
-- `opacity_from` / `opacity_to`: float, intended range `0.0..=1.0`; deserialization accepts other floats, but the animation path clamps the applied opacity. `none` plus opacity creates a pure fade.
+- `opacity_from` / `opacity_to`: finite float in the enforced range `0.0..=1.0`. Invalid values reject the complete configuration. `none` plus opacity creates a pure fade.
 
 ### Workspace transition fields
 
 - `style`: `slide`, `fade`, `zoom`, or Windows-only `iris`.
+- Workspace `zoom` scales each window independently around its own screen-space
+  center. It does not collapse the complete workspace toward the monitor
+  center. The separate `zoom_factor` option applies monitor-centered scaling
+  only while `style: slide` is active.
 - `direction`: `horizontal` or `vertical`; used by `slide` only.
 - `iris_origin`: `center`, `cursor`, or `focused_window`; used by `iris` only. `focused_window` falls back to monitor center when none is available.
-- `opacity_outgoing` / `opacity_incoming`: float, intended `0.0..=1.0`; applies to all styles. Deserialization accepts other floats, but surrogate creation clamps the endpoint.
-- `zoom_factor`: float, intended `0.0..=1.0`, recommended `0.05..=0.15`; affects `slide` only. Deserialization accepts other floats, but animation setup clamps it.
+- `opacity_outgoing` / `opacity_incoming`: finite float in the enforced range `0.0..=1.0`; applies to all styles. Invalid values reject the complete configuration.
+- `zoom_factor`: finite float in the enforced range `0.0..=1.0`, recommended `0.05..=0.15`; affects `slide` only. Invalid values reject the complete configuration.
 
 ## General/core
 
@@ -283,7 +399,7 @@ window_effects:
 - `hide_title_bar`: removes the native title bar; some applications may render incorrectly.
 - `corner_style.style`: `default`, `square`, `rounded`, or `small_rounded`; Windows 11.
 - `transparency.opacity`: window opacity using the opacity syntax above. `0` makes the real window transparent and effectively unfocusable.
-- `backdrop` (legacy section alias: `blur_behind`): DWM backdrop. `style` is `acrylic`, `mica`, or `mica_alt`; `tint` is null or a color. Acrylic is supported from Windows 10 1803; Mica variants require Windows 11 22H2. `blur_amount` is an unrestricted float intensity; `opacity` should be `0.0..=1.0`; `saturation` should be `0.0..=2.0`. Those three affect the custom acrylic overlay only and are ignored for Mica; if Windows.UI.Composition is unavailable, acrylic falls back to fixed OS intensity. Backdrop corner radius follows `corner_style` and has no independent key.
+- `backdrop` (legacy section alias: `blur_behind`): DWM backdrop. `style` is `acrylic`, `mica`, or `mica_alt`; `tint` is null or a color. Acrylic is supported from Windows 10 1803; Mica variants require Windows 11 22H2. `blur_amount` and `saturation` accept any finite float; `opacity` is strictly `0.0..=1.0`. A practical saturation range is `0.0..=2.0`, but the parser does not enforce it. Those three affect the custom acrylic overlay only and are ignored for Mica; if Windows.UI.Composition is unavailable, acrylic falls back to fixed OS intensity. Backdrop corner radius follows `corner_style` and has no independent key.
 
 ## Window rules
 
@@ -309,6 +425,48 @@ window_rules:
 ## Scratchpad status
 
 This build has **no scratchpad configuration or command**. A source-wide search finds no `scratchpad`, `scratch_pad`, or `scratch-pad` schema, parser, command, or handler. Do not add a `scratchpad:` YAML section: it would be ignored as an unknown top-level key. Stacks, minimized windows, and hidden workspaces are separate features and are not scratchpads.
+
+## Included Linux-rice adaptations
+
+Copy either example to your normal GlazeWM config location, or launch it explicitly while testing:
+
+```powershell
+glazewm.exe start --config C:\path\to\config-mon4sm-inspired.yaml
+```
+
+Do not replace your real config without keeping your own backup. Both examples use `shell-exec wt` for the terminal binding; change `wt` if you use another terminal.
+
+### Mon4sm-inspired profile
+
+Source: <https://github.com/Mon4sm/monasm-dots/blob/main/.config/hypr/hyprland.conf>
+
+The profile preserves the source's actual custom curves and nominal timing conversion:
+
+| Hyprland source behavior | GlazeWM mapping |
+|---|---|
+| Windows, speed `4.79`, `0.23,1,0.32,1` | Move/resize `479ms`, same cubic Bézier |
+| Windows-in, speed `4.1`, `popin 87%` | Open `410ms`, `zoom`; GlazeWM has no configurable 87% start scale |
+| Windows-out, speed `1.49`, linear, `popin 87%` | Close `149ms`, `linear`, `zoom` |
+| Workspaces, speed `3`, same ease-out curve, slide | Workspace slide `300ms`, same curve |
+| Active opacity `1`, inactive opacity `0.97` | Focused/non-focused transparency `1.0`/`0.97` with a `170ms` focus fade |
+| Gaps `3`/`5`, rounded corners, blue active border | Equivalent gaps, Windows rounded corners, and RGBA border colors |
+
+Hyprland shadow range, blur pass count, layer-shell animation channels, workspace gestures, and scratchpads have no direct equivalent in this build. Acrylic is only an approximation of the source's compositor blur.
+
+### maxhu08-inspired profile
+
+Source: <https://github.com/maxhu08/dotfiles/blob/master/hypr/.config/hypr/conf/appearance.lua>
+
+| Hyprland source behavior | GlazeWM mapping |
+|---|---|
+| Windows, speed `7`, `0.05,0.9,0.1,1.05` | Move/resize/open `700ms`, same mild-overshoot cubic Bézier |
+| Windows-out, speed `7`, default curve, `popin 80%` | Close `700ms`, `ease_in_out`, `zoom`; exact Hyprland inherited default and 80% scale are unavailable |
+| Fade, speed `7`, default curve | Focus-opacity transition `700ms`, `ease_in_out` |
+| Workspaces, speed `6`, custom overshoot | Workspace slide `600ms`, same custom Bézier |
+| Gaps `5`/`10`, rounded corners, blue gradient border | Equivalent gaps and corners; gradient is reduced to one focused border color |
+| Blur size `3`, passes `6` | Acrylic with stronger `blur_amount`; GlazeWM exposes intensity, not pass count |
+
+This second profile intentionally feels slower and more elastic than the Mon4sm profile. If `700ms` feels heavy on Windows, reduce move/resize/open/close together to `350..500ms` while retaining the curve.
 
 ## IPC and commands
 

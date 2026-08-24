@@ -1,7 +1,13 @@
 param(
   [Parameter(Mandatory = $true)]
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string]$VersionNumber
+  [string]$VersionNumber,
+
+  [switch]$UiAccess,
+
+  [string]$SigningCertificateThumbprint,
+
+  [string]$TimestampUrl = 'http://timestamp.digicert.com'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,11 +31,53 @@ function Assert-WixExtension {
   }
 }
 
+function Resolve-SignTool {
+  $command = Get-Command signtool.exe -ErrorAction SilentlyContinue
+  if ($command) {
+    return $command.Source
+  }
+
+  $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+  $candidate = Get-ChildItem -LiteralPath $kitsRoot -Filter signtool.exe `
+    -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1
+
+  if (!$candidate) {
+    throw 'Windows SDK signtool.exe is required for a UIAccess package.'
+  }
+
+  return $candidate.FullName
+}
+
+function Sign-PackageFiles {
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Paths,
+    [Parameter(Mandatory = $true)][string]$SignTool
+  )
+
+  foreach ($path in $Paths) {
+    & $SignTool sign /sha1 $SigningCertificateThumbprint /fd SHA256 `
+      /tr $TimestampUrl /td SHA256 /v $path
+    Assert-LastExitCode "Signing $path"
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $path
+    if (!$signature.SignerCertificate) {
+      throw "No Authenticode signature was embedded in $path."
+    }
+    if ($signature.SignerCertificate.Thumbprint -ne $SigningCertificateThumbprint) {
+      throw "Unexpected signing certificate on $path."
+    }
+  }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Push-Location $repoRoot
 
 try {
-  $releaseName = "glazewm-combined-v$VersionNumber-windows-x64"
+  $releaseSuffix = if ($UiAccess) { '-uiaccess' } else { '' }
+  $releaseName = "glazewm-combined-v$VersionNumber-windows-x64$releaseSuffix"
   $outDir = Join-Path $repoRoot 'out'
   $stageDir = Join-Path $outDir $releaseName
   $stageCliDir = Join-Path $stageDir 'cli'
@@ -54,14 +102,40 @@ try {
   & cargo check -p wm-platform
   Assert-LastExitCode 'wm-platform check'
 
+  if ($UiAccess -and !$SigningCertificateThumbprint) {
+    throw 'A UIAccess package requires -SigningCertificateThumbprint.'
+  }
+
+  $signTool = if ($UiAccess) { Resolve-SignTool } else { $null }
+
   Write-Host 'Building optimized Windows binaries...'
-  & cargo build --locked --release --workspace
+  $buildArgs = @('build', '--locked', '--release', '--workspace')
+  if ($UiAccess) {
+    $buildArgs += @('--features', 'wm/ui_access')
+  }
+  & cargo @buildArgs
   Assert-LastExitCode 'Cargo release build'
 
   $rootBinaries = @(
     'target\release\glazewm.exe',
     'target\release\glazewm-watcher.exe'
   )
+
+  if ($UiAccess) {
+    $binariesToSign = @(
+      'target\release\glazewm.exe',
+      'target\release\glazewm-watcher.exe',
+      'target\release\glazewm-cli.exe'
+    ) | ForEach-Object { Join-Path $repoRoot $_ }
+
+    Sign-PackageFiles -Paths $binariesToSign -SignTool $signTool
+
+    $manifestBytes = [IO.File]::ReadAllBytes($binariesToSign[0])
+    $manifestText = [Text.Encoding]::ASCII.GetString($manifestBytes)
+    if ($manifestText -notmatch 'uiAccess="true"') {
+      throw 'glazewm.exe was not built with uiAccess="true".'
+    }
+  }
 
   foreach ($relativePath in $rootBinaries) {
     $sourcePath = Join-Path $repoRoot $relativePath
@@ -87,7 +161,12 @@ try {
     Remove-Item -LiteralPath $zipPath -Force
   }
 
-  Write-Host 'Creating portable ZIP...'
+  if ($UiAccess) {
+    Write-Host 'Creating UIAccess staging ZIP...'
+  }
+  else {
+    Write-Host 'Creating portable ZIP...'
+  }
   Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
 
   if (!(Get-Command wix -ErrorAction SilentlyContinue)) {
@@ -97,7 +176,7 @@ try {
   Assert-WixExtension 'WixToolset.UI.wixext'
   Assert-WixExtension 'WixToolset.Util.wixext'
 
-  Write-Host 'Creating unsigned x64 MSI...'
+  Write-Host 'Creating x64 MSI...'
   & wix build `
     -arch x64 `
     -ext WixToolset.UI.wixext `
@@ -109,12 +188,26 @@ try {
     -d EXE_DIR="$stageDir"
   Assert-LastExitCode 'Building MSI'
 
+  if ($UiAccess) {
+    Sign-PackageFiles -Paths @($msiPath) -SignTool $signTool
+  }
+
   Write-Host ''
   Write-Host 'Release artifacts created:'
-  Write-Host "  Portable ZIP: $zipPath"
+  if ($UiAccess) {
+    Write-Host "  UIAccess staging ZIP: $zipPath"
+  }
+  else {
+    Write-Host "  Portable ZIP: $zipPath"
+  }
   Write-Host "  Installer MSI: $msiPath"
   Write-Host ''
-  Write-Warning 'These personal artifacts are unsigned. Windows may show an Unknown publisher warning.'
+  if ($UiAccess) {
+    Write-Warning 'This UIAccess package only runs after its signing certificate is trusted and it is installed in a secure location.'
+  }
+  else {
+    Write-Warning 'These personal artifacts are unsigned. Windows may show an Unknown publisher warning.'
+  }
 }
 finally {
   Pop-Location

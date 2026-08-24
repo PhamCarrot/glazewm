@@ -73,6 +73,11 @@ const WS_COMPLETE_THRESHOLD_PX: f32 = 1.5;
 #[cfg(target_os = "windows")]
 const OPEN_PAINT_GRACE: Duration = Duration::from_millis(30);
 
+/// Maximum time allowed for a newly registered open/close thumbnail to
+/// pass its nonblocking composition-tick handoff.
+#[cfg(target_os = "windows")]
+const SURROGATE_HANDOFF_TIMEOUT: Duration = Duration::from_millis(150);
+
 /// Duration of the surrogate fade-out at animation completion.
 ///
 /// After the real window is uncloaked beneath the (pixel-aligned, live)
@@ -130,7 +135,7 @@ use wm_common::{
 use wm_platform::{
   BlurOverlayParams, Color, CornerStyle, DxgiVsyncWaiter,
   NativeBlurOverlay, NativeIrisOverlay, NativeWindowWindowsExt,
-  ResizeSession, SessionOptions, SlideAxis, SurrogateBatch,
+  ResizeSession, SessionKind, SessionOptions, SlideAxis, SurrogateBatch,
   WorkspaceSurrogate,
 };
 use wm_platform::{NativeWindow, OpacityValue, Rect};
@@ -146,7 +151,7 @@ use crate::{
 use crate::{
   commands::{
     general::upsert_blur_overlay,
-    window::restore_window_after_failed_close,
+    window::{detach_window_for_close, restore_window_after_failed_close},
   },
   models::WindowContainer,
 };
@@ -172,6 +177,64 @@ struct PendingCloseWindow {
   handle: isize,
   window: WindowContainer,
   workspace_id: Uuid,
+  readiness: SurrogateHandoffReadiness,
+  detached: bool,
+}
+
+/// Pending hidden-surrogate handoff for a newly opened window.
+#[cfg(target_os = "windows")]
+struct PendingOpenWindow {
+  handle: isize,
+  readiness: SurrogateHandoffReadiness,
+}
+
+/// Tick-based readiness gate used instead of blocking on `DwmFlush`.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+struct SurrogateHandoffReadiness {
+  started_at: Instant,
+  ticks_seen: u8,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurrogateHandoffOutcome {
+  Waiting,
+  Ready,
+  Failed,
+}
+
+#[cfg(target_os = "windows")]
+impl SurrogateHandoffReadiness {
+  fn new(now: Instant) -> Self {
+    Self {
+      started_at: now,
+      ticks_seen: 0,
+    }
+  }
+
+  fn advance(
+    &mut self,
+    now: Instant,
+    required_ticks: u8,
+    source_valid: bool,
+    thumbnail_healthy: bool,
+  ) -> SurrogateHandoffOutcome {
+    if !source_valid
+      || !thumbnail_healthy
+      || now.saturating_duration_since(self.started_at)
+        >= SURROGATE_HANDOFF_TIMEOUT
+    {
+      return SurrogateHandoffOutcome::Failed;
+    }
+
+    self.ticks_seen = self.ticks_seen.saturating_add(1);
+    if self.ticks_seen >= required_ticks {
+      SurrogateHandoffOutcome::Ready
+    } else {
+      SurrogateHandoffOutcome::Waiting
+    }
+  }
 }
 
 /// Tracks a single window's participation in the current workspace-switch
@@ -373,6 +436,10 @@ pub struct AnimationManager {
   /// monitor.
   #[cfg(target_os = "windows")]
   slide_in_monitor_rects: HashMap<Uuid, Rect>,
+  /// Open surrogates registered hidden until one compositor-paced tick
+  /// confirms their thumbnail can be revealed without exposing backdrop.
+  #[cfg(target_os = "windows")]
+  pending_open_windows: HashMap<Uuid, PendingOpenWindow>,
   /// Active workspace-switch slide animation, or `None` when idle.
   #[cfg(target_os = "windows")]
   workspace_switch: Option<WorkspaceSwitchState>,
@@ -439,6 +506,8 @@ impl AnimationManager {
       pending_session_cleanup: Vec::new(),
       #[cfg(target_os = "windows")]
       slide_in_monitor_rects: HashMap::new(),
+      #[cfg(target_os = "windows")]
+      pending_open_windows: HashMap::new(),
       #[cfg(target_os = "windows")]
       workspace_switch: None,
       #[cfg(target_os = "windows")]
@@ -525,16 +594,11 @@ impl AnimationManager {
     self.pending_close_windows.contains_key(window_id)
   }
 
-  /// Cancels a close animation before its window is detached.
-  ///
-  /// Used when cloaking the real window fails after the surrogate was
-  /// prepared. Dropping all three records destroys the surrogate while
-  /// leaving the still-managed real window visible for ordinary close.
+  /// Returns whether an open surrogate is still waiting for its first
+  /// compositor-paced readiness tick.
   #[cfg(target_os = "windows")]
-  pub fn cancel_close_animation(&mut self, window_id: &Uuid) {
-    self.pending_close_windows.remove(window_id);
-    self.animations.remove(window_id);
-    self.resize_sessions.remove(window_id);
+  pub fn is_open_handoff_pending(&self, window_id: &Uuid) -> bool {
+    self.pending_open_windows.contains_key(window_id)
   }
 
   /// Returns `true` if a DWM surrogate is currently covering `window_id`.
@@ -611,6 +675,8 @@ impl AnimationManager {
     self.resize_sessions.remove(window_id);
     #[cfg(target_os = "windows")]
     self.slide_in_monitor_rects.remove(window_id);
+    #[cfg(target_os = "windows")]
+    self.pending_open_windows.remove(window_id);
     #[cfg(target_os = "windows")]
     self.pending_close_windows.remove(window_id);
   }
@@ -698,6 +764,7 @@ impl AnimationManager {
     sessions
       .extend(self.pending_session_cleanup.drain(..).map(|(_, _, s)| s));
     self.pending_surrogate_updates.clear();
+    self.pending_open_windows.clear();
     self.focus_opacity_animations.clear();
     self.workspace_switch = None;
     self.pending_ws_cleanup = None;
@@ -786,6 +853,9 @@ impl AnimationManager {
           .keys()
           .copied(),
       );
+      affected_ids.extend(
+        state.animation_manager.pending_open_windows.keys().copied(),
+      );
     }
 
     state
@@ -837,6 +907,7 @@ impl AnimationManager {
     {
       state.animation_manager.pending_surrogate_updates.clear();
       state.animation_manager.slide_in_monitor_rects.clear();
+      state.animation_manager.pending_open_windows.clear();
       state.animation_manager.focus_opacity_animations.clear();
       *state
         .animation_manager
@@ -852,19 +923,10 @@ impl AnimationManager {
       let pending_closes =
         std::mem::take(&mut state.animation_manager.pending_close_windows);
       for (id, pending) in pending_closes {
-        let native = NativeWindow::from_handle(pending.handle);
-        if native.is_valid() {
-          if let Err(err) = restore_window_after_failed_close(
-            pending.window,
-            pending.workspace_id,
-            state,
-          ) {
-            tracing::warn!(
-              "Failed to reattach closing window {id} during animation \
-               recovery: {err}."
-            );
-          }
-        }
+        Self::reveal_pending_close(pending, state);
+        tracing::debug!(
+          "Restored close window {id} during animation-system recovery."
+        );
       }
     }
 
@@ -1108,6 +1170,112 @@ impl AnimationManager {
     }
   }
 
+  #[cfg(target_os = "windows")]
+  fn fail_open_handoff(state: &mut WmState, id: Uuid, reason: &str) {
+    let pending = state.animation_manager.pending_open_windows.remove(&id);
+    state.animation_manager.animations.remove(&id);
+    state.animation_manager.slide_in_monitor_rects.remove(&id);
+
+    // Position while the real window is still cloaked, then reveal it.
+    // This synchronous native fallback is intentionally failure-only; the
+    // normal handoff path remains compositor-tick driven and nonblocking.
+    if let Some(mut session) =
+      state.animation_manager.resize_sessions.remove(&id)
+    {
+      session.pre_commit();
+    }
+
+    if let Some(pending) = pending {
+      let native = NativeWindow::from_handle(pending.handle);
+      if native.is_valid() {
+        if let Err(err) = native.set_cloaked(false) {
+          tracing::warn!(
+            "Failed to uncloak window {id} after open handoff failure: \
+             {err}."
+          );
+        }
+        if let Err(err) = native.show() {
+          tracing::warn!(
+            "Failed to show window {id} after open handoff failure: {err}."
+          );
+        }
+      }
+    }
+
+    if let Some(window) = state
+      .container_by_id(id)
+      .and_then(|container| container.as_window_container().ok())
+    {
+      state.pending_sync.queue_container_to_redraw(window);
+    }
+    tracing::warn!(
+      "Open surrogate handoff for {id} failed ({reason}); revealed the \
+       real window at its final layout position."
+    );
+  }
+
+  #[cfg(target_os = "windows")]
+  fn reveal_pending_close(
+    pending: PendingCloseWindow,
+    state: &mut WmState,
+  ) {
+    let id = pending.window.id();
+    let native = NativeWindow::from_handle(pending.handle);
+    if !native.is_valid() {
+      return;
+    }
+
+    if pending.detached || pending.window.is_detached() {
+      if let Err(err) = restore_window_after_failed_close(
+        pending.window,
+        pending.workspace_id,
+        state,
+      ) {
+        tracing::warn!(
+          "Failed to restore detached close window {id}: {err}."
+        );
+      }
+    } else {
+      if let Err(err) = native.set_cloaked(false) {
+        tracing::warn!(
+          "Failed to uncloak close window {id} during fallback: {err}."
+        );
+      }
+      if let Err(err) = native.show() {
+        tracing::warn!(
+          "Failed to show close window {id} during fallback: {err}."
+        );
+      }
+    }
+  }
+
+  #[cfg(target_os = "windows")]
+  fn fail_close_handoff(
+    state: &mut WmState,
+    id: Uuid,
+    pending: PendingCloseWindow,
+    reason: &str,
+  ) {
+    let handle = pending.handle;
+    state.animation_manager.animations.remove(&id);
+    state.animation_manager.resize_sessions.remove(&id);
+    Self::reveal_pending_close(pending, state);
+
+    let native = NativeWindow::from_handle(handle);
+    if native.is_valid() {
+      if let Err(err) = native.close() {
+        tracing::warn!(
+          "Failed to close visible real window {id} after handoff failure: \
+           {err}."
+        );
+      }
+    }
+    tracing::warn!(
+      "Close surrogate handoff for {id} failed ({reason}); used the \
+       visible-real-window close fallback."
+    );
+  }
+
   /// Internal update, accessed through `WmState` to avoid double-borrow.
   pub(crate) fn update_internal(
     state: &mut WmState,
@@ -1160,12 +1328,175 @@ impl AnimationManager {
       }
     }
 
+    // Advance open/close thumbnail readiness on animation ticks. No
+    // compositor flush or wait occurs on the WM thread: open reveals after
+    // one tick with the host hidden, while close keeps the real window
+    // visible through an additional tick before cloak/detach.
+    #[cfg(target_os = "windows")]
+    {
+      let now = Instant::now();
+      let open_ids: Vec<Uuid> = state
+        .animation_manager
+        .pending_open_windows
+        .keys()
+        .copied()
+        .collect();
+
+      for id in open_ids {
+        let handle = state
+          .animation_manager
+          .pending_open_windows
+          .get(&id)
+          .map_or(0, |pending| pending.handle);
+        let native = NativeWindow::from_handle(handle);
+        let healthy = state
+          .animation_manager
+          .resize_sessions
+          .get_mut(&id)
+          .is_some_and(ResizeSession::probe_thumbnail);
+        let outcome = state
+          .animation_manager
+          .pending_open_windows
+          .get_mut(&id)
+          .map_or(SurrogateHandoffOutcome::Failed, |pending| {
+            pending
+              .readiness
+              .advance(now, 1, native.is_valid(), healthy)
+          });
+
+        match outcome {
+          SurrogateHandoffOutcome::Waiting => {}
+          SurrogateHandoffOutcome::Ready => {
+            state.animation_manager.pending_open_windows.remove(&id);
+            if let Some(session) =
+              state.animation_manager.resize_sessions.get_mut(&id)
+            {
+              session.show();
+            }
+            if let Some(animation) =
+              state.animation_manager.animations.get(&id)
+            {
+              animation.restart_on_next_frame();
+            }
+          }
+          SurrogateHandoffOutcome::Failed => {
+            Self::fail_open_handoff(
+              state,
+              id,
+              "thumbnail update, source liveness, or readiness timeout",
+            );
+          }
+        }
+      }
+
+      let close_ids: Vec<Uuid> = state
+        .animation_manager
+        .pending_close_windows
+        .iter()
+        .filter(|(_, pending)| !pending.detached)
+        .map(|(id, _)| *id)
+        .collect();
+
+      for id in close_ids {
+        let handle = state
+          .animation_manager
+          .pending_close_windows
+          .get(&id)
+          .map_or(0, |pending| pending.handle);
+        let native = NativeWindow::from_handle(handle);
+        let healthy = state
+          .animation_manager
+          .resize_sessions
+          .get_mut(&id)
+          .is_some_and(ResizeSession::probe_thumbnail);
+        let outcome = state
+          .animation_manager
+          .pending_close_windows
+          .get_mut(&id)
+          .map_or(SurrogateHandoffOutcome::Failed, |pending| {
+            pending
+              .readiness
+              .advance(now, 2, native.is_valid(), healthy)
+          });
+
+        match outcome {
+          SurrogateHandoffOutcome::Waiting => {}
+          SurrogateHandoffOutcome::Failed => {
+            if let Some(pending) =
+              state.animation_manager.pending_close_windows.remove(&id)
+            {
+              Self::fail_close_handoff(
+                state,
+                id,
+                pending,
+                "thumbnail update, source liveness, or readiness timeout",
+              );
+            }
+          }
+          SurrogateHandoffOutcome::Ready => {
+            let Some(mut pending) =
+              state.animation_manager.pending_close_windows.remove(&id)
+            else {
+              continue;
+            };
+
+            if let Err(err) = native.set_cloaked(true) {
+              Self::fail_close_handoff(
+                state,
+                id,
+                pending,
+                &format!("real-window cloak failed: {err}"),
+              );
+              continue;
+            }
+
+            if let Err(err) =
+              detach_window_for_close(pending.window.clone(), state)
+            {
+              pending.detached = pending.window.is_detached();
+              Self::fail_close_handoff(
+                state,
+                id,
+                pending,
+                &format!("layout detach failed: {err}"),
+              );
+              continue;
+            }
+
+            pending.detached = true;
+            if let Some(animation) =
+              state.animation_manager.animations.get(&id)
+            {
+              animation.restart_on_next_frame();
+            }
+            state
+              .animation_manager
+              .pending_close_windows
+              .insert(id, pending);
+          }
+        }
+      }
+    }
+
     // Queue in-progress windows for redraw.
     let active_window_ids: Vec<_> = state
       .animation_manager
       .active_window_ids()
       .into_iter()
       .filter(|id| {
+        #[cfg(target_os = "windows")]
+        if state
+          .animation_manager
+          .pending_open_windows
+          .contains_key(id)
+          || state
+            .animation_manager
+            .pending_close_windows
+            .get(id)
+            .is_some_and(|pending| !pending.detached)
+        {
+          return false;
+        }
         state
           .animation_manager
           .get_animation(id)
@@ -1193,15 +1524,16 @@ impl AnimationManager {
       let close_in_progress: Vec<Uuid> = state
         .animation_manager
         .pending_close_windows
-        .keys()
-        .filter(|id| {
-          state
-            .animation_manager
-            .animations
-            .get(id)
-            .map_or(false, |a| !a.is_complete())
+        .iter()
+        .filter(|(id, pending)| {
+          pending.detached
+            && state
+              .animation_manager
+              .animations
+              .get(id)
+              .map_or(false, |a| !a.is_complete())
         })
-        .copied()
+        .map(|(id, _)| *id)
         .collect();
 
       // Batches every closing window's acrylic-overlay reposition this
@@ -1272,6 +1604,33 @@ impl AnimationManager {
       }
 
       blur_batch.commit();
+
+      let failed_close_ids: Vec<Uuid> = state
+        .animation_manager
+        .pending_close_windows
+        .iter()
+        .filter(|(id, pending)| {
+          pending.detached
+            && state
+              .animation_manager
+              .resize_sessions
+              .get(id)
+              .is_some_and(|session| !session.has_surrogate())
+        })
+        .map(|(id, _)| *id)
+        .collect();
+      for id in failed_close_ids {
+        if let Some(pending) =
+          state.animation_manager.pending_close_windows.remove(&id)
+        {
+          Self::fail_close_handoff(
+            state,
+            id,
+            pending,
+            "visible thumbnail update failed",
+          );
+        }
+      }
     }
 
     // Finalize completed close animations before
@@ -1288,14 +1647,15 @@ impl AnimationManager {
       let close_done: Vec<Uuid> = state
         .animation_manager
         .pending_close_windows
-        .keys()
-        .filter(|id| {
-          state
-            .animation_manager
-            .get_animation(id)
-            .map_or(false, |a| a.is_complete())
+        .iter()
+        .filter(|(id, pending)| {
+          pending.detached
+            && state
+              .animation_manager
+              .get_animation(id)
+              .map_or(false, |a| a.is_complete())
         })
-        .copied()
+        .map(|(id, _)| *id)
         .collect();
 
       for id in close_done {
@@ -2222,6 +2582,7 @@ impl AnimationManager {
             &start_rect,
             &target_rect,
             SessionOptions {
+              kind: SessionKind::MoveResize,
               effect_opacity,
               initially_visible: true,
               corner_style,
@@ -2256,6 +2617,14 @@ impl AnimationManager {
           native_window.hwnd(),
         ));
       }
+    }
+
+    // A newly registered open thumbnail remains hidden for its first
+    // compositor-paced tick. Do not evaluate or expose the animation yet;
+    // its clock is restarted when readiness succeeds.
+    #[cfg(target_os = "windows")]
+    if self.pending_open_windows.contains_key(&window_id) {
+      return (AnimationPositionResult::Frozen, None);
     }
 
     // Evaluate this frame's position at a predictive timestamp so the
@@ -2353,7 +2722,30 @@ impl AnimationManager {
         }
         Some((false, _, _)) => {
           // Thumbnail failed — drop the transparent surrogate and snap.
-          self.resize_sessions.remove(&window_id);
+          // Open handoffs must place and reveal the real HWND explicitly;
+          // once the session is removed, the ordinary Apply branch no
+          // longer knows that the window is cloaked.
+          if let Some(mut session) =
+            self.resize_sessions.remove(&window_id)
+          {
+            if session.is_open_close_handoff()
+              && !self.pending_close_windows.contains_key(&window_id)
+            {
+              session.pre_commit();
+              if let Err(err) = native_window.set_cloaked(false) {
+                tracing::warn!(
+                  "Failed to uncloak window {window_id} after thumbnail \
+                   failure: {err}"
+                );
+              }
+              if let Err(err) = native_window.show() {
+                tracing::warn!(
+                  "Failed to show window {window_id} after thumbnail \
+                   failure: {err}"
+                );
+              }
+            }
+          }
           self.animations.remove(&window_id);
           return (AnimationPositionResult::Apply(target_rect), None);
         }
@@ -2726,6 +3118,7 @@ impl AnimationManager {
       &start_rect,
       &target_rect,
       SessionOptions {
+        kind: SessionKind::OpenClose,
         effect_opacity,
         initially_visible: false,
         corner_style,
@@ -2756,12 +3149,39 @@ impl AnimationManager {
         if effective_opacity_from < 1.0 {
           session.update(&start_rect, initial_opacity_u8);
         }
+        if !session.has_surrogate() {
+          tracing::warn!(
+            "Open animation unavailable for {window_id}: DWM thumbnail \
+             setup failed; revealing the real window at its final rect."
+          );
+          session.pre_commit();
+          if let Err(err) = native_window.set_cloaked(false) {
+            tracing::warn!(
+              "Failed to uncloak window {window_id} after open animation \
+               setup failure: {err}"
+            );
+          }
+          if let Err(err) = native_window.show() {
+            tracing::warn!(
+              "Failed to show window {window_id} after open animation setup \
+               failure: {err}"
+            );
+          }
+          return;
+        }
         // For zoom: the drive loop handles the first frame.
         // update_zoom_fade is NOT called here so the surrogate
         // stays hidden until the first animation tick sets the
         // correct progress.
         self.animations.insert(window_id, anim);
         self.resize_sessions.insert(window_id, session);
+        self.pending_open_windows.insert(
+          window_id,
+          PendingOpenWindow {
+            handle: native_window.hwnd().0,
+            readiness: SurrogateHandoffReadiness::new(Instant::now()),
+          },
+        );
         if !is_stationary {
           self.slide_in_monitor_rects.insert(window_id, monitor_rect);
         }
@@ -2776,11 +3196,11 @@ impl AnimationManager {
 
   /// Starts a close animation for a window.
   ///
-  /// The surrogate is created and shown immediately as a pixel-identical
-  /// overlay of the (still-visible) window; the caller cloaks the real
-  /// window only after this returns, so the surrogate is already
-  /// covering it and no gap exposes the desktop. The surrogate style is
-  /// determined by `window_close.style`:
+  /// The transparent surrogate is registered and shown above the
+  /// still-visible real window. `update_internal` waits for its
+  /// compositor-paced readiness ticks before cloaking and detaching the
+  /// real HWND. The surrogate style is determined by
+  /// `window_close.style`:
   /// - `None`/`Zoom`: surrogate stays at `current_rect`, fades/zooms out.
   /// - Slide styles: surrogate slides off the corresponding screen edge
   ///   while fading. The real window is never repositioned during a close
@@ -2847,13 +3267,13 @@ impl AnimationManager {
       &current_rect,
       &target_rect,
       SessionOptions {
+        kind: SessionKind::OpenClose,
         effect_opacity,
         initially_visible: false,
         corner_style,
         place_at_top: false,
-        // Reuse a cached color when the closing window was recently
-        // animated; otherwise sample — the window is still on screen.
-        edge_color: self.cached_edge_color(native_window.hwnd().0),
+        // Open/close handoffs never expose sampled solid fill.
+        edge_color: None,
         blur_overlay,
       },
     ) {
@@ -2883,9 +3303,10 @@ impl AnimationManager {
           native_window.hwnd(),
         ));
 
-        // Show the surrogate immediately so it covers the window before
-        // the caller cloaks it (a seamless, pixel-identical
-        // handoff).
+        // The handoff host is transparent, so showing it above the still
+        // visible real window cannot expose a sampled-color frame. The
+        // readiness gate keeps that real window visible for two animation
+        // ticks before cloaking and detaching it.
         session.show();
         session.zoom = is_zoom;
         self.animations.insert(window_id, anim);
@@ -2896,6 +3317,8 @@ impl AnimationManager {
             handle: native_window.hwnd().0,
             window: recovery_window,
             workspace_id: recovery_workspace_id,
+            readiness: SurrogateHandoffReadiness::new(Instant::now()),
+            detached: false,
           },
         );
       }
@@ -3027,5 +3450,144 @@ mod tests {
 
     drop(animation_tick_rx);
     assert!(!AnimationManager::queue_animation_tick(&animation_tick_tx));
+  }
+
+  #[test]
+  fn open_handoff_is_ready_after_one_tick() {
+    let start = Instant::now();
+    let mut readiness = SurrogateHandoffReadiness::new(start);
+    assert_eq!(
+      readiness.advance(start, 1, true, true),
+      SurrogateHandoffOutcome::Ready
+    );
+  }
+
+  #[test]
+  fn close_handoff_keeps_real_window_for_first_tick() {
+    let start = Instant::now();
+    let mut readiness = SurrogateHandoffReadiness::new(start);
+    assert_eq!(
+      readiness.advance(start, 2, true, true),
+      SurrogateHandoffOutcome::Waiting
+    );
+    assert_eq!(
+      readiness.advance(start + Duration::from_millis(16), 2, true, true),
+      SurrogateHandoffOutcome::Ready
+    );
+  }
+
+  #[test]
+  fn handoff_fails_on_thumbnail_update_failure() {
+    let start = Instant::now();
+    let mut readiness = SurrogateHandoffReadiness::new(start);
+    assert_eq!(
+      readiness.advance(start, 1, true, false),
+      SurrogateHandoffOutcome::Failed
+    );
+  }
+
+  #[test]
+  fn destroyed_hwnd_cancels_pending_readiness() {
+    let start = Instant::now();
+    let mut readiness = SurrogateHandoffReadiness::new(start);
+    assert_eq!(
+      readiness.advance(start, 1, false, true),
+      SurrogateHandoffOutcome::Failed
+    );
+  }
+
+  #[test]
+  fn readiness_timeout_never_transfers_to_surrogate() {
+    let start = Instant::now();
+    let mut readiness = SurrogateHandoffReadiness::new(start);
+    assert_eq!(
+      readiness.advance(start + SURROGATE_HANDOFF_TIMEOUT, 1, true, true,),
+      SurrogateHandoffOutcome::Failed
+    );
+  }
+
+  #[test]
+  fn repeated_handoffs_do_not_share_tick_state() {
+    let start = Instant::now();
+    for _ in 0..128 {
+      let mut readiness = SurrogateHandoffReadiness::new(start);
+      assert_eq!(
+        readiness.advance(start, 2, true, true),
+        SurrogateHandoffOutcome::Waiting
+      );
+      assert_eq!(
+        readiness.advance(
+          start + Duration::from_millis(16),
+          2,
+          true,
+          true,
+        ),
+        SurrogateHandoffOutcome::Ready
+      );
+    }
+  }
+
+  #[test]
+  fn window_transition_styles_have_distinct_open_and_close_geometry() {
+    let base = Rect::from_xy(100, 200, 300, 150);
+    let cases = [
+      (WindowTransitionStyle::SlideRight, (400, 200)),
+      (WindowTransitionStyle::SlideLeft, (-200, 200)),
+      (WindowTransitionStyle::SlideTop, (100, 50)),
+      (WindowTransitionStyle::SlideBottom, (100, 350)),
+    ];
+
+    for (style, (expected_x, expected_y)) in cases {
+      let offset =
+        AnimationManager::compute_transition_start_rect(&base, &style);
+      assert_eq!((offset.x(), offset.y()), (expected_x, expected_y));
+      assert_eq!((offset.width(), offset.height()), (300, 150));
+
+      // Open interpolates offset -> base; close reverses those endpoints.
+      let open = WindowAnimationState::new_movement(
+        offset.clone(),
+        base.clone(),
+        100,
+        EasingFunction::CubicBezier(0.0, 0.0, 1.0, 1.0),
+      );
+      let close = WindowAnimationState::new_movement(
+        base.clone(),
+        offset.clone(),
+        100,
+        EasingFunction::CubicBezier(0.0, 0.0, 1.0, 1.0),
+      );
+      let now = Instant::now();
+      assert_eq!(open.current_state_at(now).0, offset);
+      assert_eq!(close.current_state_at(now).0, base);
+      assert_eq!(
+        open.current_state_at(now + Duration::from_millis(100)).0,
+        base
+      );
+      assert_eq!(
+        close.current_state_at(now + Duration::from_millis(100)).0,
+        offset
+      );
+    }
+  }
+
+  #[test]
+  fn stationary_window_styles_have_no_slide_component() {
+    let base = Rect::from_xy(10, 20, 300, 200);
+    for style in [WindowTransitionStyle::None, WindowTransitionStyle::Zoom]
+    {
+      assert!(style.is_stationary());
+      assert_eq!(
+        AnimationManager::compute_transition_start_rect(&base, &style),
+        base
+      );
+    }
+    for style in [
+      WindowTransitionStyle::SlideRight,
+      WindowTransitionStyle::SlideLeft,
+      WindowTransitionStyle::SlideTop,
+      WindowTransitionStyle::SlideBottom,
+    ] {
+      assert!(!style.is_stationary());
+    }
   }
 }

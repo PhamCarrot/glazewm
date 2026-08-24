@@ -5,10 +5,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![warn(clippy::all, clippy::pedantic)]
 
+use std::{sync::mpsc, thread, time::Duration};
+
 use anyhow::Context;
 use wm_common::{ClientResponseData, ContainerDto, WindowDto, WmEvent};
 use wm_ipc_client::IpcClient;
 use wm_platform::{NativeWindow, NativeWindowWindowsExt, OpacityValue};
+
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,6 +31,10 @@ async fn main() -> anyhow::Result<()> {
   let subscribe_res =
     watch_managed_handles(&mut client, &mut managed_handles).await;
 
+  if subscribe_res.is_ok() {
+    client.close().await;
+  }
+
   match subscribe_res {
     Ok(()) => {
       tracing::info!("WM exited successfully. Skipping watcher cleanup.");
@@ -37,29 +45,108 @@ async fn main() -> anyhow::Result<()> {
         err
       );
 
-      let managed_windows =
-        managed_handles.into_iter().map(NativeWindow::from_handle);
-
-      for window in managed_windows {
-        // Remove DWM cloak first so the window becomes compositable before
-        // `ShowWindow` makes it visible. Without this, windows cloaked
-        // during a workspace-switch animation remain invisible ("ghosted")
-        // even after the watcher restores their other attributes.
-        let _ = window.set_cloaked(false);
-
-        if let Err(err) = window.show() {
-          tracing::warn!("Failed to show window: {:?}", err);
-        }
-
-        let _ = window.set_taskbar_visibility(true);
-        let _ = window.set_border_color(None);
-        let _ =
-          window.set_transparency(&OpacityValue::from_alpha(u8::MAX));
-      }
+      restore_managed_windows(managed_handles, CLEANUP_TIMEOUT);
     }
   }
 
   Ok(())
+}
+
+fn restore_managed_windows(handles: Vec<isize>, timeout: Duration) {
+  let worker_count = handles.len();
+  let (completion_tx, completion_rx) = mpsc::channel();
+  let mut started_workers = 0usize;
+
+  for handle in handles {
+    let completion_tx = completion_tx.clone();
+    let spawn_result = thread::Builder::new()
+      .name(format!("glazewm-watcher-cleanup-{handle}"))
+      .spawn(move || {
+        restore_managed_window(handle);
+        let _ = completion_tx.send(handle);
+      });
+
+    match spawn_result {
+      Ok(_) => started_workers += 1,
+      Err(err) => tracing::warn!(
+        "Failed to start cleanup worker for window {handle}: {err}"
+      ),
+    }
+  }
+  drop(completion_tx);
+
+  let completed_workers =
+    wait_for_cleanup_workers(&completion_rx, started_workers, timeout);
+  if completed_workers < worker_count {
+    tracing::warn!(
+      "Watcher cleanup timed out or could not start for {} of {} windows; \
+       exiting so Windows can release watcher process resources.",
+      worker_count - completed_workers,
+      worker_count
+    );
+  }
+}
+
+fn wait_for_cleanup_workers(
+  completion_rx: &mpsc::Receiver<isize>,
+  worker_count: usize,
+  timeout: Duration,
+) -> usize {
+  let deadline = std::time::Instant::now() + timeout;
+  let mut completed_workers = 0usize;
+
+  while completed_workers < worker_count {
+    let remaining =
+      deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+      break;
+    }
+
+    match completion_rx.recv_timeout(remaining) {
+      Ok(_) => completed_workers += 1,
+      Err(
+        mpsc::RecvTimeoutError::Timeout
+        | mpsc::RecvTimeoutError::Disconnected,
+      ) => break,
+    }
+  }
+
+  completed_workers
+}
+
+fn restore_managed_window(handle: isize) {
+  let window = NativeWindow::from_handle(handle);
+
+  // Remove DWM cloak first so the window becomes compositable before
+  // `ShowWindow` makes it visible. Each window runs in a disposable
+  // worker: undocumented shell COM can block forever for a destroyed or
+  // hung HWND, and crash recovery must never keep the watcher process
+  // alive forever.
+  if let Err(err) = window.set_cloaked(false) {
+    tracing::warn!(
+      "Failed to uncloak window {handle} during cleanup: {err:?}"
+    );
+  }
+
+  if let Err(err) = window.show() {
+    tracing::warn!("Failed to show window {handle}: {err:?}");
+  }
+
+  if let Err(err) = window.set_taskbar_visibility(true) {
+    tracing::warn!(
+      "Failed to restore taskbar visibility for window {handle}: {err:?}"
+    );
+  }
+  if let Err(err) = window.set_border_color(None) {
+    tracing::warn!("Failed to reset border for window {handle}: {err:?}");
+  }
+  if let Err(err) =
+    window.set_transparency(&OpacityValue::from_alpha(u8::MAX))
+  {
+    tracing::warn!(
+      "Failed to restore opacity for window {handle}: {err:?}"
+    );
+  }
 }
 
 async fn query_initial_windows(
@@ -142,5 +229,27 @@ async fn watch_managed_handles(
         anyhow::bail!("IPC connection closed unexpectedly.")
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{sync::mpsc, thread, time::Duration};
+
+  use super::wait_for_cleanup_workers;
+
+  #[test]
+  fn cleanup_wait_has_a_hard_deadline() {
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+      thread::sleep(Duration::from_millis(100));
+      let _ = tx.send(1);
+    });
+
+    let completed =
+      wait_for_cleanup_workers(&rx, 1, Duration::from_millis(10));
+    assert_eq!(completed, 0);
+
+    worker.join().expect("test worker should finish");
   }
 }

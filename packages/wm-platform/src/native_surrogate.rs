@@ -216,6 +216,16 @@ pub struct SurrogateBatch {
   entries: Vec<(isize, Rect)>,
 }
 
+fn surrogate_batch_flags() -> SET_WINDOW_POS_FLAGS {
+  // `SWP_NOSENDCHANGING` is intentionally excluded. Although accepted by
+  // `SetWindowPos`, Windows returns `ERROR_INVALID_PARAMETER` when it is
+  // used by `DeferWindowPos` for these top-level surrogate hosts. Each
+  // abandoned failed transaction also retains a USER object. The hosts'
+  // default window procedure is inert, so allowing `WM_WINDOWPOSCHANGING`
+  // has no behavioral cost and keeps the atomic batch path operational.
+  SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOZORDER
+}
+
 impl SurrogateBatch {
   /// Creates an empty batch.
   #[must_use]
@@ -251,8 +261,7 @@ impl SurrogateBatch {
       return;
     }
 
-    let flags =
-      SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOSENDCHANGING | SWP_NOZORDER;
+    let flags = surrogate_batch_flags();
 
     // SAFETY: All handles refer to surrogate windows owned by this
     // process; a stale handle only causes the transaction to fail,
@@ -279,7 +288,7 @@ impl SurrogateBatch {
           // The transaction (including prior entries) is invalidated on
           // failure; redo everything individually.
           Err(_) => {
-            return Self::commit_individually(&self.entries, flags)
+            return Self::commit_individually(&self.entries, flags);
           }
         }
       }
@@ -636,9 +645,9 @@ impl NativeSurrogate {
   /// thumbnail properties.
   ///
   /// No-op when no thumbnail was registered.
-  pub fn set_thumbnail_visible(&self, visible: bool) {
+  pub fn set_thumbnail_visible(&self, visible: bool) -> bool {
     if self.thumbnail == 0 {
-      return;
+      return false;
     }
     let props = DWM_THUMBNAIL_PROPERTIES {
       dwFlags: DWM_TNP_VISIBLE,
@@ -648,8 +657,8 @@ impl NativeSurrogate {
     // SAFETY: `self.thumbnail` is a valid handle. `props` is
     // stack-allocated.
     unsafe {
-      let _ =
-        DwmUpdateThumbnailProperties(self.thumbnail, &raw const props);
+      DwmUpdateThumbnailProperties(self.thumbnail, &raw const props)
+        .is_ok()
     }
   }
 
@@ -659,13 +668,13 @@ impl NativeSurrogate {
   /// The SWCA acrylic backdrop is unaffected — only the thumbnail
   /// content fades. No-op when `opacity` matches the last applied value
   /// or when no thumbnail is registered.
-  pub fn set_window_opacity(&mut self, opacity: u8) {
+  pub fn set_window_opacity(&mut self, opacity: u8) -> bool {
     if opacity == self.last_opacity {
-      return;
+      return self.thumbnail != 0;
     }
     self.last_opacity = opacity;
     if self.thumbnail == 0 {
-      return;
+      return false;
     }
     let props = DWM_THUMBNAIL_PROPERTIES {
       dwFlags: DWM_TNP_OPACITY,
@@ -675,8 +684,8 @@ impl NativeSurrogate {
     // SAFETY: `self.thumbnail` is a valid handle. `props` is
     // stack-allocated.
     unsafe {
-      let _ =
-        DwmUpdateThumbnailProperties(self.thumbnail, &raw const props);
+      DwmUpdateThumbnailProperties(self.thumbnail, &raw const props)
+        .is_ok()
     }
   }
 
@@ -690,9 +699,9 @@ impl NativeSurrogate {
   /// when no thumbnail was registered.
   ///
   /// [`set_window_opacity`]: NativeSurrogate::set_window_opacity
-  pub fn set_thumbnail_rects(&self, rc_src: RECT, rc_dst: RECT) {
+  pub fn set_thumbnail_rects(&self, rc_src: RECT, rc_dst: RECT) -> bool {
     if self.thumbnail == 0 {
-      return;
+      return false;
     }
     let props = DWM_THUMBNAIL_PROPERTIES {
       dwFlags: DWM_TNP_RECTSOURCE
@@ -708,8 +717,8 @@ impl NativeSurrogate {
     // SAFETY: `self.thumbnail` is a valid handle. `props` is
     // stack-allocated.
     unsafe {
-      let _ =
-        DwmUpdateThumbnailProperties(self.thumbnail, &raw const props);
+      DwmUpdateThumbnailProperties(self.thumbnail, &raw const props)
+        .is_ok()
     }
   }
 
@@ -733,9 +742,10 @@ impl NativeSurrogate {
     logical_width: i32,
     logical_height: i32,
     border_inset: RECT,
-  ) {
+    allow_reregistration: bool,
+  ) -> bool {
     if self.thumbnail == 0 {
-      return;
+      return false;
     }
     let src_rect = RECT {
       left: border_inset.left,
@@ -765,18 +775,24 @@ impl NativeSurrogate {
     }
     .is_err()
     {
-      // Stale handle — fall back to a full re-registration.
-      self.reregister_thumbnail(
-        source_hwnd,
-        logical_width,
-        logical_height,
-        border_inset,
-      );
-      return;
+      if allow_reregistration {
+        // Move/resize sessions may still need a full re-registration to
+        // keep covering changing geometry. Open/close handoffs must never
+        // expose the unregister/register gap while visible.
+        self.reregister_thumbnail(
+          source_hwnd,
+          logical_width,
+          logical_height,
+          border_inset,
+        );
+        return self.thumbnail != 0;
+      }
+      return false;
     }
     self.content_size = (logical_width, logical_height);
     self.border_inset = border_inset;
     self.last_rect = None;
+    true
   }
 
   /// Unregisters the current DWM thumbnail and registers a new one at
@@ -826,8 +842,13 @@ impl NativeSurrogate {
   /// opaque).
   pub fn update(&mut self, rect: &Rect, opacity: u8) -> crate::Result<()> {
     self.reposition(rect)?;
-    self.set_window_opacity(opacity);
-    Ok(())
+    if self.set_window_opacity(opacity) {
+      Ok(())
+    } else {
+      Err(crate::Error::Platform(
+        "DWM thumbnail opacity update failed".into(),
+      ))
+    }
   }
 
   /// Queues a reposition to `rect` into `batch` instead of issuing an
@@ -855,11 +876,26 @@ impl Drop for NativeSurrogate {
     // SAFETY: All thumbnail handles and `self.hwnd` are valid handles
     // created by this type. Thumbnails must be unregistered before the
     // destination window is destroyed.
+    self.set_visible(false);
     unsafe {
       if self.thumbnail != 0 {
         let _ = DwmUnregisterThumbnail(self.thumbnail);
       }
       let _ = DestroyWindow(HWND(self.hwnd));
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn batch_flags_exclude_incompatible_no_send_changing() {
+    let flags = surrogate_batch_flags();
+    assert_eq!(flags.0 & SWP_NOSENDCHANGING.0, 0);
+    assert_ne!(flags.0 & SWP_NOACTIVATE.0, 0);
+    assert_ne!(flags.0 & SWP_NOCOPYBITS.0, 0);
+    assert_ne!(flags.0 & SWP_NOZORDER.0, 0);
   }
 }

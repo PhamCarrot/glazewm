@@ -442,11 +442,19 @@ impl UserConfig {
 mod tests {
   use wm_common::{
     EasingFunction, ParsedConfig, WindowTransitionStyle,
+    WorkspaceSwitchDirection, WorkspaceSwitchIrisOrigin,
     WorkspaceSwitchStyle,
   };
   use wm_platform::{BackdropStyle, Rect};
 
   use super::*;
+
+  const MON4SM_INSPIRED_CONFIG: &str = include_str!(
+    "../../../resources/assets/examples/config-mon4sm-inspired.yaml"
+  );
+  const MAXHU08_INSPIRED_CONFIG: &str = include_str!(
+    "../../../resources/assets/examples/config-maxhu08-inspired.yaml"
+  );
 
   /// The bundled sample config (which uses the `type` key for animation
   /// transition types) must always parse.
@@ -464,6 +472,22 @@ mod tests {
       config.animations.workspace_switch.style,
       WorkspaceSwitchStyle::Slide
     );
+  }
+
+  #[test]
+  fn inspired_example_configs_parse_and_validate() {
+    for (name, yaml) in [
+      ("Mon4sm", MON4SM_INSPIRED_CONFIG),
+      ("maxhu08", MAXHU08_INSPIRED_CONFIG),
+    ] {
+      let config: ParsedConfig = serde_yaml::from_str(yaml)
+        .unwrap_or_else(|err| {
+          panic!("{name} example should parse: {err}")
+        });
+      config.validate().unwrap_or_else(|err| {
+        panic!("{name} example should validate: {err}")
+      });
+    }
   }
 
   #[test]
@@ -504,6 +528,25 @@ animations:
   #[test]
   fn exact_named_easings_parse_and_round_trip() {
     let cases = [
+      ("linear", EasingFunction::CubicBezier(0.0, 0.0, 1.0, 1.0)),
+      ("ease_in", EasingFunction::CubicBezier(0.42, 0.0, 1.0, 1.0)),
+      ("ease_out", EasingFunction::CubicBezier(0.0, 0.0, 0.58, 1.0)),
+      (
+        "ease_in_out",
+        EasingFunction::CubicBezier(0.42, 0.0, 0.58, 1.0),
+      ),
+      (
+        "ease_in_cubic",
+        EasingFunction::CubicBezier(0.32, 0.0, 0.67, 0.0),
+      ),
+      (
+        "ease_out_cubic",
+        EasingFunction::CubicBezier(0.33, 1.0, 0.68, 1.0),
+      ),
+      (
+        "ease_in_out_cubic",
+        EasingFunction::CubicBezier(0.65, 0.0, 0.35, 1.0),
+      ),
       ("ease_in_quart", EasingFunction::EaseInQuart),
       ("ease_out_quart", EasingFunction::EaseOutQuart),
       ("ease_in_out_quart", EasingFunction::EaseInOutQuart),
@@ -516,6 +559,7 @@ animations:
       ("ease_in_back", EasingFunction::EaseInBack),
       ("ease_out_back", EasingFunction::EaseOutBack),
       ("ease_in_out_back", EasingFunction::EaseInOutBack),
+      ("ease_out_spring", EasingFunction::EaseOutSpring),
     ];
 
     for (name, expected) in cases {
@@ -530,16 +574,73 @@ animations:
       assert_eq!(reparsed, expected);
     }
 
-    let overshoot_alias: EasingFunction =
-      serde_yaml::from_str("ease_out_overshoot")
-        .expect("overshoot alias should parse");
-    assert_eq!(overshoot_alias, EasingFunction::EaseOutBack);
+    for (alias, canonical, expected) in [
+      (
+        "ease_in_overshoot",
+        "ease_in_back",
+        EasingFunction::EaseInBack,
+      ),
+      (
+        "ease_out_overshoot",
+        "ease_out_back",
+        EasingFunction::EaseOutBack,
+      ),
+      (
+        "ease_in_out_overshoot",
+        "ease_in_out_back",
+        EasingFunction::EaseInOutBack,
+      ),
+    ] {
+      let parsed: EasingFunction =
+        serde_yaml::from_str(alias).expect("overshoot alias should parse");
+      assert_eq!(parsed, expected);
+      assert_eq!(
+        serde_yaml::to_string(&parsed)
+          .expect("Back easing should serialize")
+          .trim(),
+        canonical
+      );
+    }
+  }
+
+  #[test]
+  fn custom_bezier_parser_enforces_its_public_contract() {
+    let overshoot: EasingFunction =
+      serde_yaml::from_str("'cubic_bezier(0.2, -0.5, 0.8, 1.5)'")
+        .expect("finite y control points may overshoot");
     assert_eq!(
-      serde_yaml::to_string(&overshoot_alias)
-        .expect("Back easing should serialize")
-        .trim(),
-      "ease_out_back"
+      overshoot,
+      EasingFunction::CubicBezier(0.2, -0.5, 0.8, 1.5)
     );
+
+    for invalid in [
+      "'cubic_bezier()'",
+      "'cubic_bezier(0.2, 0.3, 0.8)'",
+      "'cubic_bezier(0.2, nope, 0.8, 1.0)'",
+      "'cubic_bezier(-0.1, 0.0, 0.8, 1.0)'",
+      "'cubic_bezier(0.2, 0.0, 1.1, 1.0)'",
+      "'cubic_bezier(0.2, inf, 0.8, 1.0)'",
+      "'cubic_bezier(0.2, -inf, 0.8, 1.0)'",
+      "'cubic_bezier(0.2, NaN, 0.8, 1.0)'",
+      "'cubic_bezier(0.2, 0.0, 0.8, 1.0) trailing'",
+      "'not_an_easing'",
+    ] {
+      assert!(
+        serde_yaml::from_str::<EasingFunction>(invalid).is_err(),
+        "invalid easing unexpectedly parsed: {invalid}"
+      );
+    }
+
+    for valid in [
+      "'cubic_bezier(0, 0, 0, 1)'",
+      "'cubic_bezier(1, -10, 1, 10)'",
+      "'cubic_bezier(0.5, 0.5, 0.5, 0.5)'",
+    ] {
+      assert!(
+        serde_yaml::from_str::<EasingFunction>(valid).is_ok(),
+        "valid easing failed to parse: {valid}"
+      );
+    }
   }
 
   /// Configs written before the `style` -> `type` key rename must keep
@@ -582,6 +683,72 @@ animations:
     assert_eq!(
       config.animations.window_open.style,
       WindowTransitionStyle::SlideTop
+    );
+  }
+
+  #[test]
+  fn every_animation_style_name_and_alias_parses_distinctly() {
+    for (name, expected) in [
+      ("slide_right", WindowTransitionStyle::SlideRight),
+      ("right", WindowTransitionStyle::SlideRight),
+      ("slide_left", WindowTransitionStyle::SlideLeft),
+      ("left", WindowTransitionStyle::SlideLeft),
+      ("slide_top", WindowTransitionStyle::SlideTop),
+      ("top", WindowTransitionStyle::SlideTop),
+      ("slide_bottom", WindowTransitionStyle::SlideBottom),
+      ("bottom", WindowTransitionStyle::SlideBottom),
+      ("none", WindowTransitionStyle::None),
+      ("fade", WindowTransitionStyle::None),
+      ("zoom", WindowTransitionStyle::Zoom),
+    ] {
+      let parsed: WindowTransitionStyle = serde_yaml::from_str(name)
+        .unwrap_or_else(|_| panic!("window style should parse: {name}"));
+      assert_eq!(parsed, expected);
+    }
+    assert!(
+      serde_yaml::from_str::<WindowTransitionStyle>("slide").is_err()
+    );
+
+    for (name, expected) in [
+      ("slide", WorkspaceSwitchStyle::Slide),
+      ("fade", WorkspaceSwitchStyle::Fade),
+      ("zoom", WorkspaceSwitchStyle::Zoom),
+      ("iris", WorkspaceSwitchStyle::Iris),
+    ] {
+      let parsed: WorkspaceSwitchStyle = serde_yaml::from_str(name)
+        .unwrap_or_else(|_| {
+          panic!("workspace style should parse: {name}")
+        });
+      assert_eq!(parsed, expected);
+    }
+    assert!(serde_yaml::from_str::<WorkspaceSwitchStyle>("none").is_err());
+
+    for (name, expected) in [
+      ("horizontal", WorkspaceSwitchDirection::Horizontal),
+      ("vertical", WorkspaceSwitchDirection::Vertical),
+    ] {
+      assert_eq!(
+        serde_yaml::from_str::<WorkspaceSwitchDirection>(name)
+          .expect("workspace direction should parse"),
+        expected
+      );
+    }
+    assert!(serde_yaml::from_str::<WorkspaceSwitchDirection>("diagonal")
+      .is_err());
+
+    for (name, expected) in [
+      ("center", WorkspaceSwitchIrisOrigin::Center),
+      ("cursor", WorkspaceSwitchIrisOrigin::Cursor),
+      ("focused_window", WorkspaceSwitchIrisOrigin::FocusedWindow),
+    ] {
+      assert_eq!(
+        serde_yaml::from_str::<WorkspaceSwitchIrisOrigin>(name)
+          .expect("iris origin should parse"),
+        expected
+      );
+    }
+    assert!(
+      serde_yaml::from_str::<WorkspaceSwitchIrisOrigin>("window").is_err()
     );
   }
 

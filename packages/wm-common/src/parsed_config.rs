@@ -861,9 +861,9 @@ pub enum WorkspaceSwitchStyle {
   /// and their opacities are driven by `opacity_outgoing` /
   /// `opacity_incoming`.
   Fade,
-  /// Outgoing workspace shrinks to the monitor center; incoming expands
-  /// from it. Opacities are also animated via `opacity_outgoing` /
-  /// `opacity_incoming`.
+  /// Each outgoing window shrinks toward its own center; each incoming
+  /// window expands from its own center. Opacities are also animated via
+  /// `opacity_outgoing` / `opacity_incoming`.
   Zoom,
   /// Iris wipe: a frozen snapshot of the outgoing workspace stays on top
   /// while a circular hole grows from `iris_origin`, revealing the live

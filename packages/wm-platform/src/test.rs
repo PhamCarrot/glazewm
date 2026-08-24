@@ -10,6 +10,8 @@ mod event_loop;
 mod keybinding_listener;
 mod models;
 mod mouse_listener;
+#[cfg(target_os = "windows")]
+mod native_surrogate;
 mod native_window;
 mod platform_event;
 mod platform_impl;

@@ -12,6 +12,62 @@ pub enum SlideAxis {
   Vertical,
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn slide_offset(
+  progress: f32,
+  is_incoming: bool,
+  direction: i32,
+  distance: i32,
+) -> i32 {
+  if is_incoming {
+    (direction as f32 * distance as f32 * (1.0 - progress)) as i32
+  } else {
+    (-direction as f32 * distance as f32 * progress) as i32
+  }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn zoom_rect(
+  rect: &Rect,
+  progress: f32,
+  is_incoming: bool,
+) -> Option<Rect> {
+  let scale = if is_incoming {
+    progress
+  } else {
+    1.0 - progress
+  };
+  let half_w = (rect.width() as f32 / 2.0 * scale).round() as i32;
+  let half_h = (rect.height() as f32 / 2.0 * scale).round() as i32;
+  if half_w <= 0 || half_h <= 0 {
+    return None;
+  }
+
+  let cx = rect.x() + rect.width() / 2;
+  let cy = rect.y() + rect.height() / 2;
+  Some(Rect::from_ltrb(
+    cx - half_w,
+    cy - half_h,
+    cx + half_w,
+    cy + half_h,
+  ))
+}
+
+fn transition_opacity(
+  opacity: u8,
+  endpoint: f32,
+  progress: f32,
+  is_incoming: bool,
+) -> u8 {
+  let (start_frac, end_frac) = if is_incoming {
+    (endpoint, 1.0)
+  } else {
+    (1.0, endpoint)
+  };
+  let fraction = start_frac + (end_frac - start_frac) * progress;
+  (f32::from(opacity) * fraction.clamp(0.0, 1.0)).round() as u8
+}
+
 /// Positioning strategy for a [`WorkspaceSurrogate`].
 enum SurrogateMode {
   /// The surrogate spans the whole monitor viewport, created once and
@@ -427,28 +483,16 @@ impl WorkspaceSurrogate {
     eased_progress: f32,
     is_incoming: bool,
   ) {
-    let t = if is_incoming {
-      eased_progress
-    } else {
-      1.0 - eased_progress
+    let Some(destination) =
+      zoom_rect(&self.rect, eased_progress, is_incoming)
+    else {
+      self.inner.set_visible(false);
+      self.current_rect = None;
+      return;
     };
 
     let w = self.rect.width();
     let h = self.rect.height();
-    let half_w = (w as f32 / 2.0 * t).round() as i32;
-    let half_h = (h as f32 / 2.0 * t).round() as i32;
-
-    if half_w <= 0 || half_h <= 0 {
-      self.inner.set_visible(false);
-      self.current_rect = None;
-      return;
-    }
-
-    // Anchor at the window's own screen-space center — not the surrogate's
-    // local origin — so the zoom converges on the window's actual tile
-    // rather than the monitor's top-left corner.
-    let cx = self.rect.left + w / 2;
-    let cy = self.rect.top + h / 2;
 
     let rc_src = RECT {
       left: self.border_inset.left,
@@ -460,10 +504,10 @@ impl WorkspaceSurrogate {
     self.apply_visible_rect(
       Some(batch),
       rc_src,
-      cx - half_w,
-      cy - half_h,
-      cx + half_w,
-      cy + half_h,
+      destination.left,
+      destination.top,
+      destination.right,
+      destination.bottom,
     );
     self
       .inner
@@ -478,13 +522,12 @@ impl WorkspaceSurrogate {
   /// When `opacity_endpoint` is `1.0` (default), the result is constant
   /// `opacity` — no fade.
   fn lerp_opacity(&self, progress: f32, is_incoming: bool) -> u8 {
-    let (start_frac, end_frac): (f32, f32) = if is_incoming {
-      (self.opacity_endpoint, 1.0)
-    } else {
-      (1.0, self.opacity_endpoint)
-    };
-    let frac = start_frac + (end_frac - start_frac) * progress;
-    (self.opacity as f32 * frac.clamp(0.0, 1.0)).round() as u8
+    transition_opacity(
+      self.opacity,
+      self.opacity_endpoint,
+      progress,
+      is_incoming,
+    )
   }
 
   /// Applies a visible-rect update for one animation frame, dispatching on
@@ -586,12 +629,8 @@ impl WorkspaceSurrogate {
     }
 
     // Slide offset on the primary axis.
-    let slide_offset = if is_incoming {
-      (direction as f32 * slide_distance as f32 * (1.0 - eased_progress))
-        as i32
-    } else {
-      (-direction as f32 * slide_distance as f32 * eased_progress) as i32
-    };
+    let slide_offset =
+      slide_offset(eased_progress, is_incoming, direction, slide_distance);
 
     // Zoom all four edges from the monitor center.
     let cx = monitor_x + monitor_width / 2;
@@ -694,12 +733,8 @@ impl WorkspaceSurrogate {
   ) {
     // Incoming: start at +direction*slide_distance offset, end at 0.
     // Outgoing: start at 0, end at -direction*slide_distance offset.
-    let offset = if is_incoming {
-      (direction as f32 * slide_distance as f32 * (1.0 - eased_progress))
-        as i32
-    } else {
-      (-direction as f32 * slide_distance as f32 * eased_progress) as i32
-    };
+    let offset =
+      slide_offset(eased_progress, is_incoming, direction, slide_distance);
 
     // Axis-dependent dimensions.
     let (axis_pos, perp_pos, axis_size, perp_size) = if is_vertical {
@@ -785,5 +820,52 @@ impl WorkspaceSurrogate {
     self
       .inner
       .set_window_opacity(self.lerp_opacity(eased_progress, is_incoming));
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn workspace_slide_direction_and_endpoints_are_distinct() {
+    for direction in [-1, 1] {
+      assert_eq!(
+        slide_offset(0.0, true, direction, 1_000),
+        direction * 1_000
+      );
+      assert_eq!(slide_offset(1.0, true, direction, 1_000), 0);
+      assert_eq!(slide_offset(0.0, false, direction, 1_000), 0);
+      assert_eq!(
+        slide_offset(1.0, false, direction, 1_000),
+        -direction * 1_000
+      );
+    }
+  }
+
+  #[test]
+  fn workspace_zoom_scales_about_each_window_center() {
+    let rect = Rect::from_xy(100, 200, 400, 200);
+    assert_eq!(zoom_rect(&rect, 0.0, true), None);
+    assert_eq!(
+      zoom_rect(&rect, 0.5, true),
+      Some(Rect::from_xy(200, 250, 200, 100))
+    );
+    assert_eq!(zoom_rect(&rect, 1.0, true), Some(rect.clone()));
+
+    assert_eq!(zoom_rect(&rect, 0.0, false), Some(rect.clone()));
+    assert_eq!(
+      zoom_rect(&rect, 0.5, false),
+      Some(Rect::from_xy(200, 250, 200, 100))
+    );
+    assert_eq!(zoom_rect(&rect, 1.0, false), None);
+  }
+
+  #[test]
+  fn workspace_fade_opacity_has_exact_incoming_and_outgoing_endpoints() {
+    assert_eq!(transition_opacity(200, 0.25, 0.0, true), 50);
+    assert_eq!(transition_opacity(200, 0.25, 1.0, true), 200);
+    assert_eq!(transition_opacity(200, 0.25, 0.0, false), 200);
+    assert_eq!(transition_opacity(200, 0.25, 1.0, false), 50);
   }
 }

@@ -24,8 +24,53 @@ use crate::{
   NativeSurrogate, Rect, SurrogateBatch,
 };
 
+/// Rendering policy for a surrogate session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+  /// Move/resize sessions may sample a gap color and recover a stale DWM
+  /// thumbnail by re-registering it.
+  MoveResize,
+  /// Open/close handoffs remain transparent and fail closed to the real
+  /// window instead of exposing a visible thumbnail re-registration gap.
+  OpenClose,
+}
+
+impl SessionKind {
+  const fn uses_sampled_gap_color(self) -> bool {
+    matches!(self, Self::MoveResize)
+  }
+
+  const fn allows_thumbnail_reregistration(self) -> bool {
+    matches!(self, Self::MoveResize)
+  }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn centered_thumbnail_rect(
+  width: i32,
+  height: i32,
+  progress: f32,
+) -> Option<RECT> {
+  let half_w = (width as f32 / 2.0 * progress).round() as i32;
+  let half_h = (height as f32 / 2.0 * progress).round() as i32;
+  if half_w <= 0 || half_h <= 0 {
+    return None;
+  }
+
+  let cx = width / 2;
+  let cy = height / 2;
+  Some(RECT {
+    left: cx - half_w,
+    top: cy - half_h,
+    right: cx + half_w,
+    bottom: cy + half_h,
+  })
+}
+
 /// Options for [`ResizeSession::begin`].
 pub struct SessionOptions {
+  /// Surrogate rendering and thumbnail-recovery policy.
+  pub kind: SessionKind,
   /// DWM thumbnail opacity (0–255) from the window-effects config.
   pub effect_opacity: u8,
   /// Precomputed backdrop color for the surrogate, bypassing the
@@ -80,6 +125,11 @@ pub struct ResizeSession {
   target_rect: Rect,
   /// Surrogate overlay; `None` if creation failed.
   surrogate: Option<NativeSurrogate>,
+  /// Rendering policy selected when the session was created.
+  kind: SessionKind,
+  /// Cleared when an open/close thumbnail update fails. Such sessions
+  /// must reveal the real window rather than re-register while visible.
+  thumbnail_healthy: bool,
   /// Invisible border insets (left, top, right, bottom) of the source
   /// window in physical pixels. Applied when converting physical rects
   /// to the logical (visible-content) rects that the surrogate is sized
@@ -229,7 +279,9 @@ impl ResizeSession {
     // sample costs two GPU→CPU `BitBlt` readbacks, which stack up when
     // a relayout begins many sessions in the same keypress. Falls back
     // to transparent (no backdrop) when sampling fails.
-    let edge_color = if options.blur_overlay.is_some() {
+    let edge_color = if !options.kind.uses_sampled_gap_color()
+      || options.blur_overlay.is_some()
+    {
       None
     } else {
       options.edge_color.or_else(|| {
@@ -272,6 +324,8 @@ impl ResizeSession {
       hwnd: hwnd.0,
       target_rect: target_rect.clone(),
       surrogate,
+      kind: options.kind,
+      thumbnail_healthy: true,
       border_inset,
       effect_opacity,
       edge_color,
@@ -385,7 +439,27 @@ impl ResizeSession {
   /// real window behind the surrogate or fall back to direct
   /// repositioning.
   pub fn has_surrogate(&self) -> bool {
-    self.surrogate.as_ref().map_or(false, |s| s.has_thumbnail())
+    self.thumbnail_healthy
+      && self.surrogate.as_ref().map_or(false, |s| s.has_thumbnail())
+  }
+
+  /// Whether this session is an open/close handoff rather than a
+  /// move/resize gap-covering session.
+  #[must_use]
+  pub fn is_open_close_handoff(&self) -> bool {
+    self.kind == SessionKind::OpenClose
+  }
+
+  /// Verifies that the registered thumbnail still accepts nonblocking
+  /// property updates. This never flushes DWM or re-registers a handoff
+  /// thumbnail.
+  pub fn probe_thumbnail(&mut self) -> bool {
+    let healthy = self
+      .surrogate
+      .as_ref()
+      .is_some_and(|surrogate| surrogate.set_thumbnail_visible(true));
+    self.thumbnail_healthy &= healthy;
+    self.thumbnail_healthy
   }
 
   /// Makes the surrogate visible.
@@ -404,7 +478,7 @@ impl ResizeSession {
   /// animation completion, softening the teardown swap.
   pub fn fade_overlay(&mut self, opacity: u8) {
     if let Some(ref mut surrogate) = self.surrogate {
-      surrogate.set_window_opacity(opacity);
+      self.thumbnail_healthy &= surrogate.set_window_opacity(opacity);
     }
   }
 
@@ -421,30 +495,22 @@ impl ResizeSession {
     let logical = to_logical(&self.target_rect, &self.border_inset);
     let w = logical.width();
     let h = logical.height();
-    let half_w = (w as f32 / 2.0 * progress).round() as i32;
-    let half_h = (h as f32 / 2.0 * progress).round() as i32;
-    if half_w <= 0 || half_h <= 0 {
+    let Some(destination) = centered_thumbnail_rect(w, h, progress) else {
       surrogate.set_visible(false);
-    } else {
-      let cx = w / 2;
-      let cy = h / 2;
-      surrogate.set_thumbnail_rects(
-        RECT {
-          left: 0,
-          top: 0,
-          right: w,
-          bottom: h,
-        },
-        RECT {
-          left: cx - half_w,
-          top: cy - half_h,
-          right: cx + half_w,
-          bottom: cy + half_h,
-        },
-      );
-      surrogate.set_visible(true);
-    }
-    surrogate.set_window_opacity(opacity);
+      self.thumbnail_healthy &= surrogate.set_window_opacity(opacity);
+      return;
+    };
+    self.thumbnail_healthy &= surrogate.set_thumbnail_rects(
+      RECT {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+      },
+      destination,
+    );
+    surrogate.set_visible(true);
+    self.thumbnail_healthy &= surrogate.set_window_opacity(opacity);
   }
 
   /// Hands the real (cloaked) window off to its final target rect
@@ -506,11 +572,12 @@ impl ResizeSession {
         // unregister → register window of `reregister_thumbnail` can
         // straddle a DWM composition, blanking the surrogate to
         // backdrop-only for a frame.
-        surrogate.update_thumbnail_dims(
+        self.thumbnail_healthy &= surrogate.update_thumbnail_dims(
           HWND(self.hwnd),
           safe_w,
           safe_h,
           self.border_inset,
+          self.kind.allows_thumbnail_reregistration(),
         );
       }
     }
@@ -575,11 +642,12 @@ impl ResizeSession {
       // so there is no need to unregister and re-register — only rcSource
       // and rcDestination need updating. Falls back to reregister
       // internally if the handle has gone stale.
-      surrogate.update_thumbnail_dims(
+      self.thumbnail_healthy &= surrogate.update_thumbnail_dims(
         HWND(self.hwnd),
         target_dims.0,
         target_dims.1,
         self.border_inset,
+        self.kind.allows_thumbnail_reregistration(),
       );
     }
   }
@@ -598,6 +666,7 @@ impl ResizeSession {
     self.current_rect = Some(logical.clone());
     if let Some(surrogate) = &mut self.surrogate {
       if let Err(err) = surrogate.update(&logical, opacity) {
+        self.thumbnail_healthy = false;
         tracing::warn!("Surrogate update failed: {err}.");
       }
     }
@@ -623,11 +692,12 @@ impl ResizeSession {
     // tick rather than falling back to `GetWindowRect`.
     if let Some((w, h)) = self.pending_thumbnail_dims.take() {
       if let Some(surrogate) = &mut self.surrogate {
-        surrogate.update_thumbnail_dims(
+        self.thumbnail_healthy &= surrogate.update_thumbnail_dims(
           HWND(self.hwnd),
           w,
           h,
           self.border_inset,
+          self.kind.allows_thumbnail_reregistration(),
         );
       }
     }
@@ -636,7 +706,7 @@ impl ResizeSession {
     self.current_rect = Some(logical.clone());
     if let Some(surrogate) = &mut self.surrogate {
       surrogate.defer_reposition(batch, &logical);
-      surrogate.set_window_opacity(opacity);
+      self.thumbnail_healthy &= surrogate.set_window_opacity(opacity);
     }
   }
 
@@ -678,7 +748,7 @@ impl ResizeSession {
     let constrained_w = vis_right - vis_left;
     let constrained_h = vis_bottom - vis_top;
 
-    surrogate.set_thumbnail_rects(
+    self.thumbnail_healthy &= surrogate.set_thumbnail_rects(
       RECT {
         left: src_left,
         top: src_top,
@@ -696,9 +766,10 @@ impl ResizeSession {
     let constrained =
       Rect::from_xy(vis_left, vis_top, constrained_w, constrained_h);
     if let Err(err) = surrogate.reposition(&constrained) {
+      self.thumbnail_healthy = false;
       tracing::warn!("Surrogate clipped update failed: {err}.");
     }
-    surrogate.set_window_opacity(opacity);
+    self.thumbnail_healthy &= surrogate.set_window_opacity(opacity);
     surrogate.set_visible(true);
     self.current_rect = Some(constrained);
   }
@@ -855,11 +926,12 @@ impl ResizeSession {
         let safe_w = logical.width().min(actual.width());
         let safe_h = logical.height().min(actual.height());
         if safe_w > 0 && safe_h > 0 {
-          surrogate.update_thumbnail_dims(
+          self.thumbnail_healthy &= surrogate.update_thumbnail_dims(
             HWND(self.hwnd),
             safe_w,
             safe_h,
             self.border_inset,
+            self.kind.allows_thumbnail_reregistration(),
           );
         }
       }
@@ -950,11 +1022,12 @@ impl ResizeSession {
     // `defer_update`).
     if let Some((w, h)) = self.pending_thumbnail_dims.take() {
       if let Some(surrogate) = &mut self.surrogate {
-        surrogate.update_thumbnail_dims(
+        self.thumbnail_healthy &= surrogate.update_thumbnail_dims(
           HWND(self.hwnd),
           w,
           h,
           self.border_inset,
+          self.kind.allows_thumbnail_reregistration(),
         );
       }
     }
@@ -970,11 +1043,12 @@ impl ResizeSession {
       // Single-call update rather than a full re-registration, which
       // can blank the surrogate for a composition frame.
       if surrogate.content_size() != (logical.width(), logical.height()) {
-        surrogate.update_thumbnail_dims(
+        self.thumbnail_healthy &= surrogate.update_thumbnail_dims(
           HWND(self.hwnd),
           logical.width(),
           logical.height(),
           self.border_inset,
+          self.kind.allows_thumbnail_reregistration(),
         );
       }
       if let Err(err) = surrogate.update(&logical, self.effect_opacity) {
@@ -1219,5 +1293,41 @@ pub(crate) fn compute_border_inset(hwnd: HWND) -> RECT {
     }
   } else {
     RECT::default()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{centered_thumbnail_rect, SessionKind};
+
+  #[test]
+  fn move_resize_keeps_sampled_gap_and_reregistration() {
+    assert!(SessionKind::MoveResize.uses_sampled_gap_color());
+    assert!(SessionKind::MoveResize.allows_thumbnail_reregistration());
+  }
+
+  #[test]
+  fn open_close_is_transparent_and_never_reregisters() {
+    assert!(!SessionKind::OpenClose.uses_sampled_gap_color());
+    assert!(!SessionKind::OpenClose.allows_thumbnail_reregistration());
+  }
+
+  #[test]
+  fn zoom_thumbnail_scales_about_its_center() {
+    assert!(centered_thumbnail_rect(100, 80, 0.0).is_none());
+
+    let half = centered_thumbnail_rect(100, 80, 0.5)
+      .expect("half-scale zoom should be visible");
+    assert_eq!(
+      (half.left, half.top, half.right, half.bottom),
+      (25, 20, 75, 60)
+    );
+
+    let full = centered_thumbnail_rect(100, 80, 1.0)
+      .expect("full-scale zoom should be visible");
+    assert_eq!(
+      (full.left, full.top, full.right, full.bottom),
+      (0, 0, 100, 80)
+    );
   }
 }

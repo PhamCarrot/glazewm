@@ -20,6 +20,10 @@ impl IpcClient {
   pub async fn connect() -> anyhow::Result<Self> {
     let server_addr = format!("ws://127.0.0.1:{DEFAULT_IPC_PORT}");
 
+    Self::connect_to(server_addr).await
+  }
+
+  async fn connect_to(server_addr: String) -> anyhow::Result<Self> {
     let (stream, _) = connect_async(server_addr)
       .await
       .context("Failed to connect to IPC server.")?;
@@ -36,6 +40,16 @@ impl IpcClient {
       .context("Failed to send command.")?;
 
     Ok(())
+  }
+
+  /// Sends and flushes a WebSocket close frame.
+  ///
+  /// Closing is best-effort because a successful command such as `wm-exit`
+  /// can shut down the server before the client finishes its handshake. A
+  /// late close failure must not turn an already-successful command into
+  /// an error.
+  pub async fn close(&mut self) {
+    let _ = SinkExt::close(&mut self.stream).await;
   }
 
   /// Waits and returns the next reply from the IPC server.
@@ -81,5 +95,51 @@ impl IpcClient {
     }
 
     None
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use futures_util::StreamExt;
+  use tokio::net::TcpListener;
+  use tokio_tungstenite::accept_async;
+
+  use super::IpcClient;
+
+  #[tokio::test]
+  async fn graceful_close_sends_a_websocket_close_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+      .await
+      .expect("test listener should bind");
+    let address = listener
+      .local_addr()
+      .expect("test listener should have an address");
+
+    let server = tokio::spawn(async move {
+      let (stream, _) = listener
+        .accept()
+        .await
+        .expect("test server should accept the client");
+      let mut websocket = accept_async(stream)
+        .await
+        .expect("test WebSocket handshake should succeed");
+
+      websocket
+        .next()
+        .await
+        .expect("client should send a frame")
+        .expect("close frame should be valid")
+        .is_close()
+    });
+
+    let mut client = IpcClient::connect_to(format!("ws://{address}"))
+      .await
+      .expect("test client should connect");
+    client.close().await;
+
+    assert!(
+      server.await.expect("test server task should finish"),
+      "client must close with a WebSocket close frame"
+    );
   }
 }

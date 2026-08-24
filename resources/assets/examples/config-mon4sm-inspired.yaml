@@ -1,0 +1,93 @@
+# Mon4sm-inspired GlazeWM profile.
+# Hyprland's nominal animation speeds are mapped to milliseconds while
+# preserving the source curves where this build has an equivalent effect.
+animations:
+  window_move:
+    enabled: true
+    duration_ms: 479
+    easing: "cubic_bezier(0.23, 1.0, 0.32, 1.0)"
+    threshold_px: 10
+  window_resize:
+    enabled: true
+    duration_ms: 479
+    easing: "cubic_bezier(0.23, 1.0, 0.32, 1.0)"
+    threshold_px: 10
+  focus_change:
+    enabled: true
+    duration_ms: 170
+    easing: "ease_out_quint"
+  window_open:
+    enabled: true
+    duration_ms: 410
+    easing: "cubic_bezier(0.23, 1.0, 0.32, 1.0)"
+    style: "zoom"
+    opacity_from: 0.87
+  window_close:
+    enabled: true
+    duration_ms: 149
+    easing: "linear"
+    style: "zoom"
+    opacity_to: 0.0
+  workspace_switch:
+    enabled: true
+    duration_ms: 300
+    easing: "cubic_bezier(0.23, 1.0, 0.32, 1.0)"
+    style: "slide"
+    direction: "horizontal"
+    opacity_outgoing: 1.0
+    opacity_incoming: 1.0
+    zoom_factor: 0.0
+
+gaps:
+  scale_with_dpi: true
+  inner_gap: "3px"
+  outer_gap:
+    top: "5px"
+    right: "5px"
+    bottom: "5px"
+    left: "5px"
+
+window_effects:
+  focused_window:
+    border:
+      enabled: true
+      color: "#89b4fa"
+    corner_style:
+      enabled: true
+      style: "rounded"
+    transparency:
+      enabled: true
+      opacity: "100%"
+  other_windows:
+    border:
+      enabled: true
+      color: "#45475a"
+    corner_style:
+      enabled: true
+      style: "rounded"
+    transparency:
+      enabled: true
+      opacity: "97%"
+
+workspaces:
+  - name: "1"
+  - name: "2"
+  - name: "3"
+
+keybindings:
+  - commands: ["shell-exec wt"]
+    bindings: ["alt+enter"]
+  - commands: ["close"]
+    bindings: ["alt+shift+q"]
+  - commands: ["focus --workspace 1"]
+    bindings: ["alt+1"]
+  - commands: ["focus --workspace 2"]
+    bindings: ["alt+2"]
+  - commands: ["focus --workspace 3"]
+    bindings: ["alt+3"]
+  - commands: ["move --workspace 1", "focus --workspace 1"]
+    bindings: ["alt+shift+1"]
+  - commands: ["move --workspace 2", "focus --workspace 2"]
+    bindings: ["alt+shift+2"]
+  - commands: ["move --workspace 3", "focus --workspace 3"]
+    bindings: ["alt+shift+3"]

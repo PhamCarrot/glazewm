@@ -46,7 +46,9 @@ pub fn reload_config(
     && config.value.general.hide_method == HideMethod::Cloak
   {
     for window in state.windows() {
-      let _ = window.native().show();
+      if let Err(err) = window.native().show() {
+        warn!("Failed to show window after hide-method reload: {err:?}");
+      }
     }
   }
 
@@ -58,7 +60,11 @@ pub fn reload_config(
     && config.value.general.show_all_in_taskbar
   {
     for window in state.windows() {
-      let _ = window.native().set_taskbar_visibility(true);
+      if let Err(err) = window.native().set_taskbar_visibility(true) {
+        warn!(
+          "Failed to restore taskbar visibility after config reload: {err:?}"
+        );
+      }
     }
   }
 
