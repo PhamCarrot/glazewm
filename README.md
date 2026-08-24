@@ -13,7 +13,7 @@ Built from and credited to [florensm's DComp branch](https://github.com/florensm
 - Safer animation fallbacks, synchronized focus, bounded IPC, and watcher recovery.
 - Optional signed UIAccess packaging for managing elevated applications.
 
-See [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) for every config option and [ANIMATION_REFERENCE.md](ANIMATION_REFERENCE.md) for easing and animation details. A complete starting config is included at `resources/assets/sample-config.yaml`.
+See [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) for every config option and [ANIMATION_REFERENCE.md](ANIMATION_REFERENCE.md) for easing and animation details.
 
 ## Personal Windows package
 
