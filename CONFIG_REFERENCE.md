@@ -429,38 +429,6 @@ glazewm.exe start --config C:\path\to\config-mon4sm-inspired.yaml
 
 Do not replace your real config without keeping your own backup. Both examples use `shell-exec wt` for the terminal binding; change `wt` if you use another terminal.
 
-### Mon4sm-inspired profile
-
-Source: <https://github.com/Mon4sm/monasm-dots/blob/main/.config/hypr/hyprland.conf>
-
-The profile preserves the source's actual custom curves and nominal timing conversion:
-
-| Hyprland source behavior | GlazeWM mapping |
-|---|---|
-| Windows, speed `4.79`, `0.23,1,0.32,1` | Move/resize `479ms`, same cubic Bézier |
-| Windows-in, speed `4.1`, `popin 87%` | Open `410ms`, `zoom`; GlazeWM has no configurable 87% start scale |
-| Windows-out, speed `1.49`, linear, `popin 87%` | Close `149ms`, `linear`, `zoom` |
-| Workspaces, speed `3`, same ease-out curve, slide | Workspace slide `300ms`, same curve |
-| Active opacity `1`, inactive opacity `0.97` | Focused/non-focused transparency `1.0`/`0.97` with a `170ms` focus fade |
-| Gaps `3`/`5`, rounded corners, blue active border | Equivalent gaps, Windows rounded corners, and RGBA border colors |
-
-Hyprland shadow range, blur pass count, layer-shell animation channels, workspace gestures, and scratchpads have no direct equivalent in this build. Acrylic is only an approximation of the source's compositor blur.
-
-### maxhu08-inspired profile
-
-Source: <https://github.com/maxhu08/dotfiles/blob/master/hypr/.config/hypr/conf/appearance.lua>
-
-| Hyprland source behavior | GlazeWM mapping |
-|---|---|
-| Windows, speed `7`, `0.05,0.9,0.1,1.05` | Move/resize/open `700ms`, same mild-overshoot cubic Bézier |
-| Windows-out, speed `7`, default curve, `popin 80%` | Close `700ms`, `ease_in_out`, `zoom`; exact Hyprland inherited default and 80% scale are unavailable |
-| Fade, speed `7`, default curve | Focus-opacity transition `700ms`, `ease_in_out` |
-| Workspaces, speed `6`, custom overshoot | Workspace slide `600ms`, same custom Bézier |
-| Gaps `5`/`10`, rounded corners, blue gradient border | Equivalent gaps and corners; gradient is reduced to one focused border color |
-| Blur size `3`, passes `6` | Acrylic with stronger `blur_amount`; GlazeWM exposes intensity, not pass count |
-
-This second profile intentionally feels slower and more elastic than the Mon4sm profile. If `700ms` feels heavy on Windows, reduce move/resize/open/close together to `350..500ms` while retaining the curve.
-
 ## IPC and commands
 
 ### Where command strings work
