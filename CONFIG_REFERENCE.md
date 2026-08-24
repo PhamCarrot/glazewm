@@ -2,13 +2,6 @@
 
 This is the complete user-facing reference for the configuration accepted by **this build**. It covers every top-level YAML section, every child key, accepted values, source defaults, hard limits, commands usable from configuration, and the custom DComp animation, multi-layout, and stack features. It was checked against `packages/wm-common/src/parsed_config.rs`, `packages/wm-common/src/app_command.rs`, the primitive parsers in `packages/wm-platform/src/models`, command handlers in `packages/wm/src`, and `resources/assets/sample-config.yaml`.
 
-Two complete Linux-rice-inspired examples are provided separately:
-
-- `resources/assets/examples/config-mon4sm-inspired.yaml`
-- `resources/assets/examples/config-maxhu08-inspired.yaml`
-
-They are GlazeWM configurations, not Hyprland files. Each translates only behavior this Windows build can represent and documents every approximation inline.
-
 All YAML keys are `snake_case`. Sections and fields omitted from YAML use their source defaults unless a required list item field is noted. Commands in YAML are strings without the leading `glazewm command`; from a terminal use `glazewm.exe command <command>`. Direction values are `left`, `right`, `up`, or `down`.
 
 ## Value syntax used throughout
