@@ -2,6 +2,8 @@
 
 A personal Windows fork of [GlazeWM](https://github.com/glzr-io/glazewm) focused on smooth animations, flexible layouts, and reliable window handling.
 
+Built from and credited to [florensm's DComp branch](https://github.com/florensm/glazewm/tree/personal/dcomp) and [layout architecture branch](https://github.com/florensm/glazewm/tree/feat/layout-architecture).
+
 ## Features
 
 - Smooth move, resize, open, close, focus, and workspace animations.
