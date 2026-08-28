@@ -2,13 +2,22 @@ use std::{
   collections::{HashMap, HashSet},
   time::Instant,
 };
+#[cfg(target_os = "windows")]
+use std::{
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+  },
+  time::Duration,
+};
 
 use anyhow::Context;
 use tokio::sync::mpsc::{self};
 use tracing::warn;
 use uuid::Uuid;
 use wm_common::{
-  BindingModeConfig, HideCorner, WindowState, WmEvent, WorkspaceLayout,
+  BindingModeConfig, DisplayState, HideCorner, WindowState, WmEvent,
+  WorkspaceLayout,
 };
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect, WindowId,
@@ -36,6 +45,184 @@ use crate::{
   user_config::UserConfig,
 };
 
+/// One bounded incompatible workspace destination being prepared beneath
+/// retained surrogate coverage.
+///
+/// Logical focus/display state and IPC remain on `public_origin_name`
+/// until the destination's real windows have completed a successful native
+/// redraw. A later command replaces `destination_name`; relative targets
+/// resolve from that absolute name as their virtual base.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingWorkspaceRedirect {
+  pub public_origin_name: String,
+  pub destination_name: String,
+  pub order_direction: i32,
+}
+
+#[cfg(target_os = "windows")]
+const EARLY_CLOAK_TIMEOUT_MS: u64 = 250;
+
+/// Owns one early DWM cloak until platform synchronization has either
+/// transferred visibility to an animation/native hide operation or
+/// restored the real HWND visibly.
+///
+/// The lease remains in [`WmState`] after classification so a later
+/// fallible platform-sync operation cannot strand the HWND. Its timeout is
+/// independent of the WM event loop and uses one idempotent atomic release
+/// path.
+#[cfg(target_os = "windows")]
+pub(crate) struct VisibilityLease {
+  expected_window_id: WindowId,
+  active: Arc<AtomicBool>,
+  restore: Arc<dyn Fn() + Send + Sync>,
+  fallback_rect: Arc<Mutex<Option<Rect>>>,
+}
+
+#[cfg(target_os = "windows")]
+impl VisibilityLease {
+  pub(crate) fn arm(native_window: &NativeWindow) -> Option<Self> {
+    if let Err(err) = native_window.set_cloaked(true) {
+      warn!(
+        "Failed to early-cloak window {:?}; continuing visibly: {err:#}",
+        native_window.id(),
+      );
+      return None;
+    }
+
+    let fallback_rect = Arc::new(Mutex::new(None));
+    let restore_rect = Arc::clone(&fallback_rect);
+    let window_to_restore = native_window.clone();
+    let expected_window_id = native_window.id();
+    let restore: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+      if !window_to_restore.is_valid() {
+        return;
+      }
+
+      let target_rect = restore_rect
+        .lock()
+        .ok()
+        .and_then(|rect| rect.as_ref().cloned());
+      if let Some(target_rect) = target_rect {
+        if let Err(err) = window_to_restore.set_frame(&target_rect) {
+          warn!(
+            "Failed to place early-cloaked window {expected_window_id:?} at its safe fallback rect: {err:#}"
+          );
+        }
+      }
+      if let Err(err) = window_to_restore
+        .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      {
+        warn!(
+          "Failed to restore opaque visibility for early-cloaked window {expected_window_id:?}: {err:#}"
+        );
+      }
+      if let Err(err) = window_to_restore.set_cloaked(false) {
+        warn!(
+          "Failed to uncloak early-cloaked window {expected_window_id:?}: {err:#}"
+        );
+      }
+      if let Err(err) = window_to_restore.show() {
+        warn!(
+          "Failed to show early-cloaked window {expected_window_id:?}: {err:#}"
+        );
+      }
+    });
+
+    Some(Self::with_timeout(
+      expected_window_id,
+      restore,
+      fallback_rect,
+      Duration::from_millis(EARLY_CLOAK_TIMEOUT_MS),
+    ))
+  }
+
+  fn with_timeout(
+    expected_window_id: WindowId,
+    restore: Arc<dyn Fn() + Send + Sync>,
+    fallback_rect: Arc<Mutex<Option<Rect>>>,
+    timeout: Duration,
+  ) -> Self {
+    let active = Arc::new(AtomicBool::new(true));
+    let timeout_active = Arc::clone(&active);
+    let timeout_restore = Arc::clone(&restore);
+
+    tokio::spawn(async move {
+      tokio::time::sleep(timeout).await;
+      if Self::release_shared(&timeout_active, &timeout_restore) {
+        warn!(
+          "Early visibility handoff timed out for window {expected_window_id:?}; restored the real HWND visibly."
+        );
+      }
+    });
+
+    Self {
+      expected_window_id,
+      active,
+      restore,
+      fallback_rect,
+    }
+  }
+
+  #[cfg(test)]
+  pub(crate) fn for_test(
+    expected_window_id: WindowId,
+    restore: Arc<dyn Fn() + Send + Sync>,
+    timeout: Duration,
+  ) -> Self {
+    Self::with_timeout(
+      expected_window_id,
+      restore,
+      Arc::new(Mutex::new(None)),
+      timeout,
+    )
+  }
+
+  pub(crate) fn release_shared(
+    active: &AtomicBool,
+    restore: &Arc<dyn Fn() + Send + Sync>,
+  ) -> bool {
+    if active.swap(false, Ordering::AcqRel) {
+      restore();
+      true
+    } else {
+      false
+    }
+  }
+
+  pub(crate) fn expected_window_id(&self) -> WindowId {
+    self.expected_window_id
+  }
+
+  fn is_active(&self) -> bool {
+    self.active.load(Ordering::Acquire)
+  }
+
+  fn set_fallback_rect(&self, rect: Rect) {
+    if let Ok(mut fallback_rect) = self.fallback_rect.lock() {
+      *fallback_rect = Some(rect);
+    }
+  }
+
+  fn restore(self) {
+    Self::release_shared(&self.active, &self.restore);
+  }
+
+  pub(crate) fn transfer(self) {
+    self.active.store(false, Ordering::Release);
+  }
+
+  fn cancel_destroyed(self) {
+    self.active.store(false, Ordering::Release);
+  }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for VisibilityLease {
+  fn drop(&mut self) {
+    Self::release_shared(&self.active, &self.restore);
+  }
+}
+
 pub struct WmState {
   /// Root node of the container tree. Monitors are the children of the
   /// root node, followed by workspaces, then split containers/windows.
@@ -57,6 +244,10 @@ pub struct WmState {
   /// Used for the `general.toggle_workspace_on_refocus` option on
   /// workspace focus.
   pub recent_workspace_name: Option<String>,
+
+  /// Latest absolute real-workspace underlay requested while incompatible
+  /// workspace coverage is still retained. Bounded to exactly one entry.
+  pub pending_workspace_redirect: Option<PendingWorkspaceRedirect>,
 
   /// Last selected layout for workspaces that may be deactivated and
   /// later recreated during this WM session.
@@ -87,11 +278,21 @@ pub struct WmState {
   /// from spawning multiple retry chains.
   pub pending_window_manage_retries: HashSet<WindowId>,
 
+  /// Early-cloaked managed windows whose visibility handoff has not yet
+  /// completed. Bounded by the number of concurrently classifying windows
+  /// and drained after the corresponding platform-sync pass.
+  #[cfg(target_os = "windows")]
+  pending_visibility_leases: HashMap<Uuid, VisibilityLease>,
+
   /// Sender for delayed native-window manageability retries.
   pub window_manage_retry_tx: mpsc::UnboundedSender<(NativeWindow, u8)>,
 
   /// Whether the WM is paused.
   pub is_paused: bool,
+
+  /// Guards the transactional core of a config reload from recursive
+  /// reload commands in window rules or post-commit hooks.
+  pub is_reloading_config: bool,
 
   /// Whether the OS focused window is the same as the WM focused window.
   pub is_focus_synced: bool,
@@ -146,6 +347,11 @@ pub struct WmState {
 }
 
 impl WmState {
+  #[cfg(test)]
+  pub(crate) fn mark_initialized_for_test(&mut self) {
+    self.has_initialized = true;
+  }
+
   pub fn new(
     dispatcher: Dispatcher,
     event_tx: mpsc::UnboundedSender<WmEvent>,
@@ -165,12 +371,16 @@ impl WmState {
       blur_overlays: HashMap::new(),
       prev_effects_window: None,
       recent_workspace_name: None,
+      pending_workspace_redirect: None,
       unmanaged_or_minimized_timestamp: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       pending_window_manage_retries: HashSet::new(),
+      #[cfg(target_os = "windows")]
+      pending_visibility_leases: HashMap::new(),
       window_manage_retry_tx,
       is_paused: false,
+      is_reloading_config: false,
       is_focus_synced: false,
       #[cfg(target_os = "windows")]
       pending_post_switch_cursor_refresh: None,
@@ -183,6 +393,203 @@ impl WmState {
       #[cfg(target_os = "windows")]
       tab_bars: HashMap::new(),
     }
+  }
+
+  /// Keeps an early cloak owned by WM state until the complete native
+  /// synchronization pass establishes a replacement visibility owner.
+  #[cfg(target_os = "windows")]
+  pub(crate) fn register_visibility_lease(
+    &mut self,
+    window_id: Uuid,
+    lease: VisibilityLease,
+  ) {
+    let current_window = self
+      .container_by_id(window_id)
+      .and_then(|container| container.as_window_container().ok());
+    let Some(current_window) = current_window else {
+      lease.restore();
+      return;
+    };
+
+    if current_window.native().id() != lease.expected_window_id() {
+      warn!(
+        "Refused stale early-cloak ownership for window {window_id}; the managed HWND no longer matches {:?}.",
+        lease.expected_window_id()
+      );
+      lease.cancel_destroyed();
+      return;
+    }
+
+    if let Some(target_rect) = self
+      .window_target_positions
+      .get(&window_id)
+      .cloned()
+      .or_else(|| current_window.to_rect().ok())
+    {
+      lease.set_fallback_rect(target_rect);
+    }
+
+    if let Some(replaced) =
+      self.pending_visibility_leases.insert(window_id, lease)
+    {
+      warn!(
+        "Replaced duplicate early visibility lease for window {window_id}; restored the older owner visibly."
+      );
+      replaced.restore();
+    }
+  }
+
+  /// Settles every early visibility lease after a platform-sync attempt.
+  ///
+  /// An incomplete deferred sync retains active leases. A failed sync
+  /// restores every live matching HWND. A complete successful sync
+  /// transfers ownership only when the native/animation path
+  /// demonstrably owns the window's current visibility; otherwise it
+  /// takes the visible fallback.
+  #[cfg(target_os = "windows")]
+  pub(crate) fn settle_visibility_leases(
+    &mut self,
+    sync_succeeded: bool,
+    sync_complete: bool,
+  ) {
+    let leases = std::mem::take(&mut self.pending_visibility_leases);
+
+    for (window_id, lease) in leases {
+      if !lease.is_active() {
+        continue;
+      }
+
+      let current_window = self
+        .container_by_id(window_id)
+        .and_then(|container| container.as_window_container().ok());
+      let Some(current_window) = current_window else {
+        lease.cancel_destroyed();
+        continue;
+      };
+      if current_window.native().id() != lease.expected_window_id() {
+        warn!(
+          "Canceled stale early visibility lease for window {window_id}; its HWND identity changed before handoff."
+        );
+        lease.cancel_destroyed();
+        continue;
+      }
+
+      if !sync_succeeded {
+        warn!(
+          "Restoring early-cloaked window {window_id} after platform synchronization failed."
+        );
+        lease.restore();
+        continue;
+      }
+      if !sync_complete {
+        self.pending_visibility_leases.insert(window_id, lease);
+        continue;
+      }
+
+      let is_logically_visible = matches!(
+        current_window.display_state(),
+        DisplayState::Showing | DisplayState::Shown
+      );
+      let surrogate_owns_visibility =
+        self.animation_manager.has_active_surrogate(&window_id);
+      let real_window_is_uncloaked = if is_logically_visible
+        && !surrogate_owns_visibility
+      {
+        match current_window.native().is_cloaked() {
+          Ok(is_cloaked) => !is_cloaked,
+          Err(err) => {
+            warn!(
+              "Failed to verify early visibility handoff for window {window_id}: {err:#}; using visible fallback."
+            );
+            false
+          }
+        }
+      } else {
+        false
+      };
+
+      if !is_logically_visible
+        || surrogate_owns_visibility
+        || real_window_is_uncloaked
+      {
+        lease.transfer();
+      } else {
+        warn!(
+          "Platform synchronization completed without a visibility owner for early-cloaked window {window_id}; using visible fallback."
+        );
+        lease.restore();
+      }
+    }
+  }
+
+  /// Cancels an early visibility owner for a destroyed logical window
+  /// without touching a potentially recycled numeric HWND.
+  #[cfg(target_os = "windows")]
+  pub(crate) fn cancel_visibility_lease(
+    &mut self,
+    window_id: Uuid,
+    expected_handle: isize,
+  ) -> bool {
+    let matches_expected =
+      self.pending_visibility_leases.get(&window_id).is_some_and(
+        |lease| lease.expected_window_id().0 == expected_handle,
+      );
+    if !matches_expected {
+      return false;
+    }
+
+    if let Some(lease) = self.pending_visibility_leases.remove(&window_id)
+    {
+      lease.cancel_destroyed();
+      return true;
+    }
+    false
+  }
+
+  /// Restores a live matching window before it is intentionally unmanaged.
+  #[cfg(target_os = "windows")]
+  pub(crate) fn restore_visibility_lease(
+    &mut self,
+    window_id: Uuid,
+    expected_handle: isize,
+  ) -> bool {
+    let matches_expected =
+      self.pending_visibility_leases.get(&window_id).is_some_and(
+        |lease| lease.expected_window_id().0 == expected_handle,
+      );
+    if !matches_expected {
+      return false;
+    }
+
+    if let Some(lease) = self.pending_visibility_leases.remove(&window_id)
+    {
+      lease.restore();
+      return true;
+    }
+    false
+  }
+
+  /// Cancels any pre-management lease matching a destroyed native HWND.
+  #[cfg(target_os = "windows")]
+  pub(crate) fn cancel_visibility_lease_for_native(
+    &mut self,
+    native_window_id: WindowId,
+  ) -> bool {
+    let matching_id =
+      self
+        .pending_visibility_leases
+        .iter()
+        .find_map(|(id, lease)| {
+          (lease.expected_window_id() == native_window_id).then_some(*id)
+        });
+    matching_id.is_some_and(|id| {
+      self.cancel_visibility_lease(id, native_window_id.0)
+    })
+  }
+
+  #[cfg(all(test, target_os = "windows"))]
+  pub(crate) fn pending_visibility_lease_count(&self) -> usize {
+    self.pending_visibility_leases.len()
   }
 
   /// Populates the initial WM state by creating containers for all
@@ -768,6 +1175,13 @@ impl WmState {
 
 impl Drop for WmState {
   fn drop(&mut self) {
+    // Restore any early-cloaked HWND before tearing down animation/native
+    // state. The lease release is idempotent with its independent timeout.
+    #[cfg(target_os = "windows")]
+    for (_, lease) in self.pending_visibility_leases.drain() {
+      lease.restore();
+    }
+
     // Commit all active resize sessions before cleaning up windows so that
     // surrogate overlays are destroyed and windows are moved to their
     // target positions. This prevents invisible or mispositioned
@@ -820,5 +1234,275 @@ impl Drop for WmState {
         }
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod workspace_identity_tests {
+  use tokio::sync::mpsc;
+  use wm_common::{ParsedConfig, WorkspaceConfig};
+  use wm_platform::{Direction, Dispatcher, Rect};
+
+  use super::WmState;
+  use crate::{
+    commands::container::attach_container,
+    models::{Monitor, Workspace, WorkspaceTarget},
+    traits::CommonGetters,
+    user_config::UserConfig,
+  };
+
+  fn workspace_config(name: &str) -> WorkspaceConfig {
+    WorkspaceConfig {
+      name: name.to_string(),
+      display_name: None,
+      bind_to_monitor: None,
+      keep_alive: false,
+      default_layout: None,
+    }
+  }
+
+  fn test_state() -> (WmState, UserConfig, Workspace, Workspace, Workspace)
+  {
+    let (event_tx, _) = mpsc::unbounded_channel();
+    let (exit_tx, _) = mpsc::unbounded_channel();
+    let (animation_tick_tx, _) = mpsc::channel(1);
+    let (window_manage_retry_tx, _) = mpsc::unbounded_channel();
+    let (tab_click_tx, _) = mpsc::unbounded_channel();
+    let state = WmState::new(
+      Dispatcher::mock(),
+      event_tx,
+      exit_tx,
+      animation_tick_tx,
+      window_manage_retry_tx,
+      tab_click_tx,
+    );
+
+    let dev = Workspace::mock().name("Dev".to_string()).call();
+    let lower_dev = Workspace::mock().name("dev".to_string()).call();
+    let third = Workspace::mock().name("Third".to_string()).call();
+    let left_monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1_600, 900))
+      .workspaces(vec![dev.clone(), lower_dev.clone()])
+      .call();
+    let right_monitor = Monitor::mock()
+      .bounds(Rect::from_xy(1_600, 0, 1_600, 900))
+      .workspaces(vec![third.clone()])
+      .call();
+
+    for monitor in [left_monitor, right_monitor] {
+      attach_container(
+        &monitor.into(),
+        &state.root_container.clone().into(),
+        None,
+      )
+      .expect("test monitor should attach");
+    }
+
+    let mut parsed = ParsedConfig::default();
+    parsed.workspaces = ["Dev", "dev", "Third"]
+      .into_iter()
+      .map(workspace_config)
+      .collect();
+    let config = UserConfig::for_test(parsed);
+
+    (state, config, dev, lower_dev, third)
+  }
+
+  #[test]
+  fn direct_recent_relative_and_directional_targets_use_exact_identity() {
+    let (mut state, config, dev, lower_dev, third) = test_state();
+
+    let (name, direct) = state
+      .workspace_by_target(
+        &dev,
+        WorkspaceTarget::Name("dev".to_string()),
+        &config,
+      )
+      .expect("direct target should resolve");
+    assert_eq!(name.as_deref(), Some("dev"));
+    assert_eq!(
+      direct.expect("lowercase target should exist").id(),
+      lower_dev.id()
+    );
+
+    state.recent_workspace_name = Some("dev".to_string());
+    let (name, recent) = state
+      .workspace_by_target(&dev, WorkspaceTarget::Recent, &config)
+      .expect("recent target should resolve");
+    assert_eq!(name.as_deref(), Some("dev"));
+    assert_eq!(
+      recent.expect("recent target should exist").id(),
+      lower_dev.id()
+    );
+
+    let (name, next) = state
+      .workspace_by_target(&lower_dev, WorkspaceTarget::Next, &config)
+      .expect("next target should resolve from exact config identity");
+    assert_eq!(name.as_deref(), Some("Third"));
+    assert_eq!(
+      next.expect("next target should be active").id(),
+      third.id()
+    );
+
+    let (name, previous) = state
+      .workspace_by_target(&dev, WorkspaceTarget::Previous, &config)
+      .expect("previous target should wrap from exact config identity");
+    assert_eq!(name.as_deref(), Some("Third"));
+    assert_eq!(
+      previous.expect("previous target should be active").id(),
+      third.id()
+    );
+
+    let (name, directional) = state
+      .workspace_by_target(
+        &dev,
+        WorkspaceTarget::Direction(Direction::Right),
+        &config,
+      )
+      .expect("directional target should resolve");
+    assert_eq!(name.as_deref(), Some("Third"));
+    assert_eq!(
+      directional
+        .expect("right monitor should have a workspace")
+        .id(),
+      third.id()
+    );
+  }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod visibility_lease_tests {
+  use std::{
+    sync::{
+      atomic::{AtomicUsize, Ordering},
+      Arc,
+    },
+    time::Duration,
+  };
+
+  use tokio::sync::mpsc;
+  use wm_common::DisplayState;
+  use wm_platform::{
+    Dispatcher, NativeWindow, NativeWindowWindowsExt, WindowId,
+  };
+
+  use super::{VisibilityLease, WmState};
+  use crate::{
+    commands::container::attach_container,
+    models::{Monitor, TilingWindow, Workspace},
+    traits::{CommonGetters, WindowGetters},
+  };
+
+  fn test_state_with_window(handle: isize) -> (WmState, TilingWindow) {
+    let (event_tx, _) = mpsc::unbounded_channel();
+    let (exit_tx, _) = mpsc::unbounded_channel();
+    let (animation_tick_tx, _) = mpsc::channel(1);
+    let (window_manage_retry_tx, _) = mpsc::unbounded_channel();
+    let (tab_click_tx, _) = mpsc::unbounded_channel();
+    let state = WmState::new(
+      Dispatcher::mock(),
+      event_tx,
+      exit_tx,
+      animation_tick_tx,
+      window_manage_retry_tx,
+      tab_click_tx,
+    );
+    let window = TilingWindow::mock()
+      .native(NativeWindow::from_handle(handle))
+      .call();
+    let workspace = Workspace::mock()
+      .tiling_containers(vec![window.clone().into()])
+      .call();
+    let monitor = Monitor::mock().workspaces(vec![workspace]).call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    (state, window)
+  }
+
+  fn test_lease(
+    handle: isize,
+    calls: &Arc<AtomicUsize>,
+  ) -> VisibilityLease {
+    let calls = Arc::clone(calls);
+    VisibilityLease::for_test(
+      WindowId(handle),
+      Arc::new(move || {
+        calls.fetch_add(1, Ordering::AcqRel);
+      }),
+      Duration::from_secs(60),
+    )
+  }
+
+  #[tokio::test]
+  async fn failed_platform_sync_restores_and_drains_visibility_owner() {
+    let (mut state, window) = test_state_with_window(42);
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.register_visibility_lease(window.id(), test_lease(42, &calls));
+
+    state.settle_visibility_leases(false, false);
+
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(state.pending_visibility_lease_count(), 0);
+  }
+
+  #[tokio::test]
+  async fn deferred_platform_sync_retains_one_bounded_visibility_owner() {
+    let (mut state, window) = test_state_with_window(43);
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.register_visibility_lease(window.id(), test_lease(43, &calls));
+
+    for _ in 0..128 {
+      state.settle_visibility_leases(true, false);
+      assert_eq!(state.pending_visibility_lease_count(), 1);
+    }
+
+    state.settle_visibility_leases(false, false);
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(state.pending_visibility_lease_count(), 0);
+  }
+
+  #[tokio::test]
+  async fn hidden_native_handoff_transfers_without_visible_restore() {
+    let (mut state, window) = test_state_with_window(44);
+    window.set_display_state(DisplayState::Hidden);
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.register_visibility_lease(window.id(), test_lease(44, &calls));
+
+    state.settle_visibility_leases(true, true);
+
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.pending_visibility_lease_count(), 0);
+  }
+
+  #[tokio::test]
+  async fn destroyed_hwnd_cancels_only_its_matching_visibility_owner() {
+    let (mut state, window) = test_state_with_window(45);
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.register_visibility_lease(window.id(), test_lease(45, &calls));
+
+    assert!(!state.cancel_visibility_lease(window.id(), 999));
+    assert_eq!(state.pending_visibility_lease_count(), 1);
+    assert!(state.cancel_visibility_lease_for_native(WindowId(45)));
+
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.pending_visibility_lease_count(), 0);
+  }
+
+  #[tokio::test]
+  async fn repeated_failed_handoffs_never_accumulate_visibility_owners() {
+    let (mut state, window) = test_state_with_window(46);
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..128 {
+      state.register_visibility_lease(window.id(), test_lease(46, &calls));
+      state.settle_visibility_leases(false, false);
+      assert_eq!(state.pending_visibility_lease_count(), 0);
+    }
+
+    assert_eq!(calls.load(Ordering::Acquire), 128);
   }
 }

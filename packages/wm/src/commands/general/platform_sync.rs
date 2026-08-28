@@ -1,8 +1,11 @@
 #[cfg(target_os = "windows")]
-use std::collections::HashSet;
+use std::{
+  collections::HashSet,
+  sync::atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::Context;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 #[cfg(target_os = "windows")]
 use wm_common::TabBarPosition;
 use wm_common::{
@@ -17,10 +20,21 @@ use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{
   BackdropStyle, BlurOverlayParams, CornerStyle, NativeBlurOverlay,
   NativeIrisOverlay, NativeStackTabBar, OpacityValue, SurrogateBatch,
-  TabBarColors, TabInfo, WorkspaceSurrogate,
+  SurrogateBatchResult, TabBarColors, TabInfo, WorkspaceSurrogate,
 };
 use wm_platform::{Rect, WindowZOrder};
 
+#[cfg(target_os = "windows")]
+use crate::animation::manager::{
+  opacity_target_was_destroyed, WorkspaceCloakRetryOutcome,
+  WorkspaceRedirectOutcome,
+};
+#[cfg(target_os = "windows")]
+use crate::animation::AnimationManager;
+#[cfg(target_os = "windows")]
+use crate::commands::window::isolate_destroyed_window;
+#[cfg(target_os = "windows")]
+use crate::commands::workspace::commit_pending_workspace_redirect;
 #[cfg(target_os = "windows")]
 use crate::pending_sync::IrisSwitchRequest;
 use crate::{
@@ -30,6 +44,26 @@ use crate::{
   user_config::UserConfig,
   wm_state::WmState,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepositionWindowOutcome {
+  Applied,
+  NativeMinimizePending,
+}
+
+#[cfg(target_os = "windows")]
+static WINDOW_POSITION_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "windows")]
+fn rate_limited_native_failure(counter: &AtomicUsize) -> Option<usize> {
+  let previous = counter
+    .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+      value.checked_add(1)
+    })
+    .ok()?;
+  let occurrence = previous + 1;
+  (occurrence == 1 || occurrence.is_multiple_of(64)).then_some(occurrence)
+}
 
 /// Returns the smallest iris radius that fully covers the monitor from the
 /// origin — the distance to the farthest monitor corner.
@@ -70,54 +104,256 @@ fn should_start_workspace_switch(
     && (direction != 0 || is_no_slide)
 }
 
-/// Whether a visible reposition needs a compositor barrier for an alpha
+/// Whether a visible reposition needs a second, tick-deferred alpha
 /// reassertion.
 ///
 /// `SWP_FRAMECHANGED` can briefly reset an existing layered-window alpha,
 /// but opaque windows have no alpha state to race with DWM and must not
 /// pay for a blocking composition flush.
 #[cfg(target_os = "windows")]
-fn needs_transparency_composition_flush(
+fn needs_deferred_transparency_reassert(
   is_visible: bool,
   effect_opacity: u8,
 ) -> bool {
   is_visible && effect_opacity < u8::MAX
 }
 
-/// Whether cloaking a surrogate-covered window still needs its own DWM
-/// warm-up barrier.
-///
-/// Workspace-switch setup commits every participating surrogate together
-/// and performs one shared flush before the redraw loop. Repeating that
-/// barrier for each incoming window only serializes compositor-frame
-/// waits. Other surrogate paths are created inside the redraw loop and
-/// retain the existing per-window safety barrier.
-#[cfg(target_os = "windows")]
-fn needs_surrogate_warmup_flush(
-  workspace_surrogate_preflushed: bool,
-) -> bool {
-  !workspace_surrogate_preflushed
-}
-
 #[cfg(target_os = "windows")]
 fn should_defer_native_focus(
   is_workspace_switch_incoming: bool,
   has_resize_session: bool,
+  is_workspace_redirect_fallback: bool,
 ) -> bool {
-  is_workspace_switch_incoming || has_resize_session
+  is_workspace_switch_incoming
+    || has_resize_session
+    || is_workspace_redirect_fallback
+}
+
+#[cfg(target_os = "windows")]
+fn should_defer_cursor_jump(is_workspace_redirect_fallback: bool) -> bool {
+  is_workspace_redirect_fallback
+}
+
+#[cfg(target_os = "windows")]
+fn anyhow_target_was_destroyed(
+  error: &anyhow::Error,
+  native_valid_after: bool,
+) -> bool {
+  error.chain().any(|cause| {
+    cause
+      .downcast_ref::<wm_platform::Error>()
+      .is_some_and(|error| error.is_invalid_window_handle())
+  }) || !native_valid_after
+}
+
+#[cfg(target_os = "windows")]
+fn native_window_identity(window: &WindowContainer) -> (isize, bool) {
+  // Destroyed-window isolation can detach this same container. Keep the
+  // native `RefCell` guard wholly inside this helper so it is always
+  // dropped before cleanup begins.
+  let native = window.native();
+  (native.id().0, native.is_valid())
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceCloakFailureKind {
+  Destroyed,
+  TransientApplicationView,
+  AccessDenied,
+  UnexpectedLiveWindow,
+}
+
+#[cfg(target_os = "windows")]
+fn classify_workspace_cloak_failure(
+  error: &wm_platform::Error,
+  native_valid_after: bool,
+) -> WorkspaceCloakFailureKind {
+  classify_workspace_cloak_failure_flags(
+    opacity_target_was_destroyed(error, native_valid_after),
+    error.is_application_view_unavailable(),
+    error.is_access_denied(),
+  )
+}
+
+#[cfg(target_os = "windows")]
+fn classify_workspace_cloak_failure_flags(
+  target_destroyed: bool,
+  application_view_unavailable: bool,
+  access_denied: bool,
+) -> WorkspaceCloakFailureKind {
+  if target_destroyed {
+    WorkspaceCloakFailureKind::Destroyed
+  } else if application_view_unavailable {
+    WorkspaceCloakFailureKind::TransientApplicationView
+  } else if access_denied {
+    WorkspaceCloakFailureKind::AccessDenied
+  } else {
+    WorkspaceCloakFailureKind::UnexpectedLiveWindow
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusSyncOutcome {
+  Complete,
+  #[cfg(target_os = "windows")]
+  TargetDestroyed {
+    window_id: uuid::Uuid,
+    expected_handle: isize,
+  },
+}
+
+/// Returns whether a managed window may use the surrogate animation path
+/// for this redraw.
+///
+/// A workspace-switch surrogate that already owns the visibility handoff
+/// must be allowed to finish. Every other fullscreen window or
+/// display-change-suppressed redraw bypasses animation so GlazeWM cannot
+/// cloak or cover an exclusive/borderless application while Windows is
+/// changing its presentation mode.
+fn should_use_window_animation_path(
+  is_outgoing_switch: bool,
+  is_frozen_by_workspace_switch: bool,
+  is_fullscreen: bool,
+  animations_suppressed: bool,
+  is_floating: bool,
+  animation_enabled: bool,
+  is_state_change: bool,
+  has_slide_in: bool,
+) -> bool {
+  !is_outgoing_switch
+    && (is_frozen_by_workspace_switch
+      || (!is_fullscreen
+        && !animations_suppressed
+        && ((!is_floating && animation_enabled)
+          || (is_state_change && animation_enabled)
+          || has_slide_in)))
+}
+
+/// Whether the latest logical rectangle should replace the last presented
+/// target immediately.
+///
+/// An incoming window covered by an active workspace surrogate has not yet
+/// presented a later relayout. Retaining its previous target lets the
+/// final covered sync create one ordinary move/resize handoff from that
+/// visible geometry to the latest layout. Hidden/minimized/outgoing
+/// windows and ordinary stationary-workspace redraws keep the existing
+/// immediate commit.
+fn should_commit_presented_target(
+  is_frozen_by_workspace_switch: bool,
+  is_visible: bool,
+  previous_target: Option<&Rect>,
+  target_rect: &Rect,
+) -> bool {
+  !(is_frozen_by_workspace_switch
+    && is_visible
+    && previous_target.is_some_and(|previous| previous != target_rect))
+}
+
+#[cfg(target_os = "windows")]
+fn should_preserve_native_minimize_at_handoff(
+  is_visible: bool,
+  has_surrogate: bool,
+  logical_is_minimized: bool,
+  native_is_minimized: bool,
+) -> bool {
+  is_visible
+    && has_surrogate
+    && !logical_is_minimized
+    && native_is_minimized
+}
+
+/// Whether retained surrogate coverage owns the real window's visibility.
+///
+/// Ordinary move/resize and completed workspace handoffs return `true`. A
+/// workspace participant whose cloak failed returns `false`, keeping its
+/// visible real HWND on the non-fatal positioning path during local
+/// fallback.
+#[cfg(target_os = "windows")]
+fn surrogate_owns_visibility(
+  has_active_surrogate: bool,
+  workspace_handoff_cloaked: Option<bool>,
+) -> bool {
+  has_active_surrogate && workspace_handoff_cloaked.unwrap_or(true)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedrawOutcome {
+  Complete,
+  CompleteAfterWorkspaceFallback,
+  Deferred,
 }
 
 pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  let focused_container =
+  let result = platform_sync_inner(state, config);
+
+  #[cfg(target_os = "windows")]
+  {
+    let sync_complete =
+      result.is_ok() && !state.pending_sync.has_changes();
+    state.settle_visibility_leases(result.is_ok(), sync_complete);
+  }
+
+  result
+}
+
+fn platform_sync_inner(
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  #[cfg(target_os = "windows")]
+  let invalid_redirect_recovery = state
+    .pending_workspace_redirect
+    .as_ref()
+    .is_some_and(|pending| {
+      state.workspace_by_name(&pending.destination_name).is_none()
+    });
+  #[cfg(target_os = "windows")]
+  if invalid_redirect_recovery {
+    if let Some(pending) = state.pending_workspace_redirect.take() {
+      warn!(
+        destination = %pending.destination_name,
+        "Discarding unavailable workspace redirect destination and restoring the currently displayed workspace."
+      );
+    }
+    state
+      .pending_sync
+      .clear_workspace_switch_participants()
+      .queue_container_to_redraw(state.root_container.clone());
+    state.animation_manager.begin_workspace_redirect_fallback();
+  }
+
+  let mut focused_container =
     state.focused_container().context("No focused container.")?;
 
+  let mut finish_workspace_fallback = false;
   if !state.pending_sync.containers_to_redraw().is_empty()
     || !state.pending_sync.workspaces_to_reorder().is_empty()
   {
-    redraw_containers(&focused_container, state, config)?;
+    match redraw_containers(&focused_container, state, config)? {
+      RedrawOutcome::Deferred => {
+        // A covering workspace/iris surface was created in this pass.
+        // Keep the complete pending sync intact; the animation timer will
+        // retry it after one compositor-paced readiness tick.
+        return Ok(());
+      }
+      RedrawOutcome::CompleteAfterWorkspaceFallback => {
+        finish_workspace_fallback = true;
+      }
+      RedrawOutcome::Complete => {}
+    }
+    #[cfg(target_os = "windows")]
+    if finish_workspace_fallback
+      && state.pending_workspace_redirect.is_some()
+    {
+      commit_pending_workspace_redirect(state, config)?;
+    }
+    focused_container = state
+      .focused_container()
+      .context("No focused container after redraw.")?;
   }
 
   // Focus is synced after `redraw_containers` so that the workspace-switch
@@ -127,11 +363,60 @@ pub fn platform_sync(
   // re-queues focus after it completes), preventing the OS from
   // asynchronously uncloaking the incoming focused window mid-animation.
   if state.pending_sync.needs_focus_update() {
+    #[cfg(target_os = "windows")]
+    if let FocusSyncOutcome::TargetDestroyed {
+      window_id,
+      expected_handle,
+    } = sync_focus(&focused_container, state)?
+    {
+      isolate_destroyed_window(
+        window_id,
+        expected_handle,
+        state,
+        "native focus",
+      );
+      focused_container = state
+        .focused_container()
+        .context("No safe focus target after destroyed HWND.")?;
+
+      // Make one immediate attempt against the newly selected target. This
+      // is not a retry loop: a second stale target is isolated and
+      // native focus is reset to the desktop, leaving later normal
+      // events to select again.
+      if let FocusSyncOutcome::TargetDestroyed {
+        window_id,
+        expected_handle,
+      } = sync_focus(&focused_container, state)?
+      {
+        isolate_destroyed_window(
+          window_id,
+          expected_handle,
+          state,
+          "replacement native focus",
+        );
+        focused_container = state
+          .focused_container()
+          .context("No focus target after second destroyed HWND.")?;
+        state.dispatcher.reset_focus()?;
+        state.is_focus_synced = false;
+      }
+    }
+    #[cfg(not(target_os = "windows"))]
     sync_focus(&focused_container, state)?;
   }
 
+  #[cfg(target_os = "windows")]
+  let defer_cursor_jump = should_defer_cursor_jump(
+    state
+      .animation_manager
+      .is_workspace_redirect_fallback_active(),
+  );
+  #[cfg(not(target_os = "windows"))]
+  let defer_cursor_jump = false;
+
   if state.pending_sync.needs_cursor_jump()
     && config.value.general.cursor_jump.enabled
+    && !defer_cursor_jump
   {
     jump_cursor(focused_container.clone(), state, config)?;
   }
@@ -143,12 +428,12 @@ pub fn platform_sync(
     // applied.
     let prev_effects_window = state.prev_effects_window.clone();
 
-    let focused_window = focused_container.as_window_container().ok();
+    let mut focused_window = focused_container.as_window_container().ok();
     let focus_changed =
       prev_effects_window.as_ref().map(|window| window.id())
         != focused_window.as_ref().map(|window| window.id());
     let animate_focus_change =
-      config.value.animations.focus_change.enabled
+      config.value.animations.focus_change.should_animate()
         && state.pending_sync.needs_focused_effect_update()
         && !state.pending_sync.needs_all_effects_update()
         && focus_changed;
@@ -157,19 +442,53 @@ pub fn platform_sync(
     // the new values immediately. It must not leave an old transition
     // running with targets from the previous configuration.
     #[cfg(target_os = "windows")]
-    if !config.value.animations.focus_change.enabled
+    if !config.value.animations.focus_change.should_animate()
       || state.pending_sync.needs_all_effects_update()
     {
       state.animation_manager.clear_focus_opacity_animations();
     }
 
-    if let Some(window) = focused_window {
-      apply_window_effects(&window, true, config)?;
-      #[cfg(target_os = "windows")]
-      if animate_focus_change {
-        start_focus_transparency_animation(&window, true, state, config)?;
+    if let Some(window) = focused_window.clone() {
+      if apply_window_effects_isolating(
+        &window,
+        true,
+        state,
+        config,
+        "focused effect application",
+      )? {
+        #[cfg(target_os = "windows")]
+        if animate_focus_change {
+          start_focus_transparency_animation(
+            &window, true, state, config,
+          )?;
+        }
+        state.prev_effects_window = Some(window);
+      } else {
+        focused_container = state
+          .focused_container()
+          .context("No focus target after destroyed effect window.")?;
+        focused_window = focused_container.as_window_container().ok();
+        if let Some(replacement) = focused_window.clone() {
+          if apply_window_effects_isolating(
+            &replacement,
+            true,
+            state,
+            config,
+            "replacement focused effect application",
+          )? {
+            #[cfg(target_os = "windows")]
+            if animate_focus_change {
+              start_focus_transparency_animation(
+                &replacement,
+                true,
+                state,
+                config,
+              )?;
+            }
+            state.prev_effects_window = Some(replacement);
+          }
+        }
       }
-      state.prev_effects_window = Some(window.clone());
     } else {
       state.prev_effects_window = None;
     }
@@ -185,10 +504,20 @@ pub fn platform_sync(
         prev_effects_window.clone().into_iter().collect()
       }
       .into_iter()
-      .filter(|window| window.id() != focused_container.id());
+      .filter(|window| state.container_by_id(window.id()).is_some())
+      .filter(|window| window.id() != focused_container.id())
+      .collect::<Vec<_>>();
 
     for window in unfocused_windows {
-      apply_window_effects(&window, false, config)?;
+      if !apply_window_effects_isolating(
+        &window,
+        false,
+        state,
+        config,
+        "unfocused effect application",
+      )? {
+        continue;
+      }
       #[cfg(target_os = "windows")]
       if animate_focus_change {
         start_focus_transparency_animation(&window, false, state, config)?;
@@ -211,23 +540,71 @@ pub fn platform_sync(
             window.id(),
             opacity.to_alpha()
           );
-          window.native().set_transparency(&opacity).with_context(
-            || {
-              format!(
-                "Failed to restore in-progress opacity for window {}",
+          let transparency_result = {
+            let native = window.native();
+            native.set_transparency(&opacity)
+          };
+          if let Err(err) = transparency_result {
+            let (expected_handle, native_is_valid) =
+              native_window_identity(&window);
+            if opacity_target_was_destroyed(&err, native_is_valid) {
+              debug!(
+                "Canceled opacity animation for destroyed window {}: \
+                 {err}.",
                 window.id()
-              )
-            },
-          )?;
+              );
+              isolate_destroyed_window(
+                window.id(),
+                expected_handle,
+                state,
+                "in-progress opacity restoration",
+              );
+            } else {
+              return Err(err).with_context(|| {
+                format!(
+                  "Failed to restore in-progress opacity for window {}",
+                  window.id()
+                )
+              });
+            }
+          }
         }
       }
     }
+  }
+
+  // The latest real layout is now positioned, visible, focused, and has
+  // its ordinary effects applied. Let static blur preparation see that
+  // layout while old rapid-switch coverage still exists above it.
+  #[cfg(target_os = "windows")]
+  if finish_workspace_fallback {
+    state
+      .animation_manager
+      .prepare_workspace_redirect_fallback_effects();
   }
 
   // Sync acrylic blur overlays every tick so they track window position
   // through moves, resizes, and workspace changes.
   #[cfg(target_os = "windows")]
   sync_blur_overlays(state, config, &focused_container);
+
+  // Incompatible rapid-switch coverage deliberately outlives final real-
+  // window positioning, effects, and static blur preparation. Start its
+  // nonblocking readiness-held crossfade only now; native focus remains
+  // deferred until the animation manager drops that obsolete coverage.
+  #[cfg(target_os = "windows")]
+  if finish_workspace_fallback {
+    state.animation_manager.finish_workspace_redirect_fallback();
+    sync_tab_bars(state, config);
+  }
+
+  #[cfg(target_os = "windows")]
+  if invalid_redirect_recovery {
+    state
+      .animation_manager
+      .prepare_workspace_redirect_fallback_effects();
+    state.animation_manager.finish_workspace_redirect_fallback();
+  }
 
   state.pending_sync.clear();
 
@@ -237,7 +614,7 @@ pub fn platform_sync(
 fn sync_focus(
   focused_container: &Container,
   state: &mut WmState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<FocusSyncOutcome> {
   let native_window = focused_container.as_window_container().ok();
 
   // Defer `SetForegroundWindow` while the focused window is covered by an
@@ -249,6 +626,13 @@ fn sync_focus(
   // the animation completes and the window is uncloaked.
   #[cfg(target_os = "windows")]
   if let Some(window) = &native_window {
+    // Incompatible rapid redirects retain old coverage for one readiness
+    // tick plus a short fade over the synchronized latest workspace.
+    // Native focus (and its cursor/effect confirmation) transfers only
+    // after that final visual handoff completes.
+    let is_workspace_redirect_fallback = state
+      .animation_manager
+      .is_workspace_redirect_fallback_active();
     let is_ws_incoming =
       state.animation_manager.is_workspace_switch_active()
         && state
@@ -258,13 +642,17 @@ fn sync_focus(
       .animation_manager
       .resize_sessions
       .contains_key(&window.id());
-    if should_defer_native_focus(is_ws_incoming, has_resize_session) {
+    if should_defer_native_focus(
+      is_ws_incoming,
+      has_resize_session,
+      is_workspace_redirect_fallback,
+    ) {
       // Logical focus already points at the covered target, but native
       // focus still points elsewhere. Keep focus-follows-cursor
       // gated until cleanup requeues this operation and the matching
       // foreground event confirms it.
       state.is_focus_synced = false;
-      return Ok(());
+      return Ok(FocusSyncOutcome::Complete);
     }
   }
 
@@ -275,7 +663,7 @@ fn sync_focus(
   //
   // In either case, a `PlatformEvent::WindowFocused` event is subsequently
   // triggered.
-  let result = if let Some(window) = native_window {
+  let result = if let Some(window) = &native_window {
     tracing::info!("Setting focus to window: {window}");
     window.native().focus()
   } else {
@@ -284,6 +672,16 @@ fn sync_focus(
   };
 
   if let Err(err) = result {
+    #[cfg(target_os = "windows")]
+    if let Some(window) = native_window {
+      if opacity_target_was_destroyed(&err, window.native().is_valid()) {
+        state.is_focus_synced = false;
+        return Ok(FocusSyncOutcome::TargetDestroyed {
+          window_id: window.id(),
+          expected_handle: window.native().id().0,
+        });
+      }
+    }
     // Keep cursor-driven focus gated until a later native focus event
     // proves that the OS and logical targets match. Returning the
     // error also keeps `pending_sync` uncleared, so the next safe
@@ -297,7 +695,7 @@ fn sync_focus(
     focused_container: focused_container.to_dto()?,
   });
 
-  Ok(())
+  Ok(FocusSyncOutcome::Complete)
 }
 
 /// Finds windows that should be brought to the top of their workspace's
@@ -364,7 +762,7 @@ fn redraw_containers(
   focused_container: &Container,
   state: &mut WmState,
   config: &UserConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RedrawOutcome> {
   let windows_to_redraw = state.windows_to_redraw();
   let windows_to_bring_to_front =
     windows_to_bring_to_front(focused_container, state)?;
@@ -406,8 +804,21 @@ fn redraw_containers(
               != Some(window.id())
           })
           .unwrap_or(false);
-        let ws_displayed =
-          window.workspace().is_some_and(|w| w.is_displayed());
+        let ws_displayed = if state.pending_workspace_redirect.is_some()
+          && state
+            .pending_sync
+            .is_workspace_switch_incoming(&window.id())
+        {
+          true
+        } else if state.pending_workspace_redirect.is_some()
+          && state
+            .pending_sync
+            .is_workspace_switch_outgoing(&window.id())
+        {
+          false
+        } else {
+          window.workspace().is_some_and(|w| w.is_displayed())
+        };
         let will_show = !is_inactive_stack_child && ws_displayed;
         let focus_pos = focus_order_index.get(&window.id()).copied();
         // Windows to show sort higher → after rev() they are processed
@@ -424,16 +835,45 @@ fn redraw_containers(
   // cancelled below so their windows snap to their target rect.
   let suppress_animations = state.pending_sync.animations_suppressed();
 
+  #[cfg(target_os = "windows")]
+  let mut workspace_redirected = false;
+  #[cfg(target_os = "windows")]
+  let mut workspace_fallback = state.pending_workspace_redirect.is_some();
+  #[cfg(target_os = "windows")]
+  let mut workspace_cloak_fallback = false;
+
   // Workspace-switch pre-pass: create slide surrogates for all
   // incoming/outgoing windows before any real window is repositioned.
   // Outgoing surrogates are shown immediately (before the real window is
   // cloaked) to eliminate the blank-frame flicker.
   #[cfg(target_os = "windows")]
-  let mut preflushed_workspace_surrogates = HashSet::new();
-  #[cfg(target_os = "windows")]
   {
+    let has_ws_windows = windows_to_update.iter().any(|window| {
+      let id = window.id();
+      state.pending_sync.is_workspace_switch_incoming(&id)
+        || state.pending_sync.is_workspace_switch_outgoing(&id)
+    });
+
+    if (!has_ws_windows
+      && state.animation_manager.is_workspace_handoff_pending())
+      || state.animation_manager.is_iris_handoff_pending()
+    {
+      return Ok(RedrawOutcome::Deferred);
+    }
+
+    let mut created_staged_handoff = false;
     let ws_config = &config.value.animations.workspace_switch;
-    if ws_config.enabled && !suppress_animations {
+    if has_ws_windows
+      && state.animation_manager.is_workspace_switch_active()
+      && (!ws_config.should_animate()
+        || suppress_animations
+        || ws_config.style == WorkspaceSwitchStyle::Iris)
+    {
+      workspace_fallback =
+        state.animation_manager.begin_workspace_redirect_fallback();
+      state.pending_presented_focus_effect_handoff = None;
+    }
+    if ws_config.should_animate() && !suppress_animations {
       // Iris-wipe pre-pass: snapshot the monitor (still showing the
       // outgoing workspace) and show the overlay before the real
       // windows are switched in the redraw loop below. The hole is
@@ -461,13 +901,11 @@ fn redraw_containers(
               ws_config.duration_ms,
               ws_config.easing.clone(),
             );
-            // Composite the overlay (covering the outgoing workspace)
-            // before the redraw loop below switches the real
-            // windows underneath, so the switch never shows
-            // through for a frame. Without this the cover and
-            // the switch race within one frame, causing an occasional
-            // flicker.
-            wm_platform::dwm_flush();
+            // Do not switch the real windows in this sync. The existing
+            // animation/vsync timer will retry after one readiness tick,
+            // giving DWM an opportunity to compose the covering snapshot
+            // without blocking the WM thread.
+            created_staged_handoff = true;
           }
           Err(err) => {
             tracing::warn!(
@@ -482,16 +920,65 @@ fn redraw_containers(
       // actually incoming/outgoing windows in this sync (i.e., this
       // is the initial platform_sync for the switch, not a follow-up
       // focus event).
-      let has_ws_windows = windows_to_update.iter().any(|w| {
-        let id = w.id();
-        state.pending_sync.is_workspace_switch_incoming(&id)
-          || state.pending_sync.is_workspace_switch_outgoing(&id)
-      });
+      if has_ws_windows
+        && ws_config.style != WorkspaceSwitchStyle::Iris
+        && state.animation_manager.is_workspace_switch_active()
+      {
+        let requested_roles = windows_to_update
+          .iter()
+          .filter_map(|window| {
+            let id = window.id();
+            if state.pending_sync.is_workspace_switch_incoming(&id) {
+              Some((id, true))
+            } else if state.pending_sync.is_workspace_switch_outgoing(&id)
+            {
+              Some((id, false))
+            } else {
+              None
+            }
+          })
+          .collect::<std::collections::HashMap<_, _>>();
 
-      if has_ws_windows {
+        match state.animation_manager.redirect_workspace_switch(
+          &requested_roles,
+          direction,
+          ws_config,
+        ) {
+          WorkspaceRedirectOutcome::Redirected => {
+            workspace_redirected = true;
+            state.pending_presented_focus_effect_handoff =
+              focused_container
+                .as_window_container()
+                .ok()
+                .filter(|window| {
+                  state
+                    .pending_sync
+                    .is_workspace_switch_incoming(&window.id())
+                })
+                .map(|window| window.id());
+          }
+          WorkspaceRedirectOutcome::FinalStateFallback => {
+            workspace_fallback = true;
+            state.pending_presented_focus_effect_handoff = None;
+          }
+          WorkspaceRedirectOutcome::DirectionalReveal => {
+            workspace_fallback = true;
+            state.pending_presented_focus_effect_handoff = None;
+          }
+          WorkspaceRedirectOutcome::NotActive
+          | WorkspaceRedirectOutcome::ExistingRequest => {}
+        }
+      }
+
+      if has_ws_windows
+        && ws_config.style != WorkspaceSwitchStyle::Iris
+        && !state.animation_manager.is_workspace_switch_active()
+        && state.pending_workspace_redirect.is_none()
+      {
         let is_no_slide = ws_config.style.is_no_slide();
         let mut ws_windows: Vec<(
           uuid::Uuid,
+          isize,
           Option<WorkspaceSurrogate>,
           bool,
         )> = Vec::new();
@@ -525,6 +1012,7 @@ fn redraw_containers(
           }
 
           let hwnd = window.native().hwnd();
+          let source_handle = window.native().id().0;
 
           let effect_cfg = if window.id() == focused_container.id() {
             &config.value.window_effects.focused_window
@@ -584,7 +1072,7 @@ fn redraw_containers(
                 None
               }
             };
-            ws_windows.push((id, surrogate, true));
+            ws_windows.push((id, source_handle, surrogate, true));
           } else {
             let current = if let Some(rect) =
               state.window_target_positions.get(&id).cloned()
@@ -628,14 +1116,14 @@ fn redraw_containers(
                 }
               }
             });
-            ws_windows.push((id, surrogate, false));
+            ws_windows.push((id, source_handle, surrogate, false));
           }
         }
 
         let participant_count = ws_windows.len();
         let ready_surrogate_count = ws_windows
           .iter()
-          .filter(|(_, surrogate, _)| surrogate.is_some())
+          .filter(|(_, _, surrogate, _)| surrogate.is_some())
           .count();
 
         // For slide styles, skip when direction == 0: workspace names were
@@ -653,12 +1141,11 @@ fn redraw_containers(
           direction,
           is_no_slide,
         ) {
-          // Show outgoing surrogates before flushing: real windows are
-          // still active so their DWM thumbnails are immediately
-          // warm. For stationary (non-slide) styles, also show
-          // incoming surrogates at their start opacity so DWM
-          // warms their thumbnails before the loop.
-          for (_, ref mut surrogate, is_incoming) in &mut ws_windows {
+          // Show outgoing surrogates while real windows are still active
+          // so their DWM thumbnails can warm during the staged tick. For
+          // stationary styles, also show incoming surrogates at their
+          // initial opacity.
+          for (_, _, ref mut surrogate, is_incoming) in &mut ws_windows {
             if let Some(s) = surrogate {
               if !*is_incoming {
                 s.show_initial();
@@ -667,24 +1154,6 @@ fn redraw_containers(
               }
             }
           }
-
-          // Single flush: DWM renders one frame with outgoing surrogates
-          // at full opacity, ensuring surrogate content is composited
-          // before the real windows are cloaked below. Incoming windows
-          // start off-screen, so DWM warms their thumbnails over the
-          // first few frames of the slide without a visible gap.
-          wm_platform::dwm_flush();
-
-          // The shared barrier above covers the incoming surrogates that
-          // will enter the Frozen/cloak path below. Remember them only for
-          // this sync cycle: if an external actor unexpectedly uncloaks a
-          // window on a later tick, the normal per-window warm-up barrier
-          // runs again before it is re-cloaked.
-          preflushed_workspace_surrogates.extend(
-            ws_windows.iter().filter_map(|(id, _, is_incoming)| {
-              is_incoming.then_some(*id)
-            }),
-          );
 
           let presented_focus_effect_handoff = focused_container
             .as_window_container()
@@ -708,6 +1177,9 @@ fn redraw_containers(
           );
           state.pending_presented_focus_effect_handoff =
             presented_focus_effect_handoff;
+          // Preserve the full pending sync and transfer visibility only
+          // after the animation timer observes the first compositor tick.
+          created_staged_handoff = true;
         } else if ready_surrogate_count != participant_count {
           tracing::warn!(
             "Workspace-switch animation skipped: only \
@@ -719,6 +1191,151 @@ fn redraw_containers(
         // not in config), skip the animation.
       }
     }
+
+    if created_staged_handoff {
+      return Ok(RedrawOutcome::Deferred);
+    }
+
+    // The complete pending workspace sync is intentionally retained while
+    // the cover warms. A native event can request another `platform_sync`
+    // before the animation timer observes its first compositor tick; do
+    // not let that incidental call bypass readiness and cloak the real
+    // windows early. A genuinely newer workspace command was already
+    // handled by the redirect/final-state logic above and removes the
+    // pending handoff.
+    if state.animation_manager.is_workspace_handoff_pending() {
+      return Ok(RedrawOutcome::Deferred);
+    }
+
+    // Stage two of the workspace handoff: cloak each live real HWND while
+    // every surrogate remains stationary at progress zero. The
+    // undocumented shell ApplicationView can briefly be unpublished
+    // for an otherwise valid HWND; that exact failure is retried only
+    // on later animation ticks. Other failures stay local to this
+    // workspace transition and use the visible-real-window final-state
+    // fallback.
+    let cloak_participants = state
+      .animation_manager
+      .pending_workspace_cloak_participants();
+    for (window_id, expected_handle) in cloak_participants {
+      let Some(window) = windows_to_update.iter().find(|window| {
+        window.id() == window_id
+          && window.native().id().0 == expected_handle
+      }) else {
+        isolate_destroyed_window(
+          window_id,
+          expected_handle,
+          state,
+          "workspace cloak handoff lookup",
+        );
+        return Ok(RedrawOutcome::Deferred);
+      };
+
+      let (process_name, title) = {
+        let properties = window.native_properties();
+        (properties.process_name.clone(), properties.title.clone())
+      };
+
+      let cloak_result = match window.native().is_cloaked() {
+        Ok(true) => Ok(()),
+        Ok(false) => window.native().set_cloaked(true),
+        Err(err) => Err(err),
+      };
+
+      if let Err(err) = cloak_result {
+        // A failing undocumented shell call has no formal atomicity
+        // guarantee. Re-query DWM before classifying it: if the requested
+        // state actually landed, record the transfer and avoid both an
+        // unnecessary retry and an incorrect visible-window fallback.
+        if window.native().is_cloaked().unwrap_or(false) {
+          state.animation_manager.mark_workspace_participant_cloaked(
+            &window_id,
+            expected_handle,
+          );
+          continue;
+        }
+
+        let (_, native_is_valid) = native_window_identity(window);
+        match classify_workspace_cloak_failure(&err, native_is_valid) {
+          WorkspaceCloakFailureKind::Destroyed => {
+            debug!(
+              %window_id,
+              hwnd = format_args!("{expected_handle:#x}"),
+              %process_name,
+              %title,
+              error = ?err,
+              "Removed destroyed participant during workspace cloak handoff."
+            );
+            isolate_destroyed_window(
+              window_id,
+              expected_handle,
+              state,
+              "workspace cloak handoff",
+            );
+            return Ok(RedrawOutcome::Deferred);
+          }
+          WorkspaceCloakFailureKind::TransientApplicationView => {
+            match state.animation_manager.record_workspace_cloak_retry() {
+              WorkspaceCloakRetryOutcome::Retry { attempt, remaining } => {
+                warn!(
+                  %window_id,
+                  hwnd = format_args!("{expected_handle:#x}"),
+                  %process_name,
+                  %title,
+                  hresult = "0x8002802B",
+                  attempt,
+                  remaining,
+                  error = ?err,
+                  "Workspace cloak handoff deferred after transient ApplicationView lookup failure."
+                );
+                return Ok(RedrawOutcome::Deferred);
+              }
+              WorkspaceCloakRetryOutcome::FinalStateFallback => {
+                warn!(
+                  %window_id,
+                  hwnd = format_args!("{expected_handle:#x}"),
+                  %process_name,
+                  %title,
+                  hresult = "0x8002802B",
+                  error = ?err,
+                  "Workspace cloak handoff exhausted its bounded retries; using latest visible real-window state."
+                );
+              }
+            }
+          }
+          WorkspaceCloakFailureKind::AccessDenied => {
+            warn!(
+              %window_id,
+              hwnd = format_args!("{expected_handle:#x}"),
+              %process_name,
+              %title,
+              error = ?err,
+              "Workspace cloak handoff crossed an integrity boundary; leaving the window visible and using the latest real-window state."
+            );
+          }
+          WorkspaceCloakFailureKind::UnexpectedLiveWindow => {
+            error!(
+              %window_id,
+              hwnd = format_args!("{expected_handle:#x}"),
+              %process_name,
+              %title,
+              error = ?err,
+              "Unexpected live-HWND workspace cloak handoff failure; containing it to this transition."
+            );
+          }
+        }
+
+        workspace_fallback =
+          state.animation_manager.begin_workspace_redirect_fallback();
+        workspace_cloak_fallback = workspace_fallback;
+        state.pending_presented_focus_effect_handoff = None;
+        break;
+      }
+
+      state
+        .animation_manager
+        .mark_workspace_participant_cloaked(&window_id, expected_handle);
+    }
   }
 
   // Get monitors by their optimal hide corner.
@@ -728,17 +1345,6 @@ fn redraw_containers(
   // translations in the same cycle then share the `window_resize` timing
   // so all edges stay in lock-step during the relayout (see
   // `AnimationManager::start_animation_if_needed`).
-  // Set when any window's animation-completion redraw actually issues a
-  // `SWP_FRAMECHANGED` reposition on a visible window this pass (see the
-  // `already_positioned` check below) -- `reassert_transparency` inside
-  // `reposition_window` is only a best-effort fix-up for that flash (it
-  // races DWM's own compositor thread), so a single flush after the whole
-  // loop deterministically forces one composited frame with the corrected
-  // alpha, closing the race for every such window in one blocking call
-  // instead of leaving it to chance (or serializing a flush per window).
-  #[cfg(target_os = "windows")]
-  let mut needs_transparency_flush = false;
-
   let cycle_has_resize = windows_to_update.iter().any(|window| {
     let target_rect = window.to_rect().and_then(|rect| {
       window
@@ -756,6 +1362,8 @@ fn redraw_containers(
   });
 
   for window in windows_to_update.iter().rev() {
+    #[cfg(target_os = "windows")]
+    let expected_handle = window.native().id().0;
     let should_bring_to_front = windows_to_bring_to_front.contains(window);
 
     let workspace =
@@ -832,7 +1440,26 @@ fn redraw_containers(
     let new_display_state = if is_inactive_stack_child {
       DisplayState::Hidden
     } else {
-      match (previous_display_state.clone(), workspace.is_displayed()) {
+      let workspace_should_be_displayed =
+        if state.pending_workspace_redirect.is_some()
+          && state
+            .pending_sync
+            .is_workspace_switch_incoming(&window.id())
+        {
+          true
+        } else if state.pending_workspace_redirect.is_some()
+          && state
+            .pending_sync
+            .is_workspace_switch_outgoing(&window.id())
+        {
+          false
+        } else {
+          workspace.is_displayed()
+        };
+      match (
+        previous_display_state.clone(),
+        workspace_should_be_displayed,
+      ) {
         (DisplayState::Hidden | DisplayState::Hiding, true) => {
           DisplayState::Showing
         }
@@ -853,14 +1480,36 @@ fn redraw_containers(
       DisplayState::Showing | DisplayState::Shown
     );
 
+    // True while this visible incoming window is covered by an active
+    // workspace-switch surrogate. Unlike the one-cycle PendingSync marker,
+    // this remains true until the final covered handoff.
+    #[cfg(target_os = "windows")]
+    let is_frozen_by_ws_animation = state
+      .animation_manager
+      .is_workspace_switch_incoming(&window.id());
+    #[cfg(not(target_os = "windows"))]
+    let is_frozen_by_ws_animation = false;
+
     // Get the previous target position before updating.
     let previous_target =
       state.window_target_positions.get(&window.id()).cloned();
 
-    // Always record the latest target position.
-    state
-      .window_target_positions
-      .insert(window.id(), target_rect.clone());
+    // Do not claim that a relayout was presented while an incoming
+    // workspace surrogate still shows the previous geometry. The final
+    // covered sync will see this retained target, stage a normal
+    // resize surrogate, and only then allow workspace coverage to
+    // retire. The layout tree itself already holds the latest target,
+    // so repeated changes coalesce without a queue.
+    if should_commit_presented_target(
+      is_frozen_by_ws_animation,
+      is_visible,
+      previous_target.as_ref(),
+      &target_rect,
+    ) {
+      state
+        .window_target_positions
+        .insert(window.id(), target_rect.clone());
+    }
 
     // Floating windows are not animated in general, but we allow a single
     // `window_move` animation when the window just crossed the
@@ -880,18 +1529,16 @@ fn redraw_containers(
     let is_outgoing_switch = state
       .pending_sync
       .is_workspace_switch_outgoing(&window.id());
-
-    // True while this window is an incoming participant in the active
-    // workspace-switch animation. Unlike `is_workspace_switch_incoming` on
-    // `pending_sync` (cleared after the first `platform_sync`), this stays
-    // `true` for the full animation so that focus events during the slide
-    // do not prematurely uncloak the real window.
-    #[cfg(target_os = "windows")]
-    let is_frozen_by_ws_animation = state
-      .animation_manager
+    let is_incoming_switch = state
+      .pending_sync
       .is_workspace_switch_incoming(&window.id());
+    #[cfg(target_os = "windows")]
+    let workspace_handoff_fallback_for_window = (workspace_cloak_fallback
+      && (is_incoming_switch || is_outgoing_switch))
+      || (state.pending_workspace_redirect.is_some()
+        && (is_incoming_switch || is_outgoing_switch));
     #[cfg(not(target_os = "windows"))]
-    let is_frozen_by_ws_animation = false;
+    let workspace_handoff_fallback_for_window = false;
 
     // A window is resizing when its dimensions change (vs. a pure
     // translation).
@@ -904,9 +1551,9 @@ fn redraw_containers(
       .unwrap_or(false);
 
     let anim_enabled = if is_resize {
-      config.value.animations.window_resize.enabled
+      config.value.animations.window_resize.should_animate()
     } else {
-      config.value.animations.window_move.enabled
+      config.value.animations.window_move.should_animate()
     };
 
     // Compute effect opacity and corner style unconditionally — needed for
@@ -956,20 +1603,27 @@ fn redraw_containers(
       && !is_outgoing_switch
       && !is_frozen_by_ws_animation
       && !suppress_animations
-      && config.value.animations.window_open.enabled
+      && !workspace_handoff_fallback_for_window
+      && config.value.animations.window_open.should_animate()
     {
       let monitor_rect = monitor.to_rect()?;
-      let native_ref = window.native();
-      state.animation_manager.start_open_animation(
-        window.id(),
-        target_rect.clone(),
-        monitor_rect,
-        effect_opacity,
-        corner_style,
-        blur_overlay,
-        config,
-        &*native_ref,
-      );
+      // `window.native()` returns a `Ref` into the window's `RefCell`.
+      // Bound it to this inner scope so the normal positioning path below
+      // can safely borrow the window mutably when open-surrogate creation
+      // declines or fails during a rapid show/destroy race.
+      {
+        let native_ref = window.native();
+        state.animation_manager.start_open_animation(
+          window.id(),
+          target_rect.clone(),
+          monitor_rect,
+          effect_opacity,
+          corner_style,
+          blur_overlay,
+          config,
+          &*native_ref,
+        );
+      }
     }
 
     // A slide-in animation creates a `ResizeSession` and animation entry,
@@ -997,13 +1651,16 @@ fn redraw_containers(
     // otherwise always take the non-animated path, which also cancels
     // any in-flight animation (and its surrogate) via
     // `remove_animation` below.
-    let should_use_animations = !is_outgoing_switch
-      && (is_frozen_by_ws_animation
-        || (!is_fullscreen
-          && !suppress_animations
-          && ((!is_floating && anim_enabled)
-            || (is_state_change && anim_enabled)
-            || has_slide_in)));
+    let should_use_animations = should_use_window_animation_path(
+      is_outgoing_switch,
+      is_frozen_by_ws_animation,
+      is_fullscreen,
+      suppress_animations || workspace_handoff_fallback_for_window,
+      is_floating,
+      anim_enabled,
+      is_state_change,
+      has_slide_in,
+    );
 
     // Determine the rect to use for this frame.
     //
@@ -1057,6 +1714,11 @@ fn redraw_containers(
     debug!("Updating window position: {window}");
 
     match position_result {
+      AnimationPositionResult::Waiting => {
+        // A hidden/transparent surrogate is warming up across compositor
+        // ticks. Keep the real window visible and untouched until the
+        // animation manager completes or fails the handoff.
+      }
       AnimationPositionResult::Frozen => {
         // A surrogate overlay is covering this window. On the first frame,
         // cloak the real window (so only the surrogate is visible) and
@@ -1087,41 +1749,68 @@ fn redraw_containers(
           .get(&window.id())
           .map_or(false, |s| s.is_session_cloaked());
         #[cfg(target_os = "windows")]
-        #[cfg(target_os = "windows")]
         let is_cloaked = if already_cloaked_by_session {
           true
         } else {
-          window.native().is_cloaked().with_context(|| {
-            format!(
-              "Failed to query cloak state for window {}",
-              window.id()
-            )
-          })?
+          let cloak_result = {
+            let native = window.native();
+            native.is_cloaked()
+          };
+          match cloak_result {
+            Ok(is_cloaked) => is_cloaked,
+            Err(err) => {
+              let (_, native_is_valid) = native_window_identity(window);
+              if opacity_target_was_destroyed(&err, native_is_valid) {
+                isolate_destroyed_window(
+                  window.id(),
+                  expected_handle,
+                  state,
+                  "workspace/animation cloak query",
+                );
+                continue;
+              }
+              return Err(err).with_context(|| {
+                format!(
+                  "Failed to query cloak state for window {}",
+                  window.id()
+                )
+              });
+            }
+          }
         };
         #[cfg(target_os = "windows")]
         if !is_cloaked {
-          // Flush before cloaking unless workspace-switch setup already
-          // committed the complete surrogate set and waited for DWM once
-          // in this same sync cycle. Other surrogate paths still need this
-          // barrier so their thumbnail is populated before the real window
-          // disappears.
-          if needs_surrogate_warmup_flush(
-            preflushed_workspace_surrogates.contains(&window.id()),
-          ) {
-            wm_platform::dwm_flush();
+          let is_resize_session = state
+            .animation_manager
+            .resize_sessions
+            .contains_key(&window.id());
+          // Every path that can reach `Frozen` now passes a tick-staged
+          // readiness gate (workspace or move/resize), so no synchronous
+          // compositor barrier is needed before cloaking.
+          let cloak_result = {
+            let native = window.native();
+            native.set_cloaked(true)
+          };
+          if let Err(err) = cloak_result {
+            let (_, native_is_valid) = native_window_identity(window);
+            if opacity_target_was_destroyed(&err, native_is_valid) {
+              isolate_destroyed_window(
+                window.id(),
+                expected_handle,
+                state,
+                "animation cloak handoff",
+              );
+              continue;
+            }
+            return Err(err).with_context(|| {
+              format!("Failed to cloak animated window {}", window.id())
+            });
           }
-          window.native().set_cloaked(true).with_context(|| {
-            format!("Failed to cloak animated window {}", window.id())
-          })?;
 
           // Pre-position the cloaked window at its target rect so it
           // appears there when uncloaked at animation end. Posted
           // asynchronously — the animation duration (~300 ms) is far
           // longer than any app's message-queue processing time.
-          let is_resize_session = state
-            .animation_manager
-            .resize_sessions
-            .contains_key(&window.id());
           if !is_resize_session {
             use wm_platform::{
               SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
@@ -1203,10 +1892,18 @@ fn redraw_containers(
         // animation completion. Without this, the window
         // would be repositioned with `SWP_ASYNCWINDOWPOS` and immediately
         // uncloaked — if its message queue is slow, it appears at its old
-        // position for one frame.
+        // position for one frame. A workspace participant whose handoff
+        // cloak failed is the exception: its real window still owns
+        // visibility, so treat retained fallback coverage as decorative
+        // and keep later positioning/uncloak failures locally
+        // non-fatal.
         #[cfg(target_os = "windows")]
-        let has_surrogate =
-          state.animation_manager.has_active_surrogate(&window.id());
+        let has_surrogate = surrogate_owns_visibility(
+          state.animation_manager.has_active_surrogate(&window.id()),
+          state
+            .animation_manager
+            .workspace_participant_handoff_cloaked(&window.id()),
+        );
         #[cfg(not(target_os = "windows"))]
         let has_surrogate = false;
 
@@ -1224,9 +1921,10 @@ fn redraw_containers(
             .was_pre_committed_at(&window.id(), apply_rect);
         #[cfg(not(target_os = "windows"))]
         let already_positioned = false;
+        let mut native_minimize_pending = false;
 
         if !already_positioned {
-          if let Err(err) = reposition_window(
+          match reposition_window(
             window,
             apply_rect,
             *hide_corner,
@@ -1235,23 +1933,57 @@ fn redraw_containers(
             has_surrogate,
             config,
           ) {
-            if has_surrogate {
-              return Err(err).with_context(|| {
-                format!(
-                  "Failed to position surrogate-covered window {}",
-                  window.id()
-                )
-              });
+            Ok(RepositionWindowOutcome::Applied) => {}
+            Ok(RepositionWindowOutcome::NativeMinimizePending) => {
+              native_minimize_pending = true;
             }
-            tracing::warn!("Failed to set window position: {}", err);
+            Err(err) => {
+              if has_surrogate {
+                #[cfg(target_os = "windows")]
+                let (_, native_is_valid) = native_window_identity(window);
+                #[cfg(target_os = "windows")]
+                if anyhow_target_was_destroyed(&err, native_is_valid) {
+                  isolate_destroyed_window(
+                    window.id(),
+                    expected_handle,
+                    state,
+                    "surrogate-covered reposition",
+                  );
+                  continue;
+                }
+                return Err(err).with_context(|| {
+                  format!(
+                    "Failed to position surrogate-covered window {}",
+                    window.id()
+                  )
+                });
+              }
+              #[cfg(target_os = "windows")]
+              if let Some(failure_count) =
+                rate_limited_native_failure(&WINDOW_POSITION_FAILURES)
+              {
+                tracing::warn!(
+                  failure_count,
+                  error = %err,
+                  "Failed to set a real-window position; repeated native \
+                   failures are rate-limited."
+                );
+              }
+              #[cfg(not(target_os = "windows"))]
+              tracing::warn!("Failed to set window position: {}", err);
+            }
           }
 
           #[cfg(target_os = "windows")]
-          if needs_transparency_composition_flush(
-            is_visible,
-            effect_opacity,
-          ) {
-            needs_transparency_flush = true;
+          if !native_minimize_pending
+            && needs_deferred_transparency_reassert(
+              is_visible,
+              effect_opacity,
+            )
+          {
+            state
+              .animation_manager
+              .schedule_transparency_reassert(window.id());
           }
         }
 
@@ -1262,20 +1994,28 @@ fn redraw_containers(
         // internally inside `reposition_window`).
         #[cfg(target_os = "windows")]
         if is_visible && has_surrogate {
-          window.native().set_cloaked(false).with_context(|| {
-            format!("Failed to uncloak animated window {}", window.id())
-          })?;
+          let uncloak_result = {
+            let native = window.native();
+            native.set_cloaked(false)
+          };
+          if let Err(err) = uncloak_result {
+            let (_, native_is_valid) = native_window_identity(window);
+            if opacity_target_was_destroyed(&err, native_is_valid) {
+              isolate_destroyed_window(
+                window.id(),
+                expected_handle,
+                state,
+                "animation uncloak handoff",
+              );
+              continue;
+            }
+            return Err(err).with_context(|| {
+              format!("Failed to uncloak animated window {}", window.id())
+            });
+          }
 
-          // Hide the workspace-switch surrogate thumbnail immediately
-          // after uncloaking so both changes land in the same
-          // DWM composition frame. Deferring the hide until
-          // after the full main loop would leave the
-          // thumbnail visible during the remaining window processing time,
-          // producing a multi-frame double-blend when transparency is
-          // enabled.
-          state
-            .animation_manager
-            .hide_pending_ws_cleanup_surrogate(window.id());
+          // Workspace-switch cleanup deliberately keeps the surrogate
+          // visible for one more compositor-paced tick before teardown.
         }
 
         // Apply animated opacity for opacity-style focus animations. The
@@ -1283,14 +2023,38 @@ fn redraw_containers(
         // updates it directly each frame.
         #[cfg(target_os = "windows")]
         if let Some(ref opacity) = anim_opacity {
-          window.native().set_transparency(opacity).with_context(
-            || {
-              format!(
-                "Failed to apply animated opacity to window {}",
+          if let Err(err) = window.native().set_transparency(opacity) {
+            if opacity_target_was_destroyed(
+              &err,
+              window.native().is_valid(),
+            ) {
+              state.animation_manager.remove_animation(&window.id());
+              debug!(
+                "Canceled animated opacity for destroyed window {}: \
+                 {err}.",
                 window.id()
-              )
-            },
-          )?;
+              );
+            } else {
+              return Err(err).with_context(|| {
+                format!(
+                  "Failed to apply animated opacity to window {}",
+                  window.id()
+                )
+              });
+            }
+          }
+        }
+
+        if native_minimize_pending {
+          // `MINIMIZESTART` is a lossless native lifecycle event. Leave
+          // logical state untouched here: applying it inside this sync
+          // would queue survivor redraws that the final
+          // `pending_sync.clear` below would erase. The
+          // scheduler guarantees a non-animation
+          // turn immediately after a due frame, so the queued event
+          // creates a fresh sync cycle without letting this
+          // placement restore the HWND first.
+          continue;
         }
       }
     }
@@ -1341,7 +2105,17 @@ fn redraw_containers(
   // `DeferWindowPos` transaction so adjacent windows' edges land in the
   // same DWM composition frame.
   #[cfg(target_os = "windows")]
-  state.animation_manager.flush_surrogate_updates();
+  {
+    let failed_ids = state.animation_manager.flush_surrogate_updates();
+    for id in failed_ids {
+      AnimationManager::fail_move_resize_handoff(
+        state,
+        id,
+        "thumbnail property update failed during the current redraw",
+      );
+    }
+    AnimationManager::recover_failed_move_resize_handoffs(state);
+  }
 
   // Keep the acrylic blur overlay tracking each move/resize/open session's
   // surrogate at its just-flushed live rect, instead of leaving it hidden
@@ -1360,7 +2134,9 @@ fn redraw_containers(
   {
     let mut blur_batch = SurrogateBatch::new();
     for (id, session) in &state.animation_manager.resize_sessions {
-      if state.animation_manager.has_close_animation(id) {
+      if state.animation_manager.has_close_animation(id)
+        || state.animation_manager.is_move_resize_handoff_pending(id)
+      {
         continue;
       }
       let Some(params) = session.blur_overlay_params() else {
@@ -1381,29 +2157,31 @@ fn redraw_containers(
         }
       }
     }
-    blur_batch.commit();
+    let blur_result = blur_batch.commit();
+    remove_failed_blur_overlays(
+      state,
+      &blur_result,
+      "active resize-session tracking",
+    );
   }
 
   // Apply effect opacity to outgoing surrogates now that the real windows
   // have been cloaked. This removes the double-blend that would occur if
   // the surrogate's configured opacity were set before cloaking.
   #[cfg(target_os = "windows")]
-  state.animation_manager.apply_outgoing_surrogate_opacities();
+  if !workspace_redirected {
+    state.animation_manager.apply_outgoing_surrogate_opacities();
+  }
 
   #[cfg(target_os = "windows")]
   sync_tab_bars(state, config);
 
-  // Force one composited frame reflecting every `reassert_transparency`
-  // call made above, deterministically closing the race against DWM's
-  // own compositor thread instead of leaving it to scheduling luck. One
-  // flush covers every window that completed an animation this pass,
-  // rather than blocking once per window.
   #[cfg(target_os = "windows")]
-  if needs_transparency_flush {
-    wm_platform::dwm_flush();
+  if workspace_fallback {
+    return Ok(RedrawOutcome::CompleteAfterWorkspaceFallback);
   }
 
-  Ok(())
+  Ok(RedrawOutcome::Complete)
 }
 
 fn reposition_window(
@@ -1421,7 +2199,7 @@ fn reposition_window(
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   has_surrogate: bool,
   config: &UserConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RepositionWindowOutcome> {
   // For `HideMethod::PlaceInCorner`, we need to reposition hidden windows
   // to the corner of the monitor.
   if config.value.general.hide_method == HideMethod::PlaceInCorner
@@ -1455,7 +2233,19 @@ fn reposition_window(
       frame.height(),
     ))?;
 
-    return Ok(());
+    return Ok(RepositionWindowOutcome::Applied);
+  }
+
+  #[cfg(target_os = "windows")]
+  let native_is_minimized = window.native().is_minimized()?;
+  #[cfg(target_os = "windows")]
+  if should_preserve_native_minimize_at_handoff(
+    is_visible,
+    has_surrogate,
+    window.state() == WindowState::Minimized,
+    native_is_minimized,
+  ) {
+    return Ok(RepositionWindowOutcome::NativeMinimizePending);
   }
 
   if window.active_drag().is_some() {
@@ -1483,10 +2273,7 @@ fn reposition_window(
         // from maximized to minimized works without having to
         // restore.
         WindowState::Minimized => false,
-        _ => {
-          window.native().is_minimized()?
-            || window.native().is_maximized()?
-        }
+        _ => native_is_minimized || window.native().is_maximized()?,
       };
 
       if should_restore {
@@ -1512,7 +2299,7 @@ fn reposition_window(
 
       match &window.state() {
         WindowState::Minimized => {
-          if !window.native().is_minimized()? {
+          if !native_is_minimized {
             window.native().minimize()?;
           }
         }
@@ -1557,6 +2344,10 @@ fn reposition_window(
       if config.value.general.hide_method == HideMethod::Cloak {
         window.native().set_cloaked(!is_visible)?;
       } else if is_visible {
+        // A newly managed window may still carry an early classification
+        // cloak even when the configured hide method is `hide`. Clear that
+        // independent DWM state before showing the HWND.
+        window.native().set_cloaked(false)?;
         window.native().show()?;
       } else {
         window.native().hide()?;
@@ -1564,7 +2355,7 @@ fn reposition_window(
     }
   }
 
-  Ok(())
+  Ok(RepositionWindowOutcome::Applied)
 }
 
 fn jump_cursor(
@@ -1662,6 +2453,46 @@ fn apply_window_effects(
   Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn apply_window_effects_isolating(
+  window: &WindowContainer,
+  is_focused: bool,
+  state: &mut WmState,
+  config: &UserConfig,
+  operation: &str,
+) -> anyhow::Result<bool> {
+  match apply_window_effects(window, is_focused, config) {
+    Ok(()) => Ok(true),
+    Err(err) => {
+      let (expected_handle, native_is_valid) =
+        native_window_identity(window);
+      if anyhow_target_was_destroyed(&err, native_is_valid) {
+        isolate_destroyed_window(
+          window.id(),
+          expected_handle,
+          state,
+          operation,
+        );
+        Ok(false)
+      } else {
+        Err(err)
+      }
+    }
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_window_effects_isolating(
+  window: &WindowContainer,
+  is_focused: bool,
+  _state: &mut WmState,
+  config: &UserConfig,
+  _operation: &str,
+) -> anyhow::Result<bool> {
+  apply_window_effects(window, is_focused, config)?;
+  Ok(true)
+}
+
 /// Commits the effect state already presented by an incoming workspace
 /// surrogate without starting a second focus-opacity transition.
 ///
@@ -1674,23 +2505,37 @@ pub fn commit_presented_focus_effect_handoff(
   window: &WindowContainer,
   state: &mut WmState,
   config: &UserConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
   let previous = state.prev_effects_window.clone();
 
   state
     .animation_manager
     .clear_focus_opacity_animation(&window.id());
-  apply_window_effects(window, true, config)?;
+  if !apply_window_effects_isolating(
+    window,
+    true,
+    state,
+    config,
+    "presented focus-effect handoff",
+  )? {
+    return Ok(false);
+  }
 
   if let Some(previous) = previous.filter(|w| w.id() != window.id()) {
     state
       .animation_manager
       .clear_focus_opacity_animation(&previous.id());
-    apply_window_effects(&previous, false, config)?;
+    let _ = apply_window_effects_isolating(
+      &previous,
+      false,
+      state,
+      config,
+      "previous focus-effect handoff",
+    )?;
   }
 
   state.prev_effects_window = Some(window.clone());
-  Ok(())
+  Ok(true)
 }
 
 #[cfg(target_os = "windows")]
@@ -1808,12 +2653,34 @@ fn start_focus_transparency_animation(
 
   // `apply_window_effects` set the target opacity just above. Restore the
   // transition's first value before DWM presents this frame.
-  window.native().set_transparency(&start).with_context(|| {
-    format!(
-      "Failed to set initial focus opacity for window {}",
-      window.id()
-    )
-  })?;
+  let transparency_result = {
+    let native = window.native();
+    native.set_transparency(&start)
+  };
+  if let Err(err) = transparency_result {
+    let (expected_handle, native_is_valid) =
+      native_window_identity(window);
+    if opacity_target_was_destroyed(&err, native_is_valid) {
+      debug!(
+        "Canceled initial focus-opacity handoff for destroyed window {}: \
+         {err}.",
+        window.id()
+      );
+      isolate_destroyed_window(
+        window.id(),
+        expected_handle,
+        state,
+        "initial focus-opacity handoff",
+      );
+      return Ok(());
+    }
+    return Err(err).with_context(|| {
+      format!(
+        "Failed to set initial focus opacity for window {}",
+        window.id()
+      )
+    });
+  }
 
   Ok(())
 }
@@ -2073,6 +2940,30 @@ pub(crate) fn blur_overlay_params_for(
   Some(effect_cfg.backdrop.to_overlay_params(tint, corner_radius))
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn remove_failed_blur_overlays(
+  state: &mut WmState,
+  result: &SurrogateBatchResult,
+  context: &str,
+) {
+  if result.failed_hwnds.is_empty() {
+    return;
+  }
+  let failed: Vec<_> = state
+    .blur_overlays
+    .iter()
+    .filter(|(_, overlay)| result.failed_hwnds.contains(&overlay.handle()))
+    .map(|(id, _)| *id)
+    .collect();
+  for id in failed {
+    tracing::warn!(
+      "Removing blur overlay for {id} after fallback positioning failed \
+       during {context}."
+    );
+    state.blur_overlays.remove(&id);
+  }
+}
+
 /// Creates, repositions, and removes acrylic blur overlay windows so that
 /// every managed window with `backdrop: acrylic` has a matching overlay
 /// positioned at `HWND_BOTTOM` flush with the window's DWM frame rect.
@@ -2228,15 +3119,75 @@ fn sync_blur_overlays(
   // Destroy overlays for windows that no longer need them.
   state.blur_overlays.retain(|id, _| wanted_ids.contains(id));
 
-  batch.commit();
+  let result = batch.commit();
+  remove_failed_blur_overlays(state, &result, "static overlay sync");
 }
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
+  use anyhow::Context;
+  use wm_platform::Rect;
+
   use super::{
-    needs_surrogate_warmup_flush, needs_transparency_composition_flush,
-    should_defer_native_focus, should_start_workspace_switch,
+    anyhow_target_was_destroyed, classify_workspace_cloak_failure_flags,
+    needs_deferred_transparency_reassert, rate_limited_native_failure,
+    should_commit_presented_target, should_defer_cursor_jump,
+    should_defer_native_focus, should_preserve_native_minimize_at_handoff,
+    should_start_workspace_switch, should_use_window_animation_path,
+    surrogate_owns_visibility, WorkspaceCloakFailureKind,
   };
+
+  #[test]
+  fn native_failure_diagnostics_are_strictly_rate_limited() {
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let emitted: Vec<_> = (1..=130)
+      .filter_map(|_| rate_limited_native_failure(&counter))
+      .collect();
+    assert_eq!(emitted, vec![1, 64, 128]);
+  }
+
+  #[test]
+  fn only_destroyed_targets_are_isolated_from_native_failures() {
+    let invalid = Err::<(), _>(wm_platform::Error::WindowNotFound)
+      .context("wrapped native operation")
+      .unwrap_err();
+    assert!(anyhow_target_was_destroyed(&invalid, true));
+
+    let live_failure = anyhow::Error::new(wm_platform::Error::Platform(
+      "live failure".into(),
+    ));
+    assert!(!anyhow_target_was_destroyed(&live_failure, true));
+    assert!(anyhow_target_was_destroyed(&live_failure, false));
+  }
+
+  #[test]
+  fn workspace_cloak_failures_have_disjoint_local_actions() {
+    assert_eq!(
+      classify_workspace_cloak_failure_flags(false, true, false),
+      WorkspaceCloakFailureKind::TransientApplicationView
+    );
+    assert_eq!(
+      classify_workspace_cloak_failure_flags(false, false, true),
+      WorkspaceCloakFailureKind::AccessDenied
+    );
+    assert_eq!(
+      classify_workspace_cloak_failure_flags(false, false, false),
+      WorkspaceCloakFailureKind::UnexpectedLiveWindow
+    );
+    assert_eq!(
+      classify_workspace_cloak_failure_flags(true, true, true),
+      WorkspaceCloakFailureKind::Destroyed
+    );
+  }
+
+  #[test]
+  fn only_successfully_cloaked_workspace_participants_transfer_visibility()
+  {
+    assert!(surrogate_owns_visibility(true, Some(true)));
+    assert!(!surrogate_owns_visibility(true, Some(false)));
+    assert!(surrogate_owns_visibility(true, None));
+    assert!(!surrogate_owns_visibility(false, Some(true)));
+  }
 
   #[test]
   fn workspace_switch_requires_every_surrogate() {
@@ -2257,26 +3208,154 @@ mod tests {
   }
 
   #[test]
-  fn opaque_repositions_do_not_require_a_compositor_flush() {
-    assert!(!needs_transparency_composition_flush(true, u8::MAX));
-    assert!(!needs_transparency_composition_flush(false, 128));
-    assert!(needs_transparency_composition_flush(true, 254));
-  }
-
-  #[test]
-  fn preflushed_workspace_surrogates_skip_per_window_warmup() {
-    assert!(!needs_surrogate_warmup_flush(true));
-  }
-
-  #[test]
-  fn ordinary_surrogates_keep_per_window_warmup() {
-    assert!(needs_surrogate_warmup_flush(false));
+  fn only_visible_transparent_repositions_need_deferred_reassertion() {
+    assert!(!needs_deferred_transparency_reassert(true, u8::MAX));
+    assert!(!needs_deferred_transparency_reassert(false, 128));
+    assert!(needs_deferred_transparency_reassert(true, 254));
   }
 
   #[test]
   fn surrogate_covered_focus_is_deferred_until_handoff() {
-    assert!(should_defer_native_focus(true, false));
-    assert!(should_defer_native_focus(false, true));
-    assert!(!should_defer_native_focus(false, false));
+    assert!(should_defer_native_focus(true, false, false));
+    assert!(should_defer_native_focus(false, true, false));
+    assert!(should_defer_native_focus(false, false, true));
+    assert!(!should_defer_native_focus(false, false, false));
+  }
+
+  #[test]
+  fn redirected_workspace_cursor_jump_is_deferred_until_handoff() {
+    assert!(should_defer_cursor_jump(true));
+    assert!(!should_defer_cursor_jump(false));
+  }
+
+  #[test]
+  fn fullscreen_windows_bypass_surrogate_animation() {
+    assert!(!should_use_window_animation_path(
+      false, false, true, false, false, true, true, true,
+    ));
+  }
+
+  #[test]
+  fn display_change_suppression_cancels_ordinary_animation_path() {
+    assert!(!should_use_window_animation_path(
+      false, false, false, true, false, true, true, true,
+    ));
+  }
+
+  #[test]
+  fn active_workspace_handoff_finishes_even_when_suppressed() {
+    assert!(should_use_window_animation_path(
+      false, true, false, true, false, true, false, false,
+    ));
+  }
+
+  #[test]
+  fn outgoing_workspace_windows_are_owned_by_switch_cleanup() {
+    assert!(!should_use_window_animation_path(
+      true, false, false, false, false, true, true, true,
+    ));
+  }
+
+  #[test]
+  fn close_minimize_and_destroy_reflows_retain_last_presented_target() {
+    let presented = Rect::from_xy(0, 0, 800, 600);
+    let latest = Rect::from_xy(0, 0, 1200, 600);
+
+    // Native minimize, native destroy, and GlazeWM close all redraw the
+    // same surviving tiling siblings. The presentation rule is therefore
+    // intentionally trigger-independent.
+    for trigger in ["native minimize", "native destroy", "GlazeWM close"] {
+      assert!(
+        !should_commit_presented_target(
+          true,
+          true,
+          Some(&presented),
+          &latest,
+        ),
+        "{trigger} must retain the survivor's presented geometry"
+      );
+    }
+    assert!(should_commit_presented_target(
+      true,
+      true,
+      Some(&presented),
+      &presented,
+    ));
+  }
+
+  #[test]
+  fn repeated_covered_reflows_coalesce_to_one_latest_target() {
+    let presented = Rect::from_xy(0, 0, 600, 600);
+    let intermediate = Rect::from_xy(0, 0, 900, 600);
+    let latest = Rect::from_xy(0, 0, 1200, 600);
+    let mut recorded = presented.clone();
+
+    for logical_target in [&intermediate, &latest] {
+      if should_commit_presented_target(
+        true,
+        true,
+        Some(&recorded),
+        logical_target,
+      ) {
+        recorded = logical_target.clone();
+      }
+    }
+
+    assert_eq!(recorded, presented);
+    assert!(should_commit_presented_target(
+      false,
+      true,
+      Some(&recorded),
+      &latest,
+    ));
+    assert_ne!(recorded, latest);
+  }
+
+  #[test]
+  fn stationary_workspace_survivor_reflow_uses_resize_animation_path() {
+    assert!(should_use_window_animation_path(
+      false, false, false, false, false, true, false, false,
+    ));
+  }
+
+  #[test]
+  fn covered_native_minimize_wins_over_final_window_placement() {
+    assert!(should_preserve_native_minimize_at_handoff(
+      true, true, false, true,
+    ));
+    assert!(!should_preserve_native_minimize_at_handoff(
+      true, false, false, true,
+    ));
+    assert!(!should_preserve_native_minimize_at_handoff(
+      false, true, false, true,
+    ));
+    assert!(!should_preserve_native_minimize_at_handoff(
+      true, true, true, true,
+    ));
+    assert!(!should_preserve_native_minimize_at_handoff(
+      true, true, false, false,
+    ));
+  }
+
+  #[test]
+  fn nonpresented_windows_and_stationary_relayouts_commit_immediately() {
+    let presented = Rect::from_xy(0, 0, 800, 600);
+    let latest = Rect::from_xy(0, 0, 1200, 600);
+
+    // Hidden/minimized windows are not visible; outgoing and ordinary
+    // stationary-workspace windows are not incoming-frozen.
+    assert!(should_commit_presented_target(
+      true,
+      false,
+      Some(&presented),
+      &latest,
+    ));
+    assert!(should_commit_presented_target(
+      false,
+      true,
+      Some(&presented),
+      &latest,
+    ));
+    assert!(should_commit_presented_target(true, true, None, &latest,));
   }
 }

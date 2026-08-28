@@ -146,6 +146,20 @@ impl PendingSync {
     self
   }
 
+  /// Removes every pending operation owned specifically by `window_id`.
+  ///
+  /// Global focus/effect flags are intentionally retained: after a
+  /// destroyed focused window is detached, those operations must run
+  /// against the newly selected safe focus target. Workspace-wide
+  /// redraw/reorder work is also preserved for surviving windows.
+  pub fn remove_window(&mut self, window_id: &Uuid) -> &mut Self {
+    self.containers_to_redraw.remove(window_id);
+    self.workspace_switch_incoming.remove(window_id);
+    self.workspace_switch_outgoing.remove(window_id);
+    self.window_state_changes.remove(window_id);
+    self
+  }
+
   pub fn queue_workspace_to_reorder(
     &mut self,
     workspace: Workspace,
@@ -156,6 +170,13 @@ impl PendingSync {
 
   pub fn queue_focus_change(&mut self) -> &mut Self {
     self.needs_focus_update = true;
+    self
+  }
+
+  /// Cancels a focus operation owned by a failed animation handoff without
+  /// disturbing unrelated redraw, effect, cursor, or workspace work.
+  pub fn dequeue_focus_change(&mut self) -> &mut Self {
+    self.needs_focus_update = false;
     self
   }
 
@@ -229,6 +250,18 @@ impl PendingSync {
     self
   }
 
+  /// Replaces the one-cycle workspace participant markers without
+  /// disturbing unrelated redraw, focus, effect, or cursor work.
+  ///
+  /// Directional redirect input uses this before installing the latest
+  /// absolute underlay so a command burst never accumulates participants.
+  pub fn clear_workspace_switch_participants(&mut self) -> &mut Self {
+    self.workspace_switch_incoming.clear();
+    self.workspace_switch_outgoing.clear();
+    self.workspace_switch_direction = 0;
+    self
+  }
+
   /// Returns `true` if the window is an incoming workspace-switch window.
   pub fn is_workspace_switch_incoming(&self, window_id: &Uuid) -> bool {
     self.workspace_switch_incoming.contains(window_id)
@@ -277,5 +310,81 @@ impl PendingSync {
   /// Returns `true` if animations should be skipped for this sync cycle.
   pub fn animations_suppressed(&self) -> bool {
     self.animations_suppressed
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use uuid::Uuid;
+
+  use super::PendingSync;
+
+  #[test]
+  fn removing_destroyed_window_preserves_other_pending_participants() {
+    let stale = Uuid::new_v4();
+    let survivor = Uuid::new_v4();
+    let mut pending = PendingSync::default();
+    pending
+      .setup_workspace_switch_incoming(stale)
+      .setup_workspace_switch_outgoing(stale)
+      .mark_window_state_change(stale)
+      .setup_workspace_switch_incoming(survivor)
+      .queue_focus_change()
+      .queue_focused_effect_update();
+
+    pending.remove_window(&stale);
+
+    assert!(!pending.is_workspace_switch_incoming(&stale));
+    assert!(!pending.is_workspace_switch_outgoing(&stale));
+    assert!(!pending.is_window_state_change(&stale));
+    assert!(pending.is_workspace_switch_incoming(&survivor));
+    assert!(pending.needs_focus_update());
+    assert!(pending.needs_focused_effect_update());
+  }
+
+  #[test]
+  fn replacing_workspace_participants_preserves_unrelated_pending_work() {
+    let old_incoming = Uuid::new_v4();
+    let old_outgoing = Uuid::new_v4();
+    let latest = Uuid::new_v4();
+    let mut pending = PendingSync::default();
+    pending
+      .setup_workspace_switch_incoming(old_incoming)
+      .setup_workspace_switch_outgoing(old_outgoing)
+      .set_workspace_switch_direction(-1)
+      .queue_focus_change()
+      .queue_focused_effect_update()
+      .queue_cursor_jump();
+
+    pending
+      .clear_workspace_switch_participants()
+      .setup_workspace_switch_incoming(latest)
+      .set_workspace_switch_direction(1);
+
+    assert!(!pending.is_workspace_switch_incoming(&old_incoming));
+    assert!(!pending.is_workspace_switch_outgoing(&old_outgoing));
+    assert!(pending.is_workspace_switch_incoming(&latest));
+    assert_eq!(pending.workspace_switch_direction(), 1);
+    assert!(pending.needs_focus_update());
+    assert!(pending.needs_focused_effect_update());
+    assert!(pending.needs_cursor_jump());
+  }
+
+  #[test]
+  fn canceling_animation_owned_focus_preserves_unrelated_pending_work() {
+    let window = Uuid::new_v4();
+    let mut pending = PendingSync::default();
+    pending
+      .queue_focus_change()
+      .queue_focused_effect_update()
+      .queue_cursor_jump()
+      .mark_window_state_change(window);
+
+    pending.dequeue_focus_change();
+
+    assert!(!pending.needs_focus_update());
+    assert!(pending.needs_focused_effect_update());
+    assert!(pending.needs_cursor_jump());
+    assert!(pending.is_window_state_change(&window));
   }
 }
