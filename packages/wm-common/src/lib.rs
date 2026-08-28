@@ -3,6 +3,7 @@
 
 mod active_drag;
 mod app_command;
+mod command_line;
 mod display_state;
 mod dtos;
 mod hide_corner;
@@ -16,6 +17,7 @@ mod workspace_layout;
 
 pub use active_drag::*;
 pub use app_command::*;
+pub use command_line::*;
 pub use display_state::*;
 pub use dtos::*;
 pub use hide_corner::*;

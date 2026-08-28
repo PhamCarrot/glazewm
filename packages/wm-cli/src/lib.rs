@@ -4,7 +4,7 @@
 use std::{future::Future, time::Duration};
 
 use anyhow::Context;
-use wm_common::ClientResponseData;
+use wm_common::{join_windows_command_line, ClientResponseData};
 use wm_ipc_client::IpcClient;
 
 const IPC_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,7 +30,7 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
   )
   .await??;
 
-  let message = args[1..].join(" ");
+  let message = join_windows_command_line(&args[1..]);
   with_ipc_timeout(
     "sending a command to the IPC server",
     IPC_OPERATION_TIMEOUT,
@@ -73,7 +73,7 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
 mod tests {
   use std::{future, time::Duration};
 
-  use super::with_ipc_timeout;
+  use super::{join_windows_command_line, with_ipc_timeout};
 
   #[tokio::test]
   async fn ipc_operation_timeout_is_bounded() {
@@ -88,5 +88,25 @@ mod tests {
     assert!(error
       .to_string()
       .contains("Timed out waiting for a test response."));
+  }
+
+  #[test]
+  fn ipc_message_preserves_os_argument_boundaries() {
+    let arguments = vec![
+      "command".to_string(),
+      "shell-exec".to_string(),
+      "pwsh.exe".to_string(),
+      "two words".to_string(),
+      String::new(),
+      r#"literal"quote"#.to_string(),
+      "C:\\path with space\\".to_string(),
+    ];
+
+    let message = join_windows_command_line(&arguments);
+    assert_eq!(
+      wm_common::parse_windows_command_line(&message)
+        .expect("CLI message should round trip"),
+      arguments
+    );
   }
 }

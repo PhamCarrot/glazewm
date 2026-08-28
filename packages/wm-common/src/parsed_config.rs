@@ -1,13 +1,26 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use wm_platform::{
   BackdropStyle, BlurOverlayParams, Color, CornerStyle, Key, Keybinding,
   LengthValue, OpacityValue, RectDelta,
 };
 
-use crate::app_command::InvokeCommand;
+use crate::{
+  app_command::InvokeCommand, workspace_layout::WorkspaceLayout,
+};
+
+/// Longest configurable animation lifetime. Ten seconds preserves generous
+/// experimentation while preventing accidental multi-day native ownership.
+pub const MAX_ANIMATION_DURATION_MS: u32 = 10_000;
+
+/// Largest movement/resize trigger threshold. This is well beyond a
+/// practical virtual desktop while remaining explicit and safely
+/// representable.
+pub const MAX_ANIMATION_THRESHOLD_PX: u32 = 100_000;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct ParsedConfig {
   pub animations: AnimationsConfig,
   pub binding_modes: Vec<BindingModeConfig>,
@@ -30,6 +43,20 @@ impl ParsedConfig {
   /// rectangles or opacity to zero. Documented normalized values are also
   /// rejected outside `[0, 1]` rather than being silently clamped later.
   pub fn validate(&self) -> Result<(), String> {
+    let mut workspace_names =
+      HashSet::with_capacity(self.workspaces.len());
+    for (index, workspace) in self.workspaces.iter().enumerate() {
+      validate_workspace_name(&workspace.name)
+        .map_err(|error| format!("workspaces[{index}].name {error}"))?;
+
+      if !workspace_names.insert(workspace.name.as_str()) {
+        return Err(format!(
+          "workspaces[{index}].name duplicates the exact, case-sensitive workspace name {:?}",
+          workspace.name
+        ));
+      }
+    }
+
     validate_effect_config(
       "window_effects.focused_window",
       &self.window_effects.focused_window,
@@ -60,7 +87,96 @@ impl ParsedConfig {
       self.animations.workspace_switch.zoom_factor,
     )?;
 
+    for (path, duration_ms) in [
+      (
+        "animations.window_move.duration_ms",
+        self.animations.window_move.duration_ms,
+      ),
+      (
+        "animations.window_resize.duration_ms",
+        self.animations.window_resize.duration_ms,
+      ),
+      (
+        "animations.focus_change.duration_ms",
+        self.animations.focus_change.duration_ms,
+      ),
+      (
+        "animations.window_open.duration_ms",
+        self.animations.window_open.duration_ms,
+      ),
+      (
+        "animations.window_close.duration_ms",
+        self.animations.window_close.duration_ms,
+      ),
+      (
+        "animations.workspace_switch.duration_ms",
+        self.animations.workspace_switch.duration_ms,
+      ),
+    ] {
+      validate_animation_duration(path, duration_ms)?;
+    }
+
+    for (path, threshold_px) in [
+      (
+        "animations.window_move.threshold_px",
+        self.animations.window_move.threshold_px,
+      ),
+      (
+        "animations.window_resize.threshold_px",
+        self.animations.window_resize.threshold_px,
+      ),
+    ] {
+      validate_animation_threshold(path, threshold_px)?;
+    }
+
     Ok(())
+  }
+}
+
+/// Validates a workspace identity without silently normalizing it.
+///
+/// Workspace names use exact, case-sensitive matching throughout command
+/// and state resolution. Internal whitespace is therefore meaningful,
+/// while empty names and leading/trailing Unicode whitespace are rejected
+/// because they are difficult to address reliably from YAML, keybindings,
+/// and IPC.
+pub fn validate_workspace_name(name: &str) -> Result<(), String> {
+  if name.trim().is_empty() {
+    return Err("must not be empty or whitespace-only".to_string());
+  }
+
+  if name != name.trim() {
+    return Err(
+      "must not contain leading or trailing whitespace".to_string(),
+    );
+  }
+
+  Ok(())
+}
+
+fn validate_animation_duration(
+  path: &str,
+  value: u32,
+) -> Result<(), String> {
+  if value <= MAX_ANIMATION_DURATION_MS {
+    Ok(())
+  } else {
+    Err(format!(
+      "{path} must be between 0 and {MAX_ANIMATION_DURATION_MS} milliseconds"
+    ))
+  }
+}
+
+fn validate_animation_threshold(
+  path: &str,
+  value: u32,
+) -> Result<(), String> {
+  if value <= MAX_ANIMATION_THRESHOLD_PX {
+    Ok(())
+  } else {
+    Err(format!(
+      "{path} must be between 0 and {MAX_ANIMATION_THRESHOLD_PX} pixels"
+    ))
   }
 }
 
@@ -114,7 +230,7 @@ pub enum TabBarPosition {
 
 /// Configuration for the stack tab bar.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct StackConfig {
   /// Height of the tab bar in pixels (0 = disabled).
   pub tab_bar_height: LengthValue,
@@ -157,7 +273,7 @@ pub struct StackConfig {
 
 /// A single regex substitution applied to a tab title before display.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct TabTitleOverride {
   /// Regular expression to match against the title.
   pub regex: String,
@@ -188,7 +304,7 @@ impl Default for StackConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all(serialize = "camelCase"))]
+#[serde(deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct BindingModeConfig {
   /// Name of the binding mode.
   pub name: String,
@@ -203,7 +319,7 @@ pub struct BindingModeConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct GapsConfig {
   /// Whether to scale the gaps with the DPI of the monitor.
   pub scale_with_dpi: bool,
@@ -236,7 +352,7 @@ impl Default for GapsConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct GeneralConfig {
   /// Config for automatically moving the cursor.
   pub cursor_jump: CursorJumpConfig,
@@ -291,7 +407,7 @@ impl Default for GeneralConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct CursorJumpConfig {
   /// Whether to automatically move the cursor on the specified trigger.
   pub enabled: bool,
@@ -318,7 +434,7 @@ pub enum HideMethod {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct KeybindingConfig {
   /// Keyboard shortcut to trigger the keybinding.
   #[serde(
@@ -332,7 +448,7 @@ pub struct KeybindingConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowBehaviorConfig {
   /// New windows are created in this state whenever possible.
   pub initial_state: InitialWindowState,
@@ -352,14 +468,14 @@ pub enum InitialWindowState {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowStateDefaultsConfig {
   pub floating: FloatingStateConfig,
   pub fullscreen: FullscreenStateConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct FloatingStateConfig {
   /// Whether to center new floating windows.
   pub centered: bool,
@@ -378,7 +494,7 @@ impl Default for FloatingStateConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct FullscreenStateConfig {
   /// Whether to prefer fullscreen windows to be maximized.
   pub maximized: bool,
@@ -397,7 +513,7 @@ impl Default for FullscreenStateConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowEffectsConfig {
   /// Visual effects to apply to the focused window.
   pub focused_window: WindowEffectConfig,
@@ -407,7 +523,7 @@ pub struct WindowEffectsConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowEffectConfig {
   /// Config for optionally applying a colored border.
   pub border: BorderEffectConfig,
@@ -427,7 +543,7 @@ pub struct WindowEffectConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct BackdropEffectConfig {
   /// Whether to enable the effect.
   pub enabled: bool,
@@ -539,7 +655,7 @@ impl BackdropEffectConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct BorderEffectConfig {
   /// Whether to enable the effect.
   pub enabled: bool,
@@ -563,14 +679,14 @@ impl Default for BorderEffectConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct HideTitleBarEffectConfig {
   /// Whether to enable the effect.
   pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct CornerEffectConfig {
   /// Whether to enable the effect.
   pub enabled: bool,
@@ -580,7 +696,7 @@ pub struct CornerEffectConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct TransparencyEffectConfig {
   /// Whether to enable the effect.
   pub enabled: bool,
@@ -590,7 +706,7 @@ pub struct TransparencyEffectConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all(serialize = "camelCase"))]
+#[serde(deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowRuleConfig {
   pub commands: Vec<InvokeCommand>,
 
@@ -605,7 +721,7 @@ pub struct WindowRuleConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowMatchConfig {
   pub window_process: Option<MatchType>,
   pub window_class: Option<MatchType>,
@@ -616,7 +732,7 @@ pub struct WindowMatchConfig {
 /// instead of a regular enum for serialization. Using a regular enum
 /// causes issues with flow-style objects in YAML.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(untagged)]
+#[serde(deny_unknown_fields, untagged)]
 pub enum MatchType {
   Equals { equals: String },
   Includes { includes: String },
@@ -657,7 +773,7 @@ pub enum WindowRuleEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all(serialize = "camelCase"))]
+#[serde(deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WorkspaceConfig {
   pub name: String,
 
@@ -669,10 +785,16 @@ pub struct WorkspaceConfig {
 
   #[serde(default = "default_bool::<false>")]
   pub keep_alive: bool,
+
+  /// Initial layout used when this workspace has no remembered runtime
+  /// selection. Once the user changes the layout, the remembered
+  /// selection takes precedence for the rest of the current WM process.
+  #[serde(default)]
+  pub default_layout: Option<WorkspaceLayout>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct AnimationsConfig {
   /// Animation settings for pure window translations (position changes
   /// only).
@@ -722,11 +844,18 @@ impl Default for AnimationsConfig {
 /// opacity values in one place while this section controls only how the
 /// transition is animated.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct FocusChangeAnimationConfig {
   pub enabled: bool,
   pub duration_ms: u32,
   pub easing: EasingFunction,
+}
+
+impl FocusChangeAnimationConfig {
+  /// Whether a focus-opacity transition has time-varying work to perform.
+  pub fn should_animate(&self) -> bool {
+    self.enabled && self.duration_ms > 0
+  }
 }
 
 impl Default for FocusChangeAnimationConfig {
@@ -782,7 +911,7 @@ impl WindowTransitionStyle {
 
 /// Animation settings for when a new window appears (Windows only).
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowOpenConfig {
   pub enabled: bool,
   pub duration_ms: u32,
@@ -800,6 +929,21 @@ pub struct WindowOpenConfig {
   /// the window fades in from fully transparent. Can be combined with
   /// any style.
   pub opacity_from: f32,
+}
+
+impl WindowOpenConfig {
+  /// Whether the open animation has work to perform.
+  ///
+  /// A zero-duration animation must use the normal visible-window
+  /// placement path instead of paying for DWM surrogate creation and
+  /// readiness ticks. Stationary, fully opaque `none` animations are
+  /// also visual no-ops.
+  pub fn should_animate(&self) -> bool {
+    self.enabled
+      && self.duration_ms > 0
+      && !(self.style == WindowTransitionStyle::None
+        && self.opacity_from >= 1.0)
+  }
 }
 
 impl Default for WindowOpenConfig {
@@ -820,7 +964,7 @@ impl Default for WindowOpenConfig {
 ///
 /// Only has an effect on Windows.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowCloseConfig {
   pub enabled: bool,
   pub duration_ms: u32,
@@ -836,6 +980,16 @@ pub struct WindowCloseConfig {
   /// Final opacity (0.0–1.0). At `0.0` the window fades to fully
   /// transparent; at `1.0` no fade is applied.
   pub opacity_to: f32,
+}
+
+impl WindowCloseConfig {
+  /// Whether the close transition has time-varying visual work to perform.
+  pub fn should_animate(&self) -> bool {
+    self.enabled
+      && self.duration_ms > 0
+      && !(self.style == WindowTransitionStyle::None
+        && self.opacity_to >= 1.0)
+  }
 }
 
 impl Default for WindowCloseConfig {
@@ -918,7 +1072,7 @@ pub enum WorkspaceSwitchDirection {
 /// or crossfades in, all constrained to the monitor on which the switch
 /// occurs.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WorkspaceSwitchAnimationConfig {
   pub enabled: bool,
   pub duration_ms: u32,
@@ -956,6 +1110,17 @@ pub struct WorkspaceSwitchAnimationConfig {
   pub zoom_factor: f32,
 }
 
+impl WorkspaceSwitchAnimationConfig {
+  /// Whether a workspace switch needs a compositor-driven transition.
+  pub fn should_animate(&self) -> bool {
+    self.enabled
+      && self.duration_ms > 0
+      && !(self.style == WorkspaceSwitchStyle::Fade
+        && self.opacity_outgoing >= 1.0
+        && self.opacity_incoming >= 1.0)
+  }
+}
+
 impl Default for WorkspaceSwitchAnimationConfig {
   fn default() -> Self {
     WorkspaceSwitchAnimationConfig {
@@ -974,7 +1139,7 @@ impl Default for WorkspaceSwitchAnimationConfig {
 
 /// Animation settings for window move operations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct AnimationTypeConfig {
   pub enabled: bool,
   pub duration_ms: u32,
@@ -984,6 +1149,13 @@ pub struct AnimationTypeConfig {
   /// changes. Increase this value on high-DPI displays to reduce
   /// sensitivity.
   pub threshold_px: u32,
+}
+
+impl AnimationTypeConfig {
+  /// Whether a move animation has time-varying work to perform.
+  pub fn should_animate(&self) -> bool {
+    self.enabled && self.duration_ms > 0
+  }
 }
 
 impl Default for AnimationTypeConfig {
@@ -999,7 +1171,7 @@ impl Default for AnimationTypeConfig {
 
 /// Animation settings for window resize operations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, rename_all(serialize = "camelCase"))]
+#[serde(default, deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct WindowResizeConfig {
   pub enabled: bool,
   pub duration_ms: u32,
@@ -1007,6 +1179,13 @@ pub struct WindowResizeConfig {
   /// Minimum pixel distance required to trigger resize animations.
   /// Increase this value on high-DPI displays to reduce sensitivity.
   pub threshold_px: u32,
+}
+
+impl WindowResizeConfig {
+  /// Whether a resize animation has time-varying work to perform.
+  pub fn should_animate(&self) -> bool {
+    self.enabled && self.duration_ms > 0
+  }
 }
 
 impl Default for WindowResizeConfig {
@@ -1320,7 +1499,251 @@ where
 
 #[cfg(test)]
 mod tests {
-  use super::BackdropEffectConfig;
+  use super::{
+    AnimationTypeConfig, BackdropEffectConfig, FocusChangeAnimationConfig,
+    ParsedConfig, WindowCloseConfig, WindowOpenConfig, WindowResizeConfig,
+    WindowTransitionStyle, WorkspaceConfig,
+    WorkspaceSwitchAnimationConfig, WorkspaceSwitchStyle,
+    MAX_ANIMATION_DURATION_MS, MAX_ANIMATION_THRESHOLD_PX,
+  };
+
+  type ConfigSetter = fn(&mut ParsedConfig, u32);
+
+  fn duration_cases() -> [(&'static str, ConfigSetter); 6] {
+    [
+      ("window_move", |c, v| {
+        c.animations.window_move.duration_ms = v
+      }),
+      ("window_resize", |c, v| {
+        c.animations.window_resize.duration_ms = v;
+      }),
+      ("focus_change", |c, v| {
+        c.animations.focus_change.duration_ms = v;
+      }),
+      ("window_open", |c, v| {
+        c.animations.window_open.duration_ms = v
+      }),
+      ("window_close", |c, v| {
+        c.animations.window_close.duration_ms = v;
+      }),
+      ("workspace_switch", |c, v| {
+        c.animations.workspace_switch.duration_ms = v;
+      }),
+    ]
+  }
+
+  fn threshold_cases() -> [(&'static str, ConfigSetter); 2] {
+    [
+      ("window_move", |c, v| {
+        c.animations.window_move.threshold_px = v
+      }),
+      ("window_resize", |c, v| {
+        c.animations.window_resize.threshold_px = v;
+      }),
+    ]
+  }
+
+  #[test]
+  fn animation_duration_bounds_cover_every_family() {
+    for accepted in [0, MAX_ANIMATION_DURATION_MS] {
+      let mut config = ParsedConfig::default();
+      for (_, set) in duration_cases() {
+        set(&mut config, accepted);
+      }
+      config.validate().unwrap_or_else(|error| {
+        panic!("duration boundary {accepted} should validate: {error}")
+      });
+    }
+
+    for (name, set) in duration_cases() {
+      let mut config = ParsedConfig::default();
+      set(&mut config, MAX_ANIMATION_DURATION_MS + 1);
+      let error = config
+        .validate()
+        .expect_err("duration above practical maximum must fail");
+      assert!(error.contains(name), "wrong error for {name}: {error}");
+    }
+  }
+
+  #[test]
+  fn workspace_names_are_nonempty_trimmed_and_exactly_unique() {
+    let workspace = |name: &str| WorkspaceConfig {
+      name: name.to_string(),
+      display_name: None,
+      bind_to_monitor: None,
+      keep_alive: false,
+      default_layout: None,
+    };
+
+    for rejected in [
+      "",
+      " ",
+      "\t",
+      " workspace",
+      "workspace ",
+      "\u{2003}workspace",
+    ] {
+      let mut config = ParsedConfig::default();
+      config.workspaces = vec![workspace(rejected)];
+      let error = config
+        .validate()
+        .expect_err("empty or edge-whitespace workspace name must fail");
+      assert!(error.contains("workspaces[0].name"), "{error}");
+    }
+
+    let mut duplicate = ParsedConfig::default();
+    duplicate.workspaces = vec![workspace("Dev"), workspace("Dev")];
+    let error = duplicate
+      .validate()
+      .expect_err("exact duplicate workspace names must fail");
+    assert!(error.contains("workspaces[1].name"), "{error}");
+    assert!(error.contains("case-sensitive"), "{error}");
+
+    let mut distinct = ParsedConfig::default();
+    distinct.workspaces =
+      vec![workspace("Dev"), workspace("dev"), workspace("Dev Tools")];
+    distinct
+      .validate()
+      .expect("case differences and internal whitespace remain distinct");
+  }
+
+  #[test]
+  fn animation_threshold_bounds_cover_move_and_resize() {
+    for accepted in [0, MAX_ANIMATION_THRESHOLD_PX] {
+      let mut config = ParsedConfig::default();
+      for (_, set) in threshold_cases() {
+        set(&mut config, accepted);
+      }
+      config.validate().unwrap_or_else(|error| {
+        panic!("threshold boundary {accepted} should validate: {error}")
+      });
+    }
+
+    for rejected in
+      [MAX_ANIMATION_THRESHOLD_PX + 1, i32::MAX as u32, u32::MAX]
+    {
+      for (name, set) in threshold_cases() {
+        let mut config = ParsedConfig::default();
+        set(&mut config, rejected);
+        let error = config
+          .validate()
+          .expect_err("threshold above practical maximum must fail");
+        assert!(error.contains(name), "wrong error for {name}: {error}");
+      }
+    }
+  }
+
+  #[test]
+  fn zero_duration_skips_every_animation_family() {
+    assert!(!AnimationTypeConfig {
+      duration_ms: 0,
+      ..AnimationTypeConfig::default()
+    }
+    .should_animate());
+    assert!(!WindowResizeConfig {
+      duration_ms: 0,
+      ..WindowResizeConfig::default()
+    }
+    .should_animate());
+    assert!(!FocusChangeAnimationConfig {
+      enabled: true,
+      duration_ms: 0,
+      ..FocusChangeAnimationConfig::default()
+    }
+    .should_animate());
+    assert!(!WindowCloseConfig {
+      enabled: true,
+      duration_ms: 0,
+      ..WindowCloseConfig::default()
+    }
+    .should_animate());
+    assert!(!WorkspaceSwitchAnimationConfig {
+      duration_ms: 0,
+      ..WorkspaceSwitchAnimationConfig::default()
+    }
+    .should_animate());
+  }
+
+  #[test]
+  fn visually_empty_transition_styles_skip_setup() {
+    assert!(!WindowCloseConfig {
+      enabled: true,
+      style: WindowTransitionStyle::None,
+      opacity_to: 1.0,
+      ..WindowCloseConfig::default()
+    }
+    .should_animate());
+    assert!(!WorkspaceSwitchAnimationConfig {
+      style: WorkspaceSwitchStyle::Fade,
+      opacity_outgoing: 1.0,
+      opacity_incoming: 1.0,
+      ..WorkspaceSwitchAnimationConfig::default()
+    }
+    .should_animate());
+
+    assert!(WindowCloseConfig {
+      enabled: true,
+      style: WindowTransitionStyle::Zoom,
+      opacity_to: 1.0,
+      ..WindowCloseConfig::default()
+    }
+    .should_animate());
+    assert!(WorkspaceSwitchAnimationConfig {
+      style: WorkspaceSwitchStyle::Zoom,
+      opacity_outgoing: 1.0,
+      opacity_incoming: 1.0,
+      ..WorkspaceSwitchAnimationConfig::default()
+    }
+    .should_animate());
+  }
+
+  #[test]
+  fn zero_duration_window_open_skips_animation_setup() {
+    for style in [
+      WindowTransitionStyle::SlideRight,
+      WindowTransitionStyle::Zoom,
+      WindowTransitionStyle::None,
+    ] {
+      let config = WindowOpenConfig {
+        duration_ms: 0,
+        style,
+        opacity_from: 0.0,
+        ..WindowOpenConfig::default()
+      };
+
+      assert!(!config.should_animate());
+    }
+  }
+
+  #[test]
+  fn window_open_requires_enabled_visual_work() {
+    let disabled = WindowOpenConfig {
+      enabled: false,
+      ..WindowOpenConfig::default()
+    };
+    assert!(!disabled.should_animate());
+
+    let no_op = WindowOpenConfig {
+      style: WindowTransitionStyle::None,
+      opacity_from: 1.0,
+      ..WindowOpenConfig::default()
+    };
+    assert!(!no_op.should_animate());
+
+    let fade = WindowOpenConfig {
+      style: WindowTransitionStyle::None,
+      opacity_from: 0.5,
+      ..WindowOpenConfig::default()
+    };
+    assert!(fade.should_animate());
+
+    let zoom = WindowOpenConfig {
+      style: WindowTransitionStyle::Zoom,
+      opacity_from: 1.0,
+      ..WindowOpenConfig::default()
+    };
+    assert!(zoom.should_animate());
+  }
 
   /// `to_overlay_params` must map every field through to the resulting
   /// `BlurOverlayParams` unchanged (plus the two parameters passed in
