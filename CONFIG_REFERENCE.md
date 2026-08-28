@@ -2,11 +2,17 @@
 
 This is the complete user-facing reference for the configuration accepted by **this build**. It covers every top-level YAML section, every child key, accepted values, source defaults, hard limits, commands usable from configuration, and the custom DComp animation, multi-layout, and stack features. It was checked against `packages/wm-common/src/parsed_config.rs`, `packages/wm-common/src/app_command.rs`, the primitive parsers in `packages/wm-platform/src/models`, command handlers in `packages/wm/src`, and `resources/assets/sample-config.yaml`.
 
+Last source reconciliation: **2026-08-28**, release **0.0.6**. Unknown keys,
+invalid numeric values, malformed quoting, and invalid compiled rule regexes
+reject the candidate configuration. Reload is transactional: the current
+configuration remains active unless parsing, validation, derived-plan creation,
+and native preflight all succeed.
+
 All YAML keys are `snake_case`. Sections and fields omitted from YAML use their source defaults unless a required list item field is noted. Commands in YAML are strings without the leading `glazewm command`; from a terminal use `glazewm.exe command <command>`. Direction values are `left`, `right`, `up`, or `down`.
 
 ## Value syntax used throughout
 
-- **Length**: a quoted integer with optional `px` or `%`, such as `"20px"`, `"10%"`, `"-2%"`; no unit means pixels. Command deltas may use `+`, for example `+2%`. YAML also accepts `{ amount: 20.0, unit: pixel }` or `{ amount: 0.2, unit: percentage }`, but the string form is clearer. Negative lengths parse; whether they are meaningful depends on the field.
+- **Length**: a quoted finite decimal with optional `px` or `%`, such as `"20px"`, `"1.5px"`, `"10%"`, or `"-2.5%"`; no unit means pixels. One leading `+`/`-` and surrounding whitespace are accepted; internal whitespace, exponent notation, unsupported units, and extra text are rejected. Hard ranges are `-100000px..=100000px` and `-1000%..=1000%`. YAML also accepts `{ amount: 20.0, unit: pixel }` or `{ amount: 0.2, unit: percentage }` under the same finite/range checks. Negative lengths parse; whether they are meaningful depends on the field.
 - **Rectangle**: `{ top: LENGTH, right: LENGTH, bottom: LENGTH, left: LENGTH }`.
 - **Color**: exactly `"#RRGGBB"` or `"#RRGGBBAA"`.
 - **Opacity**: a number from `0.0` through `1.0`, a numeric string such as `"0.95"`, or a percent such as `"95%"`. Full configuration validation rejects non-finite or out-of-range values; they are not silently clamped.
@@ -28,14 +34,14 @@ window_rules: []
 workspaces: []
 ```
 
-Unknown YAML fields are not rejected by the current Serde structs, so a typo can be silently ignored. Use the spellings below.
+Unknown YAML fields are rejected at the root and within nested/list entries. The error identifies the offending field where Serde has direct struct context. Documented migration aliases remain accepted.
 
 ## Hard limits and practical ranges
 
 | Value | Hard accepted range | Practical guidance |
 |---|---:|---|
-| `duration_ms` | `0..=4294967295` (`u32`) | `80..250` feels quick; `250..500` is expressive; above `700` usually feels slow. |
-| `threshold_px` | `0..=4294967295` (`u32`) | `0` animates every change; `5..20` suppresses tiny layout noise. |
+| `duration_ms` | `0..=10000` milliseconds | `0` snaps immediately and skips animation setup; `80..250` feels quick; `250..500` is expressive; above `700` usually feels slow. Values above 10 seconds are rejected rather than clamped. |
+| `threshold_px` | `0..=100000` pixels | `0` animates every change; `5..20` suppresses tiny layout noise. Values above the hard maximum are rejected rather than converted to signed pixels. |
 | Animation opacity fields | finite `0.0..=1.0` | `0.0` fully transparent; `1.0` fully opaque. |
 | Transparency opacity | finite `0.0..=1.0`, or equivalent `0%..100%` | Avoid `0` for normal windows because the window becomes effectively unfocusable. |
 | Workspace `zoom_factor` | finite `0.0..=1.0` | `0.03..0.15` gives subtle depth; `1.0` collapses to a point. |
@@ -44,10 +50,12 @@ Unknown YAML fields are not rejected by the current Serde structs, so a typo can
 | Backdrop `opacity` | finite `0.0..=1.0` | Applies to the acrylic overlay, not the real window. |
 | Backdrop `blur_amount` | any finite `f32` | `0..100` is a useful experimental range; source default is `30`. |
 | Backdrop `saturation` | any finite `f32` | D2D behavior is defined most usefully around `0.0..=2.0`; source default is `1`. |
+| Length pixels | finite `-100000..=100000` | Whole-input decimal syntax; no unit means pixels. |
+| Length percentages | finite `-1000%..=1000%` | Internally normalized to `-10.0..=10.0`. |
 | Workspace monitor index | `0..=4294967295` (`u32`) | Zero-based; it must identify a monitor that exists to be useful. |
 | Command monitor/index values | platform `usize`/declared integer type | Use existing zero-based indices. |
 
-`NaN`, positive infinity, and negative infinity are rejected for every animation/effect float covered by full validation. Length values currently have no equivalent finite/range validation; use ordinary finite values.
+`NaN`, positive infinity, and negative infinity are rejected for every animation/effect and length float covered by validation.
 
 ## Source-default checklist
 
@@ -182,9 +190,9 @@ animations:
 ### Shared animation fields
 
 - `enabled`: switches that animation path on/off.
-- `duration_ms`: total duration. `0` is valid and effectively immediate.
+- `duration_ms`: total duration in the enforced range `0..=10000`. `0` is valid and effectively immediate; invalid values reject the complete configuration.
 - `easing`: one of the CSS/cubic names `linear`, `ease_in`, `ease_out`, `ease_in_out`, `ease_in_cubic`, `ease_out_cubic`, `ease_in_out_cubic`; the exact power families `ease_in_quart`, `ease_out_quart`, `ease_in_out_quart`, `ease_in_quint`, `ease_out_quint`, `ease_in_out_quint`; the exact exponential family `ease_in_expo`, `ease_out_expo`, `ease_in_out_expo`; the true overshooting Back family `ease_in_back`, `ease_out_back`, `ease_in_out_back`; `ease_out_spring`; or `cubic_bezier(x1, y1, x2, y2)`. `ease_in_overshoot`, `ease_out_overshoot`, and `ease_in_out_overshoot` are aliases for the corresponding Back curves. Quart and quint are evaluated as fourth- and fifth-order power functions, Expo uses base-2 exponential formulas, and Back uses the standard `1.70158` overshoot constant. A custom curve requires exactly four floats; `x1` and `x2` must be in `[0,1]`, while the y values may exceed it for overshoot.
-- `threshold_px`: only on move/resize; changes smaller than this pixel distance do not animate.
+- `threshold_px`: only on move/resize; enforced range `0..=100000`. Changes smaller than this pixel distance do not animate.
 
 ### Window and focus animation fields
 
@@ -203,6 +211,15 @@ animations:
 - `iris_origin`: `center`, `cursor`, or `focused_window`; used by `iris` only. `focused_window` falls back to monitor center when none is available.
 - `opacity_outgoing` / `opacity_incoming`: finite float in the enforced range `0.0..=1.0`; applies to all styles. Invalid values reject the complete configuration.
 - `zoom_factor`: finite float in the enforced range `0.0..=1.0`, recommended `0.05..=0.15`; affects `slide` only. Invalid values reject the complete configuration.
+
+Rapid slide requests do not create an unbounded animation queue. An exact
+two-workspace reversal reuses the currently visible surrogate set. An
+incompatible third destination replaces one bounded absolute destination,
+stages that real workspace underneath the retained frame, then performs a
+120–180 ms directional reveal (40% of the configured duration). Logical focus,
+focus effects, cursor targets, and workspace IPC updates commit only when that
+underlay is ready. Native failure uses the visible-real-window emergency
+fallback. This scheduling policy is internal and has no YAML key.
 
 ## General/core
 
@@ -325,14 +342,27 @@ workspaces:
     display_name: "Main"
     bind_to_monitor: 0
     keep_alive: true
+    default_layout: "grid"
 ```
 
-- `name` (required string): identifier used by focus/move commands.
+- `name` (required string): identifier used by focus/move commands. Names must
+  be nonempty, have no leading or trailing Unicode whitespace, and be unique
+  by exact case-sensitive comparison. Internal whitespace is allowed, and
+  names such as `Dev` and `dev` are distinct; names are not otherwise
+  normalized.
 - `display_name` (optional string): presentation name for integrations/UI.
 - `bind_to_monitor` (optional unsigned integer): zero-based monitor index.
 - `keep_alive` (default `false`): retain the workspace when empty.
+- `default_layout` (optional): initial layout when the workspace has no
+  remembered runtime selection. Accepted values are `bsp`,
+  `split_horizontal`, `split_vertical`, `columns`, `rows`, `grid`,
+  `vertical_stack`, and `horizontal_stack`. A layout selected at runtime takes
+  precedence until GlazeWM exits; it is not persisted across restarts. If this
+  field is omitted, landscape monitors use `bsp` and portrait monitors use
+  `split_vertical`, preserving the existing behavior. Invalid names reject the
+  configuration instead of silently falling back.
 
-At runtime, `update-workspace-config [--workspace NAME] --name NEW --display-name TEXT --bind-to-monitor N --keep-alive BOOL` updates one or more of these values. Without `--workspace`, it targets the subject/focused workspace. This is runtime state, not a config-file edit.
+At runtime, `update-workspace-config [--workspace NAME] --name NEW --display-name TEXT --bind-to-monitor N --keep-alive BOOL` updates one or more of these values. The same name rules apply. A rename is rejected while a deferred workspace transition is pending so recent-workspace and transition targets cannot become stale. Without `--workspace`, it targets the subject/focused workspace. This is runtime state, not a config-file edit.
 
 ## Keybindings and binding modes
 
@@ -419,21 +449,11 @@ window_rules:
 
 This build has **no scratchpad configuration or command**. A source-wide search finds no `scratchpad`, `scratch_pad`, or `scratch-pad` schema, parser, command, or handler. Do not add a `scratchpad:` YAML section: it would be ignored as an unknown top-level key. Stacks, minimized windows, and hidden workspaces are separate features and are not scratchpads.
 
-## Included Linux-rice adaptations
-
-Copy either example to your normal GlazeWM config location, or launch it explicitly while testing:
-
-```powershell
-glazewm.exe start --config C:\path\to\config-mon4sm-inspired.yaml
-```
-
-Do not replace your real config without keeping your own backup. Both examples use `shell-exec wt` for the terminal binding; change `wt` if you use another terminal.
-
 ## IPC and commands
 
 ### Where command strings work
 
-Use the same command grammar in `keybindings[].commands`, `binding_modes[].keybindings[].commands`, `window_rules[].commands`, and the three general lifecycle command lists. YAML command parsing uses whitespace splitting, not shell quote parsing; avoid relying on quoted arguments with embedded spaces. `shell-exec` consumes all remaining words as the program command.
+Use the same command grammar in `keybindings[].commands`, `binding_modes[].keybindings[].commands`, `window_rules[].commands`, and the three general lifecycle command lists. YAML and raw IPC command strings use Windows command-line quoting: quoted spaces and empty arguments are preserved, backslashes before quotes follow Windows rules, and an unterminated quote rejects the command before dispatch. `shell-exec` consumes all remaining parsed arguments as the program command.
 
 From a terminal:
 
@@ -464,7 +484,13 @@ Square brackets below mean optional syntax; alternatives separated by `|` are mu
 - `set-minimized`, `set-tiling`: enter the named state.
 - `set-title-bar-visibility shown|hidden`: change native title-bar visibility.
 - `set-transparency --opacity OPACITY [--opacity-delta SIGNED_OPACITY]`: set and/or adjust opacity; at least one required. Examples: `--opacity 95%`, `--opacity-delta -5%`.
-- `shell-exec [--hide-window] PROGRAM [ARG ...]`: launch a process; `--hide-window` hides its console window.
+- `shell-exec [--hide-window] PROGRAM [ARG ...]`: enqueue a process launch on
+  the bounded Windows Shell worker; `--hide-window` requests a hidden initial
+  window. Parsing, unavailable-worker, stopped-WM, and queue-full errors are
+  returned immediately. A later native launch failure is written to the GlazeWM
+  log because the command has already been acknowledged after enqueue. The queue
+  holds at most 16 pending launches so a blocked Windows Shell call cannot stall
+  the WM thread or cause unbounded growth.
 - `toggle-floating [--shown-on-top[=BOOL]] [--centered[=BOOL]]`, `toggle-fullscreen [--shown-on-top[=BOOL]] [--maximized[=BOOL]]`, `toggle-minimized`, `toggle-tiling`: toggle states.
 - `toggle-stack`: move the focused tiling window into/out of a stack.
 - `cycle-stack-focus [--prev]`: cycle stack children; default is next.
@@ -484,6 +510,7 @@ Square brackets below mean optional syntax; alternatives separated by `|` are mu
 glazewm.exe query app-metadata
 glazewm.exe query binding-modes
 glazewm.exe query focused
+glazewm.exe query tiling-direction
 glazewm.exe query layout
 glazewm.exe query monitors
 glazewm.exe query windows
@@ -494,9 +521,9 @@ glazewm.exe sub --events focus_changed workspace_updated
 glazewm.exe unsub --id SUBSCRIPTION_UUID
 ```
 
-`query` also has alias `q`. Subscription event values are `all`, `application_exiting`, `binding_modes_changed`, `focus_changed`, `focused_container_moved`, `monitor_added`, `monitor_updated`, `monitor_removed`, `layout_changed`, `user_config_changed`, `window_managed`, `window_unmanaged`, `workspace_activated`, `workspace_deactivated`, `workspace_updated`, and `pause_changed`.
+`query` also has alias `q`. Subscription event values are `all`, `application_exiting`, `binding_modes_changed`, `focus_changed`, `focused_container_moved`, `monitor_added`, `monitor_updated`, `monitor_removed`, `tiling_direction_changed`, `layout_changed`, `user_config_changed`, `window_managed`, `window_unmanaged`, `workspace_activated`, `workspace_deactivated`, `workspace_updated`, and `pause_changed`.
 
-The local WebSocket IPC endpoint is fixed at `ws://127.0.0.1:6123`; there is no config key for the port. Responses are tagged with JSON `messageType` (`client_response` or `event_subscription`); event payloads use `eventType` with the values above and camelCase fields.
+The local WebSocket IPC endpoint is fixed at `ws://127.0.0.1:6123`; there is no config key for the port. Responses are tagged with JSON `messageType` (`client_response` or `event_subscription`); event payloads use `eventType` with the values above and camelCase fields. The listener accepts only a locally connected process owned by the same Windows user, rejects browser-origin handshakes, and uses hard bounds for connections, message/frame size, command/response queues, subscriptions, handshake/authentication, idle time, and writes. Existing response JSON and command-success semantics are retained. See `IPC_MIGRATION.md` for exact limits and integration guidance.
 
 ### Process startup/config selection
 

@@ -4,6 +4,8 @@ This document describes the animation names accepted by this build and the
 runtime behavior they select. Configuration examples use YAML keys exactly as
 the deserializer accepts them.
 
+Last source reconciliation: **2026-08-28**, release **0.0.6**.
+
 ## Easing names
 
 Every animation `easing` field accepts the names below or a custom cubic
@@ -150,12 +152,40 @@ the target monitor and a missing/unpositioned focused window both fall back to
 the monitor center. Unknown style, direction, or origin names reject the
 config.
 
+### Rapid workspace requests
+
+- An exact A → B → A reversal with compatible participants retargets the
+  existing two-workspace surrogate set from its last submitted frame. It does
+  not allocate another host group or snap to an endpoint.
+- An incompatible A → B → C request does not serialize two complete configured
+  slides; that experiment was rejected because destination motion could wait
+  hundreds of milliseconds and felt laggy. Instead, the latest absolute C
+  destination replaces one bounded pending slot, is redrawn as the real
+  underlay, waits one nonblocking compositor-paced readiness tick, then the
+  retained A/B frame translates/fades away with cubic ease-out.
+- Directional-reveal duration is 40% of the configured workspace duration,
+  clamped to 120–180 ms. With a 360 ms slide, it is 144 ms. New requests may
+  replace the pending underlay before reveal motion starts; after motion starts,
+  they cannot reset its geometry, direction, or clock.
+- Relative next/previous input resolves from the latest intended destination,
+  so held input advances while state remains constant-size. Logical focus,
+  recent-workspace state, cursor/focus effects, and IPC events are not published
+  until the ready underlay commits.
+- Setup/update failure abandons coverage only after the surviving destination
+  HWNDs are visible and usable. The emergency opacity/final-state fallback is
+  retained for native failure, not ordinary third-destination input.
+
 ## Timing and failure behavior
 
-All durations are unsigned integer milliseconds. `0` completes immediately.
-Animations are advanced by compositor-paced ticks when the per-monitor DXGI
-waiter is available and fall back to the normal timer path if waiter creation
-fails. Non-overshooting movement may snap only after less than one pixel of
+All durations are unsigned integer milliseconds. `0` completes immediately and
+skips animation timers, readiness state, DWM surrogates, and workspace snapshot
+setup; the normal native transition applies the final state directly.
+Animations are advanced by a persistent compositor-paced worker when the
+per-monitor DXGI waiter is available. A bounded refresh estimate drives the
+nonblocking timer fallback when waiter creation, callback delivery, or platform
+synchronization fails; no `DwmFlush` or compositor wait is performed on the WM
+thread. Due animation ticks receive deadline priority followed by a guaranteed
+non-animation service turn. Non-overshooting movement may snap only after less than one pixel of
 travel remains; overshooting Back, spring, and overshooting custom Bézier
 curves run for their full wall-clock duration so the return motion is retained.
 
