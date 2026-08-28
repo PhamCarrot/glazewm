@@ -4,23 +4,30 @@ use std::path::Path;
 use anyhow::Context;
 #[cfg(target_os = "macos")]
 use shell_util::{CommandOptions, Shell};
+use uuid::Uuid;
+use wm_common::join_windows_command_line;
 #[cfg(target_os = "windows")]
 use wm_platform::DispatcherExtWindows;
 
 use crate::wm_state::WmState;
 
 pub fn shell_exec(
-  command: &str,
+  command: &[String],
   // LINT: `hide_window` is only used on Windows.
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   hide_window: bool,
   state: &WmState,
 ) -> anyhow::Result<()> {
-  let (program, args) = parse_command(command, state)?;
+  let expanded_command = expand_command(command, state)?;
+  let (program, arguments) =
+    resolve_program_and_arguments(&expanded_command, |path| {
+      Path::new(path).is_file()
+    })?;
+  let request_id = Uuid::new_v4();
   tracing::info!(
-    "Parsed command program: '{}', args: '{}'.",
-    program,
-    args
+    %request_id,
+    argument_count = arguments.len(),
+    "Queued shell exec request; executable and arguments omitted."
   );
 
   // NOTE: The standard library's `Command::new` is not used because it
@@ -32,7 +39,7 @@ pub fn shell_exec(
     {
       Shell::spawn(
         &program,
-        args.split_whitespace(),
+        arguments.iter().map(String::as_str),
         &CommandOptions::default(),
       )
     }
@@ -40,14 +47,15 @@ pub fn shell_exec(
     {
       let home_dir =
         home::home_dir().context("Unable to get home directory.")?;
+      let serialized_arguments = join_windows_command_line(&arguments);
 
-      // TODO: Use `Shell::spawn` instead. `ShellExecuteExW` is still used
-      // to be able to launch programs from the App Paths registry
-      // (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths`), like
-      // `chrome` without it being in $PATH.
-      state.dispatcher.shell_execute_ex(
+      // `ShellExecuteExW` is retained for App Paths registry resolution
+      // (`chrome` without it being in PATH), but the platform method only
+      // performs a bounded enqueue. Native Shell work and any DDE/App
+      // Execution Alias delay run on the dedicated shell worker.
+      state.dispatcher.queue_shell_execute_ex(
         &program,
-        &args,
+        &serialized_arguments,
         &home_dir,
         hide_window,
       )
@@ -56,102 +64,143 @@ pub fn shell_exec(
 
   result.map_err(|err| {
     anyhow::anyhow!(
-      "Shell exec failed for '{command}'. Make sure the program exists and is \
-      accessible from your shell. Error: {err}",
+      "Shell exec request {request_id} failed. The command must be valid and \
+      the bounded shell-launch worker must be available. Error category: \
+      {err}",
     )
   })?;
 
   Ok(())
 }
 
-/// Parses a command string into a program name/path and arguments. This
-/// also expands any environment variables found in the command string if
-/// they are wrapped in `%` characters. If the command string is a path,
-/// a file extension is required.
-///
-/// This is similar to the `SHEvaluateSystemCommandTemplate` Win32
-/// function. It also parses program name/path and arguments, but can't
-/// handle `/` as file path delimiters and it errors for certain programs
-/// (e.g. `code`).
-///
-/// Returns a tuple containing the program name/path and arguments.
-///
-/// # Examples
-///
-/// ```ignore
-/// let (prog, args) = parse_command("code .")?;
-/// assert_eq!(prog, "code");
-/// assert_eq!(args, ".");
-///
-/// let (prog, args) = parse_command(
-///   r#"C:\Program Files\Git\git-bash --cd=C:\Users\larsb\.glaze-wm"#,
-/// )?;
-/// assert_eq!(prog, r#"C:\Program Files\Git\git-bash"#);
-/// assert_eq!(args, r#"--cd=C:\Users\larsb\.glaze-wm"#);
-/// ```
-fn parse_command(
-  command: &str,
+fn expand_command(
+  command: &[String],
   // LINT: `state` is only used on Windows.
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   state: &WmState,
-) -> anyhow::Result<(String, String)> {
-  // Expand environment variables in the command string.
-  let expanded_command = {
-    #[cfg(target_os = "windows")]
-    {
-      state.dispatcher.expand_env_strings(command)?
-    }
-    #[cfg(target_os = "macos")]
-    {
-      // TODO: Expand env variables on macOS.
-      command.to_string()
-    }
-  };
+) -> anyhow::Result<Vec<String>> {
+  #[cfg(target_os = "windows")]
+  {
+    command
+      .iter()
+      .map(|argument| state.dispatcher.expand_env_strings(argument))
+      .collect::<wm_platform::Result<Vec<_>>>()
+      .map_err(anyhow::Error::from)
+  }
+  #[cfg(target_os = "macos")]
+  {
+    // TODO: Expand environment variables on macOS.
+    Ok(command.to_vec())
+  }
+}
 
-  let command_parts =
-    expanded_command.split_whitespace().collect::<Vec<_>>();
+/// Resolves the executable without changing the remaining argument vector.
+/// A split executable path is combined only for backwards compatibility
+/// with legacy unquoted config such as `C:\Program Files\App\app.exe
+/// --flag`.
+fn resolve_program_and_arguments<F>(
+  command: &[String],
+  mut is_file: F,
+) -> anyhow::Result<(String, Vec<String>)>
+where
+  F: FnMut(&str) -> bool,
+{
+  let first = command
+    .first()
+    .filter(|program| !program.is_empty())
+    .ok_or_else(|| anyhow::anyhow!("Shell exec command is empty."))?;
 
-  // If the command starts with double quotes, then the program name/path
-  // is wrapped in double quotes (e.g. `"C:\path\to\app.exe" --flag`).
-  if expanded_command.starts_with('"') {
-    // Find the closing double quote.
-    let (closing_index, _) =
-      expanded_command.match_indices('"').nth(2).ok_or_else(|| {
-        anyhow::anyhow!(
-          "Shell exec failed for '{command}': command doesn't have an ending `\"`."
-        )
-      })?;
-
-    return Ok((
-      expanded_command[1..closing_index].to_string(),
-      expanded_command[closing_index + 1..].trim().to_string(),
-    ));
+  if !first.contains(&['/', '\\'][..]) || is_file(first) {
+    return Ok((first.clone(), command[1..].to_vec()));
   }
 
-  // The first part is the program name if it doesn't contain a slash or
-  // backslash.
-  if let Some(first_part) = command_parts.first() {
-    if !first_part.contains(&['/', '\\'][..]) {
-      let args = command_parts[1..].join(" ");
-      return Ok(((*first_part).to_string(), args));
-    }
-  }
-
-  let mut cumulative_path = Vec::new();
-
-  // Lastly, iterate over the command until a valid file path is found.
-  for (part_index, &part) in command_parts.iter().enumerate() {
-    cumulative_path.push(part);
-
-    if Path::new(&cumulative_path.join(" ")).is_file() {
-      return Ok((
-        cumulative_path.join(" "),
-        command_parts[part_index + 1..].join(" "),
-      ));
+  let mut cumulative_path = first.clone();
+  for part_index in 1..command.len() {
+    cumulative_path.push(' ');
+    cumulative_path.push_str(&command[part_index]);
+    if is_file(&cumulative_path) {
+      return Ok((cumulative_path, command[part_index + 1..].to_vec()));
     }
   }
 
-  anyhow::bail!(
-    "Shell exec failed for '{command}': program path is not valid."
-  )
+  anyhow::bail!("Shell exec program path is not valid.")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+  }
+
+  #[test]
+  fn preserves_exact_arguments_and_shell_metacharacters() {
+    let command = strings(&[
+      "pwsh.exe",
+      "-Command",
+      "Write-Output \"hello world\"",
+      "",
+      "&",
+      "|",
+      "C:\\trailing\\",
+    ]);
+    let (program, arguments) =
+      resolve_program_and_arguments(&command, |_| false).expect(
+        "App Paths executable should resolve without path probing",
+      );
+
+    assert_eq!(program, "pwsh.exe");
+    assert_eq!(arguments, command[1..]);
+    let serialized = join_windows_command_line(&arguments);
+    assert_eq!(
+      wm_common::parse_windows_command_line(&serialized)
+        .expect("ShellExecute arguments should round trip"),
+      arguments
+    );
+  }
+
+  #[test]
+  fn resolves_quoted_and_legacy_unquoted_executable_paths() {
+    let quoted =
+      strings(&[r"C:\Program Files\App\app.exe", "two words", ""]);
+    let resolved = resolve_program_and_arguments(&quoted, |path| {
+      path == r"C:\Program Files\App\app.exe"
+    })
+    .expect("single quoted path token should resolve");
+    assert_eq!(resolved, (quoted[0].clone(), quoted[1..].to_vec()));
+
+    let legacy =
+      strings(&[r"C:\Program", r"Files\App\app.exe", "two words", ""]);
+    let resolved = resolve_program_and_arguments(&legacy, |path| {
+      path == r"C:\Program Files\App\app.exe"
+    })
+    .expect("legacy split executable path should resolve");
+    assert_eq!(
+      resolved,
+      (
+        r"C:\Program Files\App\app.exe".to_string(),
+        legacy[2..].to_vec(),
+      )
+    );
+  }
+
+  #[test]
+  fn invalid_or_empty_program_fails_before_launch_planning_completes() {
+    let mut probes = 0;
+    let result = resolve_program_and_arguments(
+      &strings(&[r"C:\missing\app.exe", "argument"]),
+      |_| {
+        probes += 1;
+        false
+      },
+    );
+    assert!(result.is_err());
+    assert_eq!(probes, 2);
+
+    assert!(resolve_program_and_arguments(&[], |_| true).is_err());
+    assert!(
+      resolve_program_and_arguments(&[String::new()], |_| true).is_err()
+    );
+  }
 }
