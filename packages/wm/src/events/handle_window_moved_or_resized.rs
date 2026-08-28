@@ -1,7 +1,7 @@
 use anyhow::Context;
 use wm_common::{
-  try_warn, ActiveDrag, ActiveDragOperation, DisplayState,
-  FloatingStateConfig, FullscreenStateConfig, HideMethod, WindowState,
+  ActiveDrag, ActiveDragOperation, DisplayState, FloatingStateConfig,
+  FullscreenStateConfig, HideMethod, WindowState,
 };
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
@@ -11,8 +11,11 @@ use wm_platform::{NativeWindow, Rect};
 
 #[cfg(target_os = "windows")]
 use crate::commands::general::{
-  blur_overlay_params_for, upsert_blur_overlay,
+  blur_overlay_params_for, remove_failed_blur_overlays,
+  upsert_blur_overlay,
 };
+#[cfg(target_os = "windows")]
+use crate::commands::window::isolate_destroyed_window;
 use crate::{
   commands::{
     container::{flatten_split_container, move_container_within_tree},
@@ -24,6 +27,46 @@ use crate::{
   user_config::UserConfig,
   wm_state::WmState,
 };
+
+#[cfg(target_os = "windows")]
+fn native_event_target_was_destroyed(
+  error: &wm_platform::Error,
+  native_is_valid: bool,
+) -> bool {
+  error.is_invalid_window_handle() || !native_is_valid
+}
+
+fn native_event_query_or_warn<T>(
+  result: Result<T, wm_platform::Error>,
+  window: &WindowContainer,
+  state: &mut WmState,
+  operation: &str,
+) -> Option<T> {
+  match result {
+    Ok(value) => Some(value),
+    Err(err) => {
+      #[cfg(target_os = "windows")]
+      {
+        let (expected_handle, native_is_valid) = {
+          let native = window.native();
+          (native.id().0, native.is_valid())
+        };
+        if native_event_target_was_destroyed(&err, native_is_valid) {
+          isolate_destroyed_window(
+            window.id(),
+            expected_handle,
+            state,
+            operation,
+          );
+          return None;
+        }
+      }
+
+      tracing::warn!("Operation failed: {err:?}");
+      None
+    }
+  }
+}
 
 #[allow(clippy::too_many_lines)]
 pub fn handle_window_moved_or_resized(
@@ -41,7 +84,18 @@ pub fn handle_window_moved_or_resized(
 
   if let Some(window) = found_window {
     let old_frame_position = window.native_properties().frame;
-    let frame_position = try_warn!(window.native().frame());
+    let frame_result = {
+      let native = window.native();
+      native.frame()
+    };
+    let Some(frame_position) = native_event_query_or_warn(
+      frame_result,
+      &window,
+      state,
+      "move/resize frame query",
+    ) else {
+      return Ok(());
+    };
 
     window.update_native_properties(|properties| {
       properties.frame = frame_position.clone();
@@ -78,7 +132,12 @@ pub fn handle_window_moved_or_resized(
             &frame_position,
             &mut batch,
           );
-          batch.commit();
+          let result = batch.commit();
+          remove_failed_blur_overlays(
+            state,
+            &result,
+            "interactive-drag tracking",
+          );
         }
       }
 
@@ -111,7 +170,18 @@ pub fn handle_window_moved_or_resized(
     }
 
     let old_is_maximized = window.native_properties().is_maximized;
-    let is_maximized = try_warn!(window.native().is_maximized());
+    let maximized_result = {
+      let native = window.native();
+      native.is_maximized()
+    };
+    let Some(is_maximized) = native_event_query_or_warn(
+      maximized_result,
+      &window,
+      state,
+      "move/resize maximized query",
+    ) else {
+      return Ok(());
+    };
 
     // Ignore duplicate move/resize events. Window position changes can
     // trigger multiple events. For example, restoring from maximized can
@@ -132,7 +202,18 @@ pub fn handle_window_moved_or_resized(
     // we should use its previous value for redraws.
     #[cfg(target_os = "windows")]
     {
-      let shadow_borders = try_warn!(window.native().shadow_borders());
+      let shadow_result = {
+        let native = window.native();
+        native.shadow_borders()
+      };
+      let Some(shadow_borders) = native_event_query_or_warn(
+        shadow_result,
+        &window,
+        state,
+        "move/resize shadow-border query",
+      ) else {
+        return Ok(());
+      };
       if !is_maximized {
         window.update_native_properties(|properties| {
           properties.shadow_borders = shadow_borders;
@@ -140,7 +221,18 @@ pub fn handle_window_moved_or_resized(
       }
     }
 
-    let is_minimized = try_warn!(window.native().is_minimized());
+    let minimized_result = {
+      let native = window.native();
+      native.is_minimized()
+    };
+    let Some(is_minimized) = native_event_query_or_warn(
+      minimized_result,
+      &window,
+      state,
+      "move/resize minimized query",
+    ) else {
+      return Ok(());
+    };
 
     // Ignore events for minimized windows. Let them be handled by the
     // `PlatformEvent::WindowMinimized` event handler instead.
@@ -581,6 +673,19 @@ mod tests {
   use wm_platform::Rect;
 
   use super::is_in_corner;
+  #[cfg(target_os = "windows")]
+  use super::native_event_target_was_destroyed;
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn stale_queries_are_isolated_but_live_errors_are_not() {
+    let destroyed = wm_platform::Error::WindowNotFound;
+    let live = wm_platform::Error::Platform("still live".to_string());
+
+    assert!(native_event_target_was_destroyed(&destroyed, true));
+    assert!(native_event_target_was_destroyed(&live, false));
+    assert!(!native_event_target_was_destroyed(&live, true));
+  }
 
   #[test]
   fn matches_corner_positions() {

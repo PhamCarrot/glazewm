@@ -1,12 +1,3 @@
-#[cfg(target_os = "windows")]
-use std::{
-  sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-  },
-  time::Duration,
-};
-
 use anyhow::Context;
 use tracing::info;
 use wm_common::{WindowRuleEvent, WindowState, WmEvent};
@@ -14,6 +5,8 @@ use wm_common::{WindowRuleEvent, WindowState, WmEvent};
 use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{NativeWindow, RectDelta, WindowId};
 
+#[cfg(target_os = "windows")]
+use crate::wm_state::VisibilityLease;
 use crate::{
   commands::{
     container::{attach_container, set_focused_descendant},
@@ -31,9 +24,6 @@ use crate::{
 const MAX_MANAGE_RETRIES: u8 = 3;
 const MANAGE_RETRY_BASE_DELAY_MS: u64 = 50;
 #[cfg(target_os = "windows")]
-const EARLY_CLOAK_TIMEOUT_MS: u64 = 250;
-
-#[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EarlyWindowTraits {
   is_child: bool,
@@ -46,95 +36,6 @@ fn should_early_cloak(traits: EarlyWindowTraits) -> bool {
   !traits.is_child
     && !traits.is_tool_or_no_activate
     && !traits.is_owned_without_caption
-}
-
-/// Owns an early cloak until normal platform synchronization takes over.
-///
-/// Dropping the lease restores visibility. The timeout uses the same
-/// idempotent release path, so a stalled classification cannot strand an
-/// HWND even if the main event loop is temporarily blocked.
-#[cfg(target_os = "windows")]
-struct EarlyCloakLease {
-  active: Arc<AtomicBool>,
-  uncloak: Arc<dyn Fn() + Send + Sync>,
-}
-
-#[cfg(target_os = "windows")]
-impl EarlyCloakLease {
-  fn arm(native_window: &NativeWindow) -> Option<Self> {
-    if let Err(err) = native_window.set_cloaked(true) {
-      tracing::warn!(
-        "Failed to early-cloak window {:?}; continuing visibly: {err:#}",
-        native_window.id(),
-      );
-      return None;
-    }
-
-    let window_to_restore = native_window.clone();
-    let window_id = native_window.id();
-    let uncloak: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-      if window_to_restore.is_valid() {
-        if let Err(err) = window_to_restore.set_cloaked(false) {
-          tracing::warn!(
-            "Failed to restore visibility for early-cloaked window \
-             {window_id:?}: {err:#}"
-          );
-        }
-      }
-    });
-
-    Some(Self::with_timeout(
-      uncloak,
-      Duration::from_millis(EARLY_CLOAK_TIMEOUT_MS),
-      window_id,
-    ))
-  }
-
-  fn with_timeout(
-    uncloak: Arc<dyn Fn() + Send + Sync>,
-    timeout: Duration,
-    window_id: WindowId,
-  ) -> Self {
-    let active = Arc::new(AtomicBool::new(true));
-    let timeout_active = Arc::clone(&active);
-    let timeout_uncloak = Arc::clone(&uncloak);
-
-    tokio::spawn(async move {
-      tokio::time::sleep(timeout).await;
-      if Self::release_shared(&timeout_active, &timeout_uncloak) {
-        tracing::warn!(
-          "Early classification cloak timed out for window {window_id:?}; \
-           restored visibility while management continues."
-        );
-      }
-    });
-
-    Self { active, uncloak }
-  }
-
-  fn release_shared(
-    active: &AtomicBool,
-    uncloak: &Arc<dyn Fn() + Send + Sync>,
-  ) -> bool {
-    if active.swap(false, Ordering::AcqRel) {
-      uncloak();
-      true
-    } else {
-      false
-    }
-  }
-
-  /// Transfers visibility ownership to animation/platform synchronization.
-  fn transfer(self) {
-    self.active.store(false, Ordering::Release);
-  }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for EarlyCloakLease {
-  fn drop(&mut self) {
-    Self::release_shared(&self.active, &self.uncloak);
-  }
 }
 
 pub fn manage_window(
@@ -180,20 +81,54 @@ fn manage_window_attempt(
   failed_attempts: u8,
 ) -> anyhow::Result<()> {
   #[cfg(target_os = "windows")]
-  let mut early_cloak = match early_cloak_candidate(&native_window) {
+  let should_early_cloak = match early_cloak_candidate(&native_window) {
     Ok(None) => {
       state
         .pending_window_manage_retries
         .remove(&native_window.id());
       return Ok(());
     }
-    Ok(Some(true)) => EarlyCloakLease::arm(&native_window),
-    Ok(Some(false)) => None,
+    Ok(Some(should_cloak)) => should_cloak,
     Err(err) => {
       schedule_manage_retry(native_window, failed_attempts, state, &err);
       return Ok(());
     }
   };
+
+  // An ordinary, non-UIAccess process cannot safely manipulate windows
+  // owned by a higher-integrity or protected process. Leaving such a
+  // window visible and unmanaged prevents repeated cloak/effect/position
+  // failures from aborting every later platform-sync pass. An elevated
+  // or valid UIAccess build passes this check and retains the existing
+  // behavior.
+  #[cfg(target_os = "windows")]
+  match native_window.is_accessible_by_current_process() {
+    Ok(true) => {}
+    Ok(false) => {
+      state
+        .pending_window_manage_retries
+        .remove(&native_window.id());
+      if !state.ignored_windows.contains(&native_window) {
+        state.ignored_windows.push(native_window.clone());
+      }
+      tracing::warn!(
+        "Leaving elevated or protected window {:?} visible and unmanaged; \
+         the current GlazeWM token cannot safely control it.",
+        native_window.id(),
+      );
+      return Ok(());
+    }
+    Err(err) => {
+      let err = anyhow::Error::from(err);
+      schedule_manage_retry(native_window, failed_attempts, state, &err);
+      return Ok(());
+    }
+  }
+
+  #[cfg(target_os = "windows")]
+  let mut early_cloak = should_early_cloak
+    .then(|| VisibilityLease::arm(&native_window))
+    .flatten();
 
   let native_properties = match check_is_manageable(
     &native_window,
@@ -251,6 +186,8 @@ fn manage_window_attempt(
 
   if let Some(window) = updated_window {
     info!("New window managed: {window}");
+    #[cfg(target_os = "windows")]
+    let managed_window_id = window.id();
 
     state.emit_event(WmEvent::WindowManaged {
       managed_window: window.to_dto()?,
@@ -278,12 +215,12 @@ fn manage_window_attempt(
       },
     );
 
-    // All fallible management work is complete. The existing
-    // open-animation and platform-sync paths now own when the real
-    // HWND becomes visible.
+    // Keep the early cloak owned by WmState through the following fallible
+    // platform-sync pass. Ownership transfers only after native visibility
+    // or an animation surrogate is demonstrably ready.
     #[cfg(target_os = "windows")]
     if let Some(lease) = early_cloak.take() {
-      lease.transfer();
+      state.register_visibility_lease(managed_window_id, lease);
     }
   } else {
     // Window was detached by an `ignore` rule. The early-cloak lease drops
@@ -684,7 +621,9 @@ mod tests {
 
   use super::{next_manage_retry_attempt, remove_pending_manage_retry};
   #[cfg(target_os = "windows")]
-  use super::{should_early_cloak, EarlyCloakLease, EarlyWindowTraits};
+  use super::{should_early_cloak, EarlyWindowTraits};
+  #[cfg(target_os = "windows")]
+  use crate::wm_state::VisibilityLease;
 
   #[test]
   fn native_property_retries_are_bounded() {
@@ -744,8 +683,8 @@ mod tests {
     let action = test_uncloak_action(&cloaked, &calls);
     let active = AtomicBool::new(true);
 
-    assert!(EarlyCloakLease::release_shared(&active, &action));
-    assert!(!EarlyCloakLease::release_shared(&active, &action));
+    assert!(VisibilityLease::release_shared(&active, &action));
+    assert!(!VisibilityLease::release_shared(&active, &action));
     assert!(!cloaked.load(Ordering::Acquire));
     assert_eq!(calls.load(Ordering::Acquire), 1);
   }
@@ -755,10 +694,10 @@ mod tests {
   async fn cloak_lease_timeout_restores_visibility() {
     let cloaked = Arc::new(AtomicBool::new(true));
     let calls = Arc::new(AtomicUsize::new(0));
-    let lease = EarlyCloakLease::with_timeout(
+    let lease = VisibilityLease::for_test(
+      WindowId(42),
       test_uncloak_action(&cloaked, &calls),
       std::time::Duration::from_millis(1),
-      WindowId(42),
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -769,14 +708,15 @@ mod tests {
   }
 
   #[cfg(target_os = "windows")]
-  #[test]
-  fn successful_transfer_leaves_visibility_to_platform_sync() {
+  #[tokio::test]
+  async fn successful_transfer_leaves_visibility_to_platform_sync() {
     let cloaked = Arc::new(AtomicBool::new(true));
     let calls = Arc::new(AtomicUsize::new(0));
-    let lease = EarlyCloakLease {
-      active: Arc::new(AtomicBool::new(true)),
-      uncloak: test_uncloak_action(&cloaked, &calls),
-    };
+    let lease = VisibilityLease::for_test(
+      WindowId(42),
+      test_uncloak_action(&cloaked, &calls),
+      std::time::Duration::from_secs(60),
+    );
 
     lease.transfer();
     assert!(cloaked.load(Ordering::Acquire));
@@ -784,15 +724,16 @@ mod tests {
   }
 
   #[cfg(target_os = "windows")]
-  #[test]
-  fn repeated_failed_creations_never_leave_a_cloak_owned() {
+  #[tokio::test]
+  async fn repeated_failed_creations_never_leave_a_cloak_owned() {
     for _ in 0..128 {
       let cloaked = Arc::new(AtomicBool::new(true));
       let calls = Arc::new(AtomicUsize::new(0));
-      let lease = EarlyCloakLease {
-        active: Arc::new(AtomicBool::new(true)),
-        uncloak: test_uncloak_action(&cloaked, &calls),
-      };
+      let lease = VisibilityLease::for_test(
+        WindowId(42),
+        test_uncloak_action(&cloaked, &calls),
+        std::time::Duration::from_secs(60),
+      );
 
       drop(lease);
       assert!(!cloaked.load(Ordering::Acquire));

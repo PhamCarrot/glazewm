@@ -76,8 +76,12 @@ pub fn handle_window_focused(
         &state.pending_presented_focus_effect_handoff,
         window.id(),
       ) {
-        commit_presented_focus_effect_handoff(&window, state, config)?;
+        let target_survived =
+          commit_presented_focus_effect_handoff(&window, state, config)?;
         state.pending_presented_focus_effect_handoff = None;
+        if !target_survived {
+          return Ok(());
+        }
       } else {
         state.pending_sync.queue_focused_effect_update();
       }

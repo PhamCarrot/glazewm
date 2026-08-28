@@ -243,6 +243,7 @@ impl Workspace {
       display_name,
       bind_to_monitor: None,
       keep_alive: false,
+      default_layout: None,
     };
 
     let workspace = Self::new(config, gaps_config, layout);

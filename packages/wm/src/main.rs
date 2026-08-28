@@ -14,12 +14,7 @@ use std::io::IsTerminal;
 use std::{env, path::PathBuf, process, time::Duration};
 
 use anyhow::{Context, Error};
-use tokio::{
-  process::Command,
-  signal,
-  sync::{broadcast, mpsc},
-};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::{process::Command, signal, sync::mpsc};
 use tracing::Level;
 use tracing_subscriber::{
   fmt::{self, writer::MakeWriterExt},
@@ -28,6 +23,8 @@ use tracing_subscriber::{
 use wm_common::{AppCommand, InvokeCommand, Verbosity, WmEvent};
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
+#[cfg(target_os = "windows")]
+use wm_platform::DispatcherExtWindows;
 use wm_platform::{
   Dispatcher, DisplayListener, EventLoop, KeybindingEvent,
   KeybindingListener, MouseEvent, MouseEventKind, MouseListener,
@@ -36,7 +33,9 @@ use wm_platform::{
 };
 
 use crate::{
-  ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
+  ipc_server::{IncomingIpcMessage, IpcServer},
+  sys_tray::SystemTray,
+  user_config::UserConfig,
   wm::WindowManager,
 };
 
@@ -65,10 +64,12 @@ enum NonAnimationInput {
   Keybinding(KeybindingEvent),
   WindowManageRetry(NativeWindow, u8),
   Cleanup,
-  IpcMessage(String, mpsc::Sender<Message>, broadcast::Sender<()>),
+  IpcMessage(IncomingIpcMessage),
   TabClick(uuid::Uuid, usize),
   WmEvent(WmEvent),
   ConfigReload,
+  AnimationWatchdog,
+  BlurOverlayReady,
 }
 
 enum MainLoopInput {
@@ -112,14 +113,11 @@ async fn next_non_animation_input(
   keybinding_listener: &mut KeybindingListener,
   window_manage_retry_rx: &mut mpsc::UnboundedReceiver<(NativeWindow, u8)>,
   cleanup_interval: &mut tokio::time::Interval,
-  ipc_message_rx: &mut mpsc::Receiver<(
-    String,
-    mpsc::Sender<Message>,
-    broadcast::Sender<()>,
-  )>,
+  ipc_message_rx: &mut mpsc::Receiver<IncomingIpcMessage>,
   tab_click_rx: &mut mpsc::UnboundedReceiver<(uuid::Uuid, usize)>,
   event_rx: &mut mpsc::UnboundedReceiver<WmEvent>,
   config_reload_rx: &mut mpsc::UnboundedReceiver<()>,
+  animation_watchdog_deadline: Option<std::time::Instant>,
 ) -> NonAnimationInput {
   tokio::select! {
     _ = signal::ctrl_c() => NonAnimationInput::CtrlC,
@@ -141,12 +139,8 @@ async fn next_non_animation_input(
       NonAnimationInput::WindowManageRetry(native_window, attempt)
     },
     _ = cleanup_interval.tick() => NonAnimationInput::Cleanup,
-    Some((message, response_tx, disconnection_tx)) = ipc_message_rx.recv() => {
-      NonAnimationInput::IpcMessage(
-        message,
-        response_tx,
-        disconnection_tx,
-      )
+    Some(message) = ipc_message_rx.recv() => {
+      NonAnimationInput::IpcMessage(message)
     },
     Some((stack_id, tab_index)) = tab_click_rx.recv() => {
       NonAnimationInput::TabClick(stack_id, tab_index)
@@ -155,12 +149,42 @@ async fn next_non_animation_input(
       NonAnimationInput::WmEvent(wm_event)
     },
     Some(()) = config_reload_rx.recv() => NonAnimationInput::ConfigReload,
+    () = wait_for_animation_watchdog(animation_watchdog_deadline) => {
+      NonAnimationInput::AnimationWatchdog
+    },
+    () = wait_for_blur_overlay_ready() => {
+      NonAnimationInput::BlurOverlayReady
+    },
+  }
+}
+
+#[cfg(target_os = "windows")]
+async fn wait_for_blur_overlay_ready() {
+  wm_platform::wait_for_blur_overlay_composition().await;
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn wait_for_blur_overlay_ready() {
+  std::future::pending::<()>().await;
+}
+
+async fn wait_for_animation_watchdog(
+  deadline: Option<std::time::Instant>,
+) {
+  match deadline {
+    Some(deadline) => {
+      tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))
+        .await;
+    }
+    None => std::future::pending::<()>().await,
   }
 }
 
 #[cfg(test)]
 mod scheduler_tests {
-  use super::AnimationFrameScheduler;
+  use std::time::{Duration, Instant};
+
+  use super::{wait_for_animation_watchdog, AnimationFrameScheduler};
 
   #[test]
   fn animation_frame_creates_one_non_animation_turn() {
@@ -183,6 +207,28 @@ mod scheduler_tests {
     assert!(!scheduler.should_prioritize_pending_tick());
     scheduler.on_non_animation_work();
     assert!(scheduler.should_prioritize_pending_tick());
+  }
+
+  #[tokio::test]
+  async fn inactive_animation_watchdog_never_polls_the_event_loop() {
+    assert!(tokio::time::timeout(
+      Duration::from_millis(10),
+      wait_for_animation_watchdog(None),
+    )
+    .await
+    .is_err());
+  }
+
+  #[tokio::test]
+  async fn animation_watchdog_wakes_at_its_control_side_deadline() {
+    tokio::time::timeout(
+      Duration::from_millis(100),
+      wait_for_animation_watchdog(Some(
+        Instant::now() + Duration::from_millis(5),
+      )),
+    )
+    .await
+    .expect("watchdog deadline should wake independently");
   }
 }
 
@@ -265,6 +311,15 @@ async fn start_wm(
   // Ensure that only one instance of the WM is running.
   let _single_instance = SingleInstance::new()?;
 
+  // Start the bounded STA shell worker before keybindings/startup commands
+  // can use it. If initialization is unavailable, retain that failure in
+  // the platform layer so every shell command fails immediately without
+  // retrying thread creation or blocking the WM loop.
+  #[cfg(target_os = "windows")]
+  if let Err(err) = dispatcher.initialize_shell_launch_worker() {
+    tracing::warn!("Shell-launch worker is unavailable: {err}.");
+  }
+
   #[cfg(target_os = "macos")]
   {
     if !dispatcher.has_ax_permission(true) {
@@ -277,6 +332,12 @@ async fn start_wm(
 
   // Parse and validate user config.
   let mut config = UserConfig::new(config_path)?;
+
+  // The only synchronous Composition initialization happens before window
+  // management, IPC, native listeners or user commands can enter the WM.
+  // Runtime overlay creation and effect rebuilds are actor-driven.
+  #[cfg(target_os = "windows")]
+  let _ = wm_platform::initialize_blur_overlay_composition_actor();
 
   // Add application icon to system tray.
   let mut tray = SystemTray::new(&config.path, dispatcher.clone())?;
@@ -358,6 +419,8 @@ async fn start_wm(
     }
 
     let input = {
+      let animation_watchdog_deadline =
+        wm.animation_timer_watchdog_deadline();
       let next_non_animation = next_non_animation_input(
         &mut wm.exit_rx,
         &mut tray.exit_rx,
@@ -371,6 +434,7 @@ async fn start_wm(
         &mut wm.tab_click_rx,
         &mut wm.event_rx,
         &mut tray.config_reload_rx,
+        animation_watchdog_deadline,
       );
       tokio::pin!(next_non_animation);
 
@@ -456,6 +520,8 @@ async fn start_wm(
       }
       MainLoopInput::NonAnimation(NonAnimationInput::Cleanup) => {
         frame_scheduler.on_non_animation_work();
+        #[cfg(target_os = "windows")]
+        wm_platform::reap_orphaned_blur_overlay_composition();
         if wm.state.is_paused {
           Ok(())
         } else {
@@ -464,20 +530,18 @@ async fn start_wm(
       }
       MainLoopInput::NonAnimation(NonAnimationInput::IpcMessage(
         message,
-        response_tx,
-        disconnection_tx,
       )) => {
         frame_scheduler.on_non_animation_work();
-        tracing::info!("Received IPC message: {:?}", message);
+        let correlation_id = message.correlation_id;
 
-        if let Err(err) = ipc_server.process_message(
-          message,
-          &response_tx,
-          &disconnection_tx,
-          &mut wm,
-          &mut config,
-        ) {
-          tracing::error!("{:?}", err);
+        if let Err(err) =
+          ipc_server.process_message(message, &mut wm, &mut config)
+        {
+          tracing::error!(
+            correlation_id,
+            error = %err,
+            "IPC request processing failed; payload omitted."
+          );
         }
 
         Ok(())
@@ -501,7 +565,10 @@ async fn start_wm(
         wm_event,
       )) => {
         frame_scheduler.on_non_animation_work();
-        tracing::debug!("Received WM event: {:?}", wm_event);
+        tracing::debug!(
+          event_name = wm_event.diagnostic_name(),
+          "Received WM event; payload omitted."
+        );
 
         // Disable mouse listener when the WM is paused.
         if let WmEvent::PauseChanged { is_paused } = wm_event {
@@ -537,6 +604,17 @@ async fn start_wm(
 
         Ok(())
       }
+      MainLoopInput::NonAnimation(NonAnimationInput::BlurOverlayReady) => {
+        frame_scheduler.on_non_animation_work();
+        #[cfg(target_os = "windows")]
+        {
+          for overlay in wm.state.blur_overlays.values_mut() {
+            overlay.finish_composition_upgrade();
+          }
+          wm_platform::reap_orphaned_blur_overlay_composition();
+        }
+        Ok(())
+      }
       MainLoopInput::NonAnimation(NonAnimationInput::ConfigReload) => {
         frame_scheduler.on_non_animation_work();
         wm.process_commands(
@@ -545,6 +623,13 @@ async fn start_wm(
           &mut config,
         )
         .map(|_| ())
+      }
+      MainLoopInput::NonAnimation(
+        NonAnimationInput::AnimationWatchdog,
+      ) => {
+        frame_scheduler.on_non_animation_work();
+        wm.process_animation_timer_watchdog(&config);
+        Ok(())
       }
     };
 

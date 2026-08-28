@@ -92,13 +92,21 @@ impl SystemTray {
         .unwrap_or(false),
     ));
 
-    let tray_icon = dispatcher.dispatch_sync(|| {
+    let tray_dispatcher = dispatcher.clone();
+    let tray_icon = Self::dispatch_creation(&dispatcher, || {
+      let animations_enabled =
+        *animations_enabled.lock().map_err(|_| {
+          anyhow::anyhow!("Animation-state mutex was poisoned.")
+        })?;
+      let run_on_startup_enabled =
+        *run_on_startup_enabled.lock().map_err(|_| {
+          anyhow::anyhow!("Startup-state mutex was poisoned.")
+        })?;
       let tray_icon = Self::create_tray_icon(
-        *animations_enabled.lock().unwrap(),
-        *run_on_startup_enabled.lock().unwrap(),
-      )
-      .unwrap();
-      ThreadBound::new(tray_icon, dispatcher.clone())
+        animations_enabled,
+        run_on_startup_enabled,
+      )?;
+      Ok(ThreadBound::new(tray_icon, tray_dispatcher))
     })?;
 
     // Spawn thread to handle tray menu events.
@@ -129,6 +137,22 @@ impl SystemTray {
       _icon_thread: Some(icon_thread),
       _tray_icon: tray_icon,
     })
+  }
+
+  /// Dispatches fallible tray creation to the event-loop thread and keeps
+  /// dispatcher failure distinct from construction failure.
+  fn dispatch_creation<F, T>(
+    dispatcher: &Dispatcher,
+    create: F,
+  ) -> anyhow::Result<T>
+  where
+    F: FnOnce() -> anyhow::Result<T> + Send,
+    T: Send,
+  {
+    dispatcher
+      .dispatch_sync(create)
+      .context("Failed to dispatch system tray creation.")?
+      .context("Failed to create system tray.")
   }
 
   fn create_tray_icon(
@@ -188,7 +212,7 @@ impl SystemTray {
 
     let tray_icon = TrayIconBuilder::new()
       .with_menu(Box::new(tray_menu))
-      .with_tooltip(format!("GlazeWM v{}", env!("VERSION_NUMBER")))
+      .with_tooltip(format!("GlazeWM v{}", wm_common::VERSION))
       .with_icon(icon)
       .build()?;
 
@@ -288,4 +312,57 @@ fn auto_launch_instance() -> anyhow::Result<AutoLaunch> {
   let instance = AutoLaunch::new("GlazeWM", &exe_path, false, &args);
 
   Ok(instance)
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+  };
+
+  use wm_platform::EventLoop;
+
+  use super::*;
+
+  #[test]
+  fn tray_construction_failure_is_returned_without_panicking() {
+    let (_event_loop, dispatcher) =
+      EventLoop::new().expect("test event loop should initialize");
+
+    let error = SystemTray::dispatch_creation(
+      &dispatcher,
+      || -> anyhow::Result<()> {
+        anyhow::bail!("injected tray construction failure")
+      },
+    )
+    .expect_err("injected tray failure should be returned");
+
+    assert!(error.to_string().contains("Failed to create system tray"));
+    assert!(error.chain().any(|cause| cause
+      .to_string()
+      .contains("injected tray construction failure")));
+  }
+
+  #[test]
+  fn tray_dispatch_failure_does_not_run_construction() {
+    let (_event_loop, dispatcher) =
+      EventLoop::new().expect("test event loop should initialize");
+    dispatcher
+      .stop_event_loop()
+      .expect("test dispatcher should stop");
+    let called = Arc::new(AtomicBool::new(false));
+    let called_in_closure = Arc::clone(&called);
+
+    let error = SystemTray::dispatch_creation(&dispatcher, move || {
+      called_in_closure.store(true, Ordering::SeqCst);
+      Ok(())
+    })
+    .expect_err("stopped dispatcher should reject tray creation");
+
+    assert!(error
+      .to_string()
+      .contains("Failed to dispatch system tray creation"));
+    assert!(!called.load(Ordering::SeqCst));
+  }
 }

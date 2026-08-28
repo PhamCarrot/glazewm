@@ -18,6 +18,8 @@ pub fn handle_window_destroyed(
   // A destroyed HWND cannot become manageable. Cancel a sleeping retry now
   // instead of waiting for its timer to wake and rediscover invalidity.
   cancel_pending_manage_retry(native_window_id, state);
+  #[cfg(target_os = "windows")]
+  state.cancel_visibility_lease_for_native(native_window_id);
 
   let found_window = state
     .windows()

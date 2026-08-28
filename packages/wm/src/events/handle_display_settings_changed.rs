@@ -124,6 +124,12 @@ pub fn handle_display_settings_changed(
     .queue_container_to_redraw(state.root_container.clone())
     .suppress_animations();
 
+  // Replace the generation only after topology reconciliation succeeds.
+  // On an early native/query error, the existing timer and its watchdog
+  // stay armed instead of leaving animation-owned visibility without
+  // ticks.
+  state.animation_manager.invalidate_timer_generation();
+
   Ok(())
 }
 

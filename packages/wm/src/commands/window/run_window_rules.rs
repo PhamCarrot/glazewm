@@ -23,7 +23,18 @@ pub fn run_window_rules(
   let mut subject_window = window;
 
   for rule in pending_window_rules {
-    info!("Running window rule with commands: {:?}.", rule.commands);
+    let command_names: Vec<_> = rule
+      .commands
+      .iter()
+      .map(wm_common::InvokeCommand::diagnostic_name)
+      .collect();
+    info!(
+      window_id = %subject_window.id(),
+      event = ?event_type,
+      command_count = command_names.len(),
+      command_names = ?command_names,
+      "Running matching window rule; command arguments omitted."
+    );
 
     for command in &rule.commands {
       WindowManager::run_command(

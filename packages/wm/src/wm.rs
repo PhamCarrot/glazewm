@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::{bail, Context};
 use tokio::sync::mpsc::{self};
 use tracing::warn;
@@ -17,7 +19,7 @@ use wm_platform::{
 
 #[cfg(target_os = "windows")]
 use crate::{
-  animation::AnimationManager,
+  animation::{manager::AnimationUpdateOutcome, AnimationManager},
   commands::{
     container::{
       focus_container_by_id, focus_in_direction, set_tiling_direction,
@@ -30,11 +32,12 @@ use crate::{
     },
     monitor::focus_monitor,
     window::{
-      cycle_stack_focus, focus_stack_index, ignore_window, move_to_stack,
-      move_window_in_direction, move_window_to_workspace, resize_window,
-      retry_manage_window, set_window_position, set_window_size,
-      stack_absorb_neighbor, stack_insert, toggle_stack,
-      update_window_state, WindowPositionTarget,
+      cycle_stack_focus, focus_stack_index, ignore_window,
+      isolate_destroyed_window, move_to_stack, move_window_in_direction,
+      move_window_to_workspace, resize_window, retry_manage_window,
+      set_window_position, set_window_size, stack_absorb_neighbor,
+      stack_insert, toggle_stack, update_window_state,
+      WindowPositionTarget,
     },
     workspace::{
       focus_workspace, move_workspace_in_direction, set_workspace_layout,
@@ -45,8 +48,8 @@ use crate::{
     handle_display_settings_changed, handle_mouse_move,
     handle_window_destroyed, handle_window_focused, handle_window_hidden,
     handle_window_minimize_ended, handle_window_minimized,
-    handle_window_moved_or_resized, handle_window_shown,
-    handle_window_title_changed,
+    handle_window_moved_or_resized, handle_window_reconcile_requested,
+    handle_window_shown, handle_window_title_changed,
   },
   ipc_server::IpcServer,
   models::{Container, WindowContainer, WorkspaceTarget},
@@ -67,6 +70,73 @@ pub struct WindowManager {
   /// `main.rs` compiles on all platforms. On non-Windows the sender is
   /// never used, so this receiver never yields an item.
   pub tab_click_rx: mpsc::UnboundedReceiver<(uuid::Uuid, usize)>,
+}
+
+#[cfg(target_os = "windows")]
+fn native_command_target_was_destroyed(
+  error: &wm_platform::Error,
+  native_valid_after: bool,
+) -> bool {
+  error.is_invalid_window_handle() || !native_valid_after
+}
+
+#[cfg(target_os = "windows")]
+fn finish_native_window_command(
+  window: &WindowContainer,
+  state: &mut WmState,
+  operation: &str,
+  result: wm_platform::Result<()>,
+) -> anyhow::Result<()> {
+  match result {
+    Ok(()) => Ok(()),
+    Err(error) => {
+      let window_id = window.id();
+      let (expected_handle, native_valid_after) = {
+        let native = window.native();
+        (native.id().0, native.is_valid())
+      };
+      if native_command_target_was_destroyed(&error, native_valid_after) {
+        isolate_destroyed_window(
+          window_id,
+          expected_handle,
+          state,
+          operation,
+        );
+      }
+
+      Err(anyhow::Error::new(error)).with_context(|| {
+        format!("Failed to {operation} for window {window_id}")
+      })
+    }
+  }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_transparency_command(
+  args: &wm_common::SetTransparencyCommand,
+  original_opacity: &wm_platform::OpacityValue,
+  mut set_opacity: impl FnMut(
+    &wm_platform::OpacityValue,
+  ) -> wm_platform::Result<()>,
+  mut adjust_opacity: impl FnMut(
+    &wm_platform::Delta<wm_platform::OpacityValue>,
+  ) -> wm_platform::Result<()>,
+) -> Result<(), (&'static str, wm_platform::Error)> {
+  if let Some(opacity) = &args.opacity {
+    if let Err(error) = set_opacity(opacity) {
+      let _ = set_opacity(original_opacity);
+      return Err(("set transparency", error));
+    }
+  }
+
+  if let Some(opacity_delta) = &args.opacity_delta {
+    if let Err(error) = adjust_opacity(opacity_delta) {
+      let _ = set_opacity(original_opacity);
+      return Err(("adjust transparency", error));
+    }
+  }
+
+  Ok(())
 }
 
 impl WindowManager {
@@ -172,6 +242,9 @@ impl WindowManager {
         handle_mouse_move(&event, state, config)
       }
       PlatformEvent::Window(window_event) => match window_event {
+        WindowEvent::ReconcileRequested { .. } => {
+          handle_window_reconcile_requested(state, config)
+        }
         WindowEvent::Focused { window, .. } => {
           handle_window_focused(&window, state, config)
         }
@@ -229,16 +302,72 @@ impl WindowManager {
     config: &UserConfig,
   ) -> anyhow::Result<()> {
     // Access animation_manager through state to avoid double borrow.
-    let result =
-      AnimationManager::update_internal(&mut self.state, config);
-    if let Err(err) = &result {
+    match AnimationManager::update_internal(&mut self.state, config) {
+      AnimationUpdateOutcome::Complete => Ok(()),
+      AnimationUpdateOutcome::RetryScheduled {
+        attempt,
+        remaining,
+        error,
+      } => {
+        tracing::warn!(
+          "Animation final synchronization failed on bounded attempt \
+           {attempt}; retained safe coverage and scheduled another tick \
+           ({remaining} attempt(s) remain): {error}."
+        );
+        Ok(())
+      }
+      AnimationUpdateOutcome::ParticipantFailed { window_ids } => {
+        tracing::warn!(
+          "Isolated {} failed animation participant(s) without cancelling \
+           unrelated animation groups: {window_ids:?}.",
+          window_ids.len()
+        );
+        Ok(())
+      }
+      AnimationUpdateOutcome::GroupRecovered {
+        participant_count,
+        error,
+      } => {
+        tracing::warn!(
+          "Workspace animation cleanup exhausted its bounded retry; \
+           restored {participant_count} real participant(s) before dropping \
+           that group's coverage and kept unrelated animations active: \
+           {error}."
+        );
+        Ok(())
+      }
+      AnimationUpdateOutcome::Fatal(err) => {
+        AnimationManager::recover_after_animation_failure(
+          &mut self.state,
+          config,
+          &format!("fatal animation update failure: {err}"),
+        );
+        Err(err)
+      }
+    }
+  }
+
+  /// Returns the independent deadline for detecting a native compositor
+  /// timer generation that has stopped making progress.
+  pub fn animation_timer_watchdog_deadline(&self) -> Option<Instant> {
+    self.state.animation_manager.timer_watchdog_deadline()
+  }
+
+  /// Abandons one stale native timer generation, restores every animation-
+  /// owned real window visibly, and leaves future animations on the
+  /// bounded fixed-rate fallback driver.
+  pub fn process_animation_timer_watchdog(&mut self, config: &UserConfig) {
+    if self
+      .state
+      .animation_manager
+      .abandon_stalled_timer_generation(Instant::now())
+    {
       AnimationManager::recover_after_animation_failure(
         &mut self.state,
         config,
-        &format!("animation update failed: {err}"),
+        "native compositor timer watchdog expired",
       );
     }
-    result
   }
 
   pub fn process_commands(
@@ -357,7 +486,7 @@ impl WindowManager {
         match subject_container.as_window_container() {
           Ok(window) => {
             #[cfg(target_os = "windows")]
-            if config.value.animations.window_close.enabled {
+            if config.value.animations.window_close.should_animate() {
               let effect_cfg = if window.id()
                 == state
                   .focused_container()
@@ -792,10 +921,17 @@ impl WindowManager {
       } => match subject_container.as_window_container() {
         #[cfg(target_os = "windows")]
         Ok(window) => {
-          _ = window.native().set_title_bar_visibility(
+          let native = window.native();
+          let result = native.set_title_bar_visibility(
             *visibility == TitleBarVisibility::Shown,
           );
-          Ok(())
+          drop(native);
+          finish_native_window_command(
+            &window,
+            state,
+            "set title bar visibility",
+            result,
+          )
         }
         _ => Ok(()),
       },
@@ -805,15 +941,36 @@ impl WindowManager {
         match subject_container.as_window_container() {
           #[cfg(target_os = "windows")]
           Ok(window) => {
-            if let Some(opacity) = &args.opacity {
-              _ = window.native().set_transparency(opacity);
-            }
+            let native = window.native();
+            let original_opacity = match native.transparency() {
+              Ok(opacity) => opacity,
+              Err(error) => {
+                drop(native);
+                return finish_native_window_command(
+                  &window,
+                  state,
+                  "read transparency before update",
+                  Err(error),
+                );
+              }
+            };
 
-            if let Some(opacity_delta) = &args.opacity_delta {
-              _ = window.native().adjust_transparency(opacity_delta);
+            let result = apply_transparency_command(
+              args,
+              &original_opacity,
+              |opacity| native.set_transparency(opacity),
+              |delta| native.adjust_transparency(delta),
+            );
+            drop(native);
+            match result {
+              Ok(()) => Ok(()),
+              Err((operation, error)) => finish_native_window_command(
+                &window,
+                state,
+                operation,
+                Err(error),
+              ),
             }
-
-            Ok(())
           }
           _ => Ok(()),
         }
@@ -821,7 +978,7 @@ impl WindowManager {
       InvokeCommand::ShellExec {
         hide_window,
         command,
-      } => shell_exec(&command.join(" "), *hide_window, state),
+      } => shell_exec(command, *hide_window, state),
       InvokeCommand::Size(args) => {
         match subject_container.as_window_container() {
           Ok(window) => set_window_size(
@@ -1088,5 +1245,146 @@ fn ensure_tiling(
         _ => anyhow::bail!("Window could not be converted to tiling."),
       }
     }
+  }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod native_command_tests {
+  use std::cell::RefCell;
+
+  use tokio::sync::mpsc;
+  use wm_common::{
+    ParsedConfig, SetTransparencyCommand, TitleBarVisibility,
+  };
+  use wm_platform::{Delta, Dispatcher, NativeWindow, OpacityValue};
+
+  use super::*;
+  use crate::{
+    commands::container::attach_container,
+    models::{Monitor, TilingWindow, Workspace},
+    traits::CommonGetters,
+  };
+
+  fn state_with_invalid_window() -> (WmState, WindowContainer) {
+    let (event_tx, _) = mpsc::unbounded_channel();
+    let (exit_tx, _) = mpsc::unbounded_channel();
+    let (animation_tick_tx, _) = mpsc::channel(1);
+    let (window_manage_retry_tx, _) = mpsc::unbounded_channel();
+    let (tab_click_tx, _) = mpsc::unbounded_channel();
+    let state = WmState::new(
+      Dispatcher::mock(),
+      event_tx,
+      exit_tx,
+      animation_tick_tx,
+      window_manage_retry_tx,
+      tab_click_tx,
+    );
+    let window = TilingWindow::mock()
+      .native(NativeWindow::from_handle(-1))
+      .call();
+    let workspace = Workspace::mock()
+      .tiling_containers(vec![window.clone().into()])
+      .call();
+    let monitor = Monitor::mock().workspaces(vec![workspace]).call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .expect("test monitor should attach");
+
+    (state, window.into())
+  }
+
+  #[test]
+  fn destroyed_titlebar_target_returns_error_and_isolates_only_that_window(
+  ) {
+    let (mut state, window) = state_with_invalid_window();
+    let mut config = UserConfig::for_test(ParsedConfig::default());
+    let window_id = window.id();
+
+    WindowManager::run_command(
+      &InvokeCommand::SetTitleBarVisibility {
+        visibility: TitleBarVisibility::Shown,
+      },
+      window.into(),
+      &mut state,
+      &mut config,
+    )
+    .expect_err("destroyed titlebar target must not report success");
+
+    assert!(state.container_by_id(window_id).is_none());
+    assert!(state.windows().is_empty());
+  }
+
+  #[test]
+  fn destroyed_transparency_target_returns_error_and_isolates_only_that_window(
+  ) {
+    let (mut state, window) = state_with_invalid_window();
+    let mut config = UserConfig::for_test(ParsedConfig::default());
+    let window_id = window.id();
+
+    WindowManager::run_command(
+      &InvokeCommand::SetTransparency(SetTransparencyCommand {
+        opacity: Some(OpacityValue::try_new(0.5).unwrap()),
+        opacity_delta: None,
+      }),
+      window.into(),
+      &mut state,
+      &mut config,
+    )
+    .expect_err("destroyed opacity target must not report success");
+
+    assert!(state.container_by_id(window_id).is_none());
+    assert!(state.windows().is_empty());
+  }
+
+  #[test]
+  fn only_destroyed_native_command_failures_request_local_isolation() {
+    assert!(native_command_target_was_destroyed(
+      &wm_platform::Error::WindowNotFound,
+      true
+    ));
+    assert!(native_command_target_was_destroyed(
+      &wm_platform::Error::Platform("raced destruction".to_string()),
+      false
+    ));
+    assert!(!native_command_target_was_destroyed(
+      &wm_platform::Error::Platform("live access failure".to_string()),
+      true
+    ));
+  }
+
+  #[test]
+  fn failed_transparency_sequence_restores_the_original_alpha() {
+    let original = OpacityValue::from_alpha(200);
+    let calls = RefCell::new(Vec::new());
+    let args = SetTransparencyCommand {
+      opacity: Some(OpacityValue::try_new(0.5).unwrap()),
+      opacity_delta: Some(Delta {
+        inner: OpacityValue::try_new(0.1).unwrap(),
+        is_negative: true,
+      }),
+    };
+
+    let result = apply_transparency_command(
+      &args,
+      &original,
+      |opacity| {
+        calls.borrow_mut().push(opacity.to_alpha());
+        Ok(())
+      },
+      |_| {
+        Err(wm_platform::Error::Platform(
+          "injected delta failure".into(),
+        ))
+      },
+    );
+
+    assert!(matches!(result, Err(("adjust transparency", _))));
+    assert_eq!(
+      calls.into_inner(),
+      [args.opacity.unwrap().to_alpha(), original.to_alpha()]
+    );
   }
 }
