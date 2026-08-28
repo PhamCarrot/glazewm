@@ -10,6 +10,28 @@ use crate::{
   user_config::UserConfig,
 };
 
+/// Applies the geometry policy used to enter or retain borderless
+/// fullscreen state.
+///
+/// A newly observed window must extend at least one pixel past every
+/// workspace edge. Once a non-maximized fullscreen window is tracked, it
+/// remains fullscreen while it still covers the workspace with one pixel
+/// of positioning tolerance. Keeping these two cases distinct prevents an
+/// ordinary zero-gap tiled window from being mistaken for borderless
+/// fullscreen while still tolerating the one-pixel rounding errors
+/// produced by Windows and some games.
+fn frame_should_fullscreen(
+  frame: &Rect,
+  workspace_rect: &Rect,
+  retain_non_maximized_fullscreen: bool,
+) -> bool {
+  if retain_non_maximized_fullscreen {
+    frame.contains_rect(&workspace_rect.inset(1))
+  } else {
+    frame.inset(1).contains_rect(workspace_rect)
+  }
+}
+
 #[delegatable_trait]
 pub trait WindowGetters: CommonGetters {
   fn state(&self) -> WindowState;
@@ -109,17 +131,16 @@ pub trait WindowGetters: CommonGetters {
       .frame
       .apply_delta(&self.border_delta().inverse(), None);
 
-    let should_fullscreen = match self.state() {
-      // Keep as fullscreen if the frame covers the workspace bounds.
-      WindowState::Fullscreen(fullscreen) if !fullscreen.maximized => {
-        frame.contains_rect(&workspace_rect.inset(1))
-      }
+    let retain_non_maximized_fullscreen = matches!(
+      self.state(),
+      WindowState::Fullscreen(fullscreen) if !fullscreen.maximized
+    );
 
-      // Change to fullscreen if the frame *exceeds* the workspace bounds.
-      // NOTE: This is never possible with 0px outer gaps; the window has
-      // to be made fullscreen via the `set-fullscreen` command.
-      _ => frame.inset(1).contains_rect(&workspace_rect),
-    };
+    let should_fullscreen = frame_should_fullscreen(
+      &frame,
+      &workspace_rect,
+      retain_non_maximized_fullscreen,
+    );
 
     Ok(should_fullscreen)
   }
@@ -166,6 +187,52 @@ pub trait WindowGetters: CommonGetters {
   fn update_native_properties<F>(&self, updater: F)
   where
     F: FnOnce(&mut NativeWindowProperties);
+}
+
+#[cfg(test)]
+mod tests {
+  use wm_platform::Rect;
+
+  use super::frame_should_fullscreen;
+
+  fn workspace() -> Rect {
+    Rect::from_xy(0, 0, 1920, 1080)
+  }
+
+  #[test]
+  fn ordinary_window_does_not_enter_fullscreen() {
+    let frame = Rect::from_xy(100, 100, 1280, 720);
+    assert!(!frame_should_fullscreen(&frame, &workspace(), false));
+  }
+
+  #[test]
+  fn exact_zero_gap_workspace_rect_does_not_enter_fullscreen() {
+    assert!(!frame_should_fullscreen(&workspace(), &workspace(), false));
+  }
+
+  #[test]
+  fn borderless_frame_exceeding_every_edge_enters_fullscreen() {
+    let frame = Rect::from_ltrb(-1, -1, 1921, 1081);
+    assert!(frame_should_fullscreen(&frame, &workspace(), false));
+  }
+
+  #[test]
+  fn borderless_entry_requires_every_edge_to_exceed_workspace() {
+    let frame = Rect::from_ltrb(-1, -1, 1920, 1081);
+    assert!(!frame_should_fullscreen(&frame, &workspace(), false));
+  }
+
+  #[test]
+  fn tracked_borderless_fullscreen_tolerates_one_pixel_rounding() {
+    let frame = Rect::from_ltrb(1, 1, 1919, 1079);
+    assert!(frame_should_fullscreen(&frame, &workspace(), true));
+  }
+
+  #[test]
+  fn tracked_borderless_fullscreen_exits_after_losing_coverage() {
+    let frame = Rect::from_ltrb(2, 1, 1919, 1079);
+    assert!(!frame_should_fullscreen(&frame, &workspace(), true));
+  }
 }
 
 /// Implements the `WindowGetters` trait for a given struct.

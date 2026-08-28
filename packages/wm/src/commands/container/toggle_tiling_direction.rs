@@ -26,12 +26,29 @@ pub fn toggle_tiling_direction(
     _ => return Ok(()),
   }?;
 
-  state.emit_event(WmEvent::LayoutChanged {
-    direction_container: direction_container.to_dto()?,
-    new_layout: direction_container.layout(),
+  let direction_container_dto = direction_container.to_dto()?;
+  state.emit_event(WmEvent::TilingDirectionChanged {
+    direction_container: direction_container_dto.clone(),
+    new_tiling_direction: direction_container.tiling_direction(),
   });
 
+  // `layout_changed` is the custom workspace-layout signal consumed by the
+  // active-layout integration. A nested split direction is not a workspace
+  // layout change and must not publish a misleading custom event.
+  if is_workspace_layout_change(&direction_container) {
+    state.emit_event(WmEvent::LayoutChanged {
+      direction_container: direction_container_dto,
+      new_layout: direction_container.layout(),
+    });
+  }
+
   Ok(())
+}
+
+fn is_workspace_layout_change(
+  direction_container: &DirectionContainer,
+) -> bool {
+  matches!(direction_container, DirectionContainer::Workspace(_))
 }
 
 fn toggle_window_direction(
@@ -94,5 +111,20 @@ pub fn set_tiling_direction(
     Ok(())
   } else {
     toggle_tiling_direction(container, state, config)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::models::Workspace;
+
+  #[test]
+  fn only_workspace_direction_changes_are_custom_layout_changes() {
+    let workspace = Workspace::mock().call();
+    let split = SplitContainer::mock().call();
+
+    assert!(is_workspace_layout_change(&workspace.into()));
+    assert!(!is_workspace_layout_change(&split.into()));
   }
 }

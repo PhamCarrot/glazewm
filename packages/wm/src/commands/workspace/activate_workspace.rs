@@ -55,6 +55,7 @@ pub fn activate_workspace(
 
   let layout = workspace_layout_for_activation(
     &workspace_config.name,
+    workspace_config.default_layout.as_ref(),
     &monitor_rect,
     &state.workspace_layouts,
   );
@@ -85,12 +86,14 @@ pub fn activate_workspace(
 
 fn workspace_layout_for_activation(
   workspace_name: &str,
+  configured_default: Option<&WorkspaceLayout>,
   monitor_rect: &wm_platform::Rect,
   remembered_layouts: &HashMap<String, WorkspaceLayout>,
 ) -> WorkspaceLayout {
   remembered_layouts
     .get(workspace_name)
     .cloned()
+    .or_else(|| configured_default.cloned())
     .unwrap_or_else(|| {
       if monitor_rect.height() > monitor_rect.width() {
         WorkspaceLayout::SplitVertical
@@ -146,6 +149,21 @@ mod tests {
 
     let layout = workspace_layout_for_activation(
       "dev",
+      Some(&WorkspaceLayout::Columns),
+      &Rect::from_xy(0, 0, 1920, 1080),
+      &remembered,
+    );
+
+    assert_eq!(layout, WorkspaceLayout::Grid);
+  }
+
+  #[test]
+  fn activation_uses_configured_default_without_remembered_layout() {
+    let remembered = HashMap::new();
+
+    let layout = workspace_layout_for_activation(
+      "dev",
+      Some(&WorkspaceLayout::Grid),
       &Rect::from_xy(0, 0, 1920, 1080),
       &remembered,
     );
@@ -160,6 +178,7 @@ mod tests {
     assert_eq!(
       workspace_layout_for_activation(
         "landscape",
+        None,
         &Rect::from_xy(0, 0, 1920, 1080),
         &remembered,
       ),
@@ -168,6 +187,7 @@ mod tests {
     assert_eq!(
       workspace_layout_for_activation(
         "portrait",
+        None,
         &Rect::from_xy(0, 0, 1080, 1920),
         &remembered,
       ),

@@ -29,7 +29,7 @@ pub struct UserConfig {
 
   /// Hashmap of window rule event types (e.g. `WindowRuleEvent::Manage`)
   /// and the corresponding window rules of that type.
-  window_rules_by_event: HashMap<WindowRuleEvent, Vec<WindowRuleConfig>>,
+  window_rules_by_event: HashMap<WindowRuleEvent, Vec<CompiledWindowRule>>,
 
   /// Pre-compiled regexes from `stack.tab_title_overrides`, paired with
   /// their replacement strings. Built once on load and on config reload
@@ -37,7 +37,117 @@ pub struct UserConfig {
   pub compiled_tab_title_overrides: Vec<(Regex, String)>,
 }
 
+#[derive(Clone, Debug)]
+struct CompiledWindowRule {
+  config: WindowRuleConfig,
+  match_window: Vec<CompiledWindowMatchConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledWindowMatchConfig {
+  process: Option<CompiledMatchType>,
+  class: Option<CompiledMatchType>,
+  title: Option<CompiledMatchType>,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledMatchType {
+  Equals(String),
+  Includes(String),
+  Regex(Regex),
+  NotEquals(String),
+  NotRegex(Regex),
+}
+
+impl CompiledMatchType {
+  fn compile(match_type: &MatchType, path: &str) -> Result<Self> {
+    match match_type {
+      MatchType::Equals { equals } => Ok(Self::Equals(equals.clone())),
+      MatchType::Includes { includes } => {
+        Ok(Self::Includes(includes.clone()))
+      }
+      MatchType::Regex { regex } => Regex::new(regex)
+        .map(Self::Regex)
+        .with_context(|| format!("Invalid regex at {path}: {regex:?}.")),
+      MatchType::NotEquals { not_equals } => {
+        Ok(Self::NotEquals(not_equals.clone()))
+      }
+      MatchType::NotRegex { not_regex } => {
+        Regex::new(not_regex).map(Self::NotRegex).with_context(|| {
+          format!("Invalid negative regex at {path}: {not_regex:?}.")
+        })
+      }
+    }
+  }
+
+  fn is_match(&self, value: &str) -> bool {
+    match self {
+      Self::Equals(expected) => value == expected,
+      Self::Includes(expected) => value.contains(expected),
+      Self::Regex(regex) => regex.is_match(value),
+      Self::NotEquals(expected) => value != expected,
+      Self::NotRegex(regex) => !regex.is_match(value),
+    }
+  }
+}
+
+impl CompiledWindowMatchConfig {
+  fn compile(config: &WindowMatchConfig, path: &str) -> Result<Self> {
+    let compile = |match_type: &Option<MatchType>, field: &str| {
+      match_type
+        .as_ref()
+        .map(|value| {
+          CompiledMatchType::compile(value, &format!("{path}.{field}"))
+        })
+        .transpose()
+    };
+
+    Ok(Self {
+      process: compile(&config.window_process, "window_process")?,
+      class: compile(&config.window_class, "window_class")?,
+      title: compile(&config.window_title, "window_title")?,
+    })
+  }
+}
+
+impl CompiledWindowRule {
+  fn compile(config: &WindowRuleConfig, path: &str) -> Result<Self> {
+    let match_window = config
+      .match_window
+      .iter()
+      .enumerate()
+      .map(|(index, match_config)| {
+        CompiledWindowMatchConfig::compile(
+          match_config,
+          &format!("{path}.match[{index}]"),
+        )
+      })
+      .collect::<Result<Vec<_>>>()?;
+
+    Ok(Self {
+      config: config.clone(),
+      match_window,
+    })
+  }
+}
+
 impl UserConfig {
+  #[cfg(test)]
+  pub(crate) fn for_test(value: ParsedConfig) -> Self {
+    let window_rules_by_event = Self::window_rules_by_event(&value)
+      .expect("test window-rule regexes should compile");
+    let compiled_tab_title_overrides =
+      Self::compile_tab_title_overrides(&value);
+
+    Self {
+      path: PathBuf::from("test-config.yaml"),
+      value,
+      value_str: String::new(),
+      window_rules_by_event,
+      compiled_tab_title_overrides,
+    }
+  }
+
   /// Creates an instance of `UserConfig`. Reads and validates the user
   /// config from the given path.
   ///
@@ -53,7 +163,8 @@ impl UserConfig {
 
     let (config_value, config_str) = Self::read(&config_path)?;
 
-    let window_rules_by_event = Self::window_rules_by_event(&config_value);
+    let window_rules_by_event =
+      Self::window_rules_by_event(&config_value)?;
     let compiled_tab_title_overrides =
       Self::compile_tab_title_overrides(&config_value);
 
@@ -85,7 +196,7 @@ impl UserConfig {
     config_value
       .validate()
       .map_err(anyhow::Error::msg)
-      .context("Invalid numeric configuration.")?;
+      .context("Invalid configuration.")?;
 
     Ok((config_value, config_str))
   }
@@ -106,17 +217,31 @@ impl UserConfig {
     Ok(())
   }
 
+  #[cfg(test)]
   pub fn reload(&mut self) -> anyhow::Result<()> {
-    let (config_value, config_str) = Self::read(&self.path)?;
-
-    self.window_rules_by_event =
-      Self::window_rules_by_event(&config_value);
-    self.compiled_tab_title_overrides =
-      Self::compile_tab_title_overrides(&config_value);
-    self.value = config_value;
-    self.value_str = config_str;
+    let candidate = self.load_candidate()?;
+    *self = candidate;
 
     Ok(())
+  }
+
+  /// Loads and derives a complete replacement config without mutating the
+  /// currently active generation.
+  pub fn load_candidate(&self) -> anyhow::Result<Self> {
+    let (config_value, config_str) = Self::read(&self.path)?;
+
+    let window_rules_by_event =
+      Self::window_rules_by_event(&config_value)?;
+    let compiled_tab_title_overrides =
+      Self::compile_tab_title_overrides(&config_value);
+
+    Ok(Self {
+      path: self.path.clone(),
+      value: config_value,
+      value_str: config_str,
+      window_rules_by_event,
+      compiled_tab_title_overrides,
+    })
   }
 
   fn default_window_rules(
@@ -235,26 +360,33 @@ impl UserConfig {
 
   fn window_rules_by_event(
     config_value: &ParsedConfig,
-  ) -> HashMap<WindowRuleEvent, Vec<WindowRuleConfig>> {
+  ) -> Result<HashMap<WindowRuleEvent, Vec<CompiledWindowRule>>> {
     let mut window_rules_by_event = HashMap::new();
 
-    // Combine user-defined window rules with the default ones.
+    // Compile user-defined and built-in rules once per accepted config
+    // generation. Event buckets clone the compiled regex handles rather
+    // than rebuilding regex automata while windows are being matched.
     let default_window_rules = Self::default_window_rules(config_value);
     let all_window_rules = config_value
       .window_rules
       .iter()
-      .chain(default_window_rules.iter());
+      .enumerate()
+      .map(|(index, rule)| (format!("window_rules[{index}]"), rule))
+      .chain(default_window_rules.iter().enumerate().map(
+        |(index, rule)| (format!("built-in window rule {index}"), rule),
+      ));
 
-    for window_rule in all_window_rules {
-      for event_type in &window_rule.on {
+    for (path, window_rule) in all_window_rules {
+      let compiled_rule = CompiledWindowRule::compile(window_rule, &path)?;
+      for event_type in &compiled_rule.config.on {
         window_rules_by_event
           .entry(event_type.clone())
           .or_insert_with(Vec::new)
-          .push(window_rule.clone());
+          .push(compiled_rule.clone());
       }
     }
 
-    window_rules_by_event
+    Ok(window_rules_by_event)
   }
 
   /// Window rules that should be applied to the window when the given
@@ -266,17 +398,18 @@ impl UserConfig {
   ) -> Vec<WindowRuleConfig> {
     let native_properties = window.native_properties();
 
-    self
-      .window_rules_by_event
-      .get(event)
-      .unwrap_or(&Vec::new())
+    let Some(rules) = self.window_rules_by_event.get(event) else {
+      return Vec::new();
+    };
+
+    rules
       .iter()
       .filter(|rule| {
         // Skip if window has already ran the rule.
-        !window.done_window_rules().contains(rule)
+        !window.done_window_rules().contains(&rule.config)
           && Self::rule_matches(rule, &native_properties)
       })
-      .cloned()
+      .map(|rule| rule.config.clone())
       .collect()
   }
 
@@ -294,7 +427,7 @@ impl UserConfig {
       .get(&WindowRuleEvent::Manage)
       .is_some_and(|rules| {
         rules.iter().any(|rule| {
-          rule.commands.contains(&InvokeCommand::ForceManage)
+          rule.config.commands.contains(&InvokeCommand::ForceManage)
             && Self::rule_matches(rule, properties)
         })
       })
@@ -303,14 +436,12 @@ impl UserConfig {
   /// Whether a window with the given native properties matches any of
   /// the window rule's match configs.
   fn rule_matches(
-    rule: &WindowRuleConfig,
+    rule: &CompiledWindowRule,
     properties: &NativeWindowProperties,
   ) -> bool {
     rule.match_window.iter().any(|match_config| {
-      let is_process_match = match_config
-        .window_process
-        .as_ref()
-        .is_none_or(|match_type| {
+      let is_process_match =
+        match_config.process.as_ref().is_none_or(|match_type| {
           // TODO: Temp fix for matching Zebar on both platforms with
           // the same process name. Consider using lowercase for every
           // `equals` match type.
@@ -324,18 +455,18 @@ impl UserConfig {
       let is_class_match = {
         #[cfg(target_os = "windows")]
         {
-          match_config.window_class.as_ref().is_none_or(|match_type| {
+          match_config.class.as_ref().is_none_or(|match_type| {
             match_type.is_match(&properties.class_name)
           })
         }
         #[cfg(not(target_os = "windows"))]
         {
-          match_config.window_class.is_none()
+          match_config.class.is_none()
         }
       };
 
       let is_title_match = match_config
-        .window_title
+        .title
         .as_ref()
         .is_none_or(|match_type| match_type.is_match(&properties.title));
 
@@ -441,20 +572,13 @@ impl UserConfig {
 #[cfg(test)]
 mod tests {
   use wm_common::{
-    EasingFunction, ParsedConfig, WindowTransitionStyle,
+    EasingFunction, ParsedConfig, WindowTransitionStyle, WorkspaceLayout,
     WorkspaceSwitchDirection, WorkspaceSwitchIrisOrigin,
     WorkspaceSwitchStyle,
   };
   use wm_platform::{BackdropStyle, Rect};
 
   use super::*;
-
-  const MON4SM_INSPIRED_CONFIG: &str = include_str!(
-    "../../../resources/assets/examples/config-mon4sm-inspired.yaml"
-  );
-  const MAXHU08_INSPIRED_CONFIG: &str = include_str!(
-    "../../../resources/assets/examples/config-maxhu08-inspired.yaml"
-  );
 
   /// The bundled sample config (which uses the `type` key for animation
   /// transition types) must always parse.
@@ -474,20 +598,303 @@ mod tests {
     );
   }
 
+  fn assert_unknown_config_key_is_rejected(yaml: &str, unknown_key: &str) {
+    let error = serde_yaml::from_str::<ParsedConfig>(yaml)
+      .expect_err("unknown config key must be rejected")
+      .to_string();
+    assert!(
+      error.contains("unknown field"),
+      "missing actionable unknown-field diagnostic for {unknown_key}: {error}"
+    );
+    assert!(
+      error.contains(unknown_key),
+      "diagnostic omitted unknown key {unknown_key}: {error}"
+    );
+  }
+
   #[test]
-  fn inspired_example_configs_parse_and_validate() {
-    for (name, yaml) in [
-      ("Mon4sm", MON4SM_INSPIRED_CONFIG),
-      ("maxhu08", MAXHU08_INSPIRED_CONFIG),
-    ] {
-      let config: ParsedConfig = serde_yaml::from_str(yaml)
-        .unwrap_or_else(|err| {
-          panic!("{name} example should parse: {err}")
-        });
-      config.validate().unwrap_or_else(|err| {
-        panic!("{name} example should validate: {err}")
-      });
+  fn unknown_root_and_nested_config_keys_are_rejected() {
+    assert_unknown_config_key_is_rejected("animtions: {}\n", "animtions");
+    assert_unknown_config_key_is_rejected(
+      "animations:\n  workspace_switch:\n    duration_mss: 360\n",
+      "duration_mss",
+    );
+  }
+
+  #[test]
+  fn unknown_keys_in_config_list_entries_are_rejected() {
+    assert_unknown_config_key_is_rejected(
+      "workspaces:\n  - name: '1'\n    naem: typo\n",
+      "naem",
+    );
+    assert_unknown_config_key_is_rejected(
+      "window_rules:\n  - commands: ['ignore']\n    match:\n      - window_titel:\n          equals: 'Terminal'\n",
+      "window_titel",
+    );
+  }
+
+  #[test]
+  fn unknown_keys_in_structured_config_values_are_rejected() {
+    let cases = [
+      "gaps:\n  outer_gap:\n    left: '0px'\n    top: '0px'\n    right: '0px'\n    bottom: '0px'\n    botom: '10px'\n",
+      "gaps:\n  inner_gap:\n    amount: 10\n    unit: pixel\n    amuont: 20\n",
+      "window_effects:\n  focused_window:\n    border:\n      color:\n        r: 1\n        g: 2\n        b: 3\n        a: 255\n        alpha: 1\n",
+    ];
+
+    for yaml in cases {
+      assert!(
+        serde_yaml::from_str::<ParsedConfig>(yaml).is_err(),
+        "accepted unknown key in structured config value:\n{yaml}"
+      );
     }
+  }
+
+  #[test]
+  fn unknown_key_reload_preserves_previous_valid_config() {
+    let test_root = std::env::current_dir()
+      .expect("test working directory should exist")
+      .join("target")
+      .join(format!("cfg001-reload-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&test_root)
+      .expect("source-local reload test directory should be created");
+    let config_path = test_root.join("config.yaml");
+    let valid_yaml = "general:\n  focus_follows_cursor: true\n";
+    fs::write(&config_path, valid_yaml)
+      .expect("valid test config should be written");
+
+    let mut config = UserConfig::new(Some(config_path.clone()))
+      .expect("valid test config should load");
+    let previous_value_str = config.value_str.clone();
+    assert!(config.value.general.focus_follows_cursor);
+
+    fs::write(
+      &config_path,
+      "general:\n  focus_follows_cursor: false\n  focus_follow_cursor: true\n",
+    )
+    .expect("invalid reload config should be written");
+    let error =
+      config.reload().expect_err("unknown key must reject reload");
+
+    assert!(error.to_string().contains("unknown field"));
+    assert!(config.value.general.focus_follows_cursor);
+    assert_eq!(config.value_str, previous_value_str);
+
+    fs::remove_dir_all(&test_root)
+      .expect("source-local reload test directory should be removed");
+  }
+
+  #[test]
+  fn out_of_range_animation_reload_preserves_previous_valid_config() {
+    let test_root = std::env::current_dir()
+      .expect("test working directory should exist")
+      .join("target")
+      .join(format!("cfg002-reload-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&test_root)
+      .expect("source-local reload test directory should be created");
+    let config_path = test_root.join("config.yaml");
+    let valid_yaml =
+      "animations:\n  workspace_switch:\n    duration_ms: 360\n";
+    fs::write(&config_path, valid_yaml)
+      .expect("valid test config should be written");
+
+    let mut config = UserConfig::new(Some(config_path.clone()))
+      .expect("valid test config should load");
+    let previous_value_str = config.value_str.clone();
+    assert_eq!(config.value.animations.workspace_switch.duration_ms, 360);
+
+    fs::write(
+      &config_path,
+      "animations:\n  workspace_switch:\n    duration_ms: 10001\n",
+    )
+    .expect("out-of-range reload config should be written");
+    let error = config
+      .reload()
+      .expect_err("out-of-range animation duration must reject reload");
+
+    assert!(error.to_string().contains("Invalid configuration"));
+    assert_eq!(config.value.animations.workspace_switch.duration_ms, 360);
+    assert_eq!(config.value_str, previous_value_str);
+
+    fs::remove_dir_all(&test_root)
+      .expect("source-local reload test directory should be removed");
+  }
+
+  #[test]
+  fn invalid_string_and_structured_lengths_are_rejected() {
+    for yaml in [
+      "gaps:\n  inner_gap: 'junk100pxmore'\n",
+      "gaps:\n  inner_gap: '100001px'\n",
+      "gaps:\n  inner_gap: '1001%'\n",
+      "gaps:\n  inner_gap:\n    amount: .nan\n    unit: pixel\n",
+      "gaps:\n  inner_gap:\n    amount: .inf\n    unit: percentage\n",
+      "gaps:\n  inner_gap:\n    amount: 100001\n    unit: pixel\n",
+      "gaps:\n  inner_gap:\n    amount: 10.01\n    unit: percentage\n",
+    ] {
+      assert!(
+        serde_yaml::from_str::<ParsedConfig>(yaml).is_err(),
+        "accepted invalid length config:\n{yaml}"
+      );
+    }
+  }
+
+  #[test]
+  fn decimal_length_config_preserves_units() {
+    let config: ParsedConfig = serde_yaml::from_str(
+      "gaps:\n  inner_gap: '1.5px'\n  outer_gap:\n    top: '-2.5%'\n    right: '.5px'\n    bottom: '1.px'\n    left: '+2%'\n",
+    )
+    .expect("defined decimal length forms should parse");
+
+    assert_eq!(config.gaps.inner_gap.amount, 1.5);
+    assert_eq!(config.gaps.outer_gap.top.amount, -0.025);
+    assert_eq!(config.gaps.outer_gap.right.amount, 0.5);
+    assert_eq!(config.gaps.outer_gap.bottom.amount, 1.0);
+    assert_eq!(config.gaps.outer_gap.left.amount, 0.02);
+  }
+
+  #[test]
+  fn invalid_length_reload_preserves_previous_geometry_config() {
+    let test_root = std::env::current_dir()
+      .expect("test working directory should exist")
+      .join("target")
+      .join(format!("cfg003-reload-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&test_root)
+      .expect("source-local reload test directory should be created");
+    let config_path = test_root.join("config.yaml");
+    let valid_yaml = "gaps:\n  inner_gap: '20px'\n";
+    fs::write(&config_path, valid_yaml)
+      .expect("valid test config should be written");
+
+    let mut config = UserConfig::new(Some(config_path.clone()))
+      .expect("valid test config should load");
+    let previous_value_str = config.value_str.clone();
+    assert_eq!(config.value.gaps.inner_gap.amount, 20.0);
+
+    fs::write(&config_path, "gaps:\n  inner_gap: 'junk100pxmore'\n")
+      .expect("invalid reload config should be written");
+    config
+      .reload()
+      .expect_err("invalid length must reject reload");
+
+    assert_eq!(config.value.gaps.inner_gap.amount, 20.0);
+    assert_eq!(config.value_str, previous_value_str);
+
+    fs::remove_dir_all(&test_root)
+      .expect("source-local reload test directory should be removed");
+  }
+
+  #[test]
+  fn invalid_workspace_identity_reload_preserves_previous_config() {
+    let test_root = std::env::current_dir()
+      .expect("test working directory should exist")
+      .join("target")
+      .join(format!("cfg005-reload-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&test_root)
+      .expect("source-local reload test directory should be created");
+    let config_path = test_root.join("config.yaml");
+    let valid_yaml = "workspaces:\n  - name: 'Dev'\n  - name: 'Web'\n";
+    fs::write(&config_path, valid_yaml)
+      .expect("valid workspace config should be written");
+
+    let mut config = UserConfig::new(Some(config_path.clone()))
+      .expect("valid workspace config should load");
+    let previous_value_str = config.value_str.clone();
+    let previous_names = config
+      .value
+      .workspaces
+      .iter()
+      .map(|workspace| workspace.name.clone())
+      .collect::<Vec<_>>();
+
+    for invalid_yaml in [
+      "workspaces:\n  - name: 'Dev'\n  - name: 'Dev'\n",
+      "workspaces:\n  - name: '   '\n",
+      "workspaces:\n  - name: ' Dev'\n",
+    ] {
+      fs::write(&config_path, invalid_yaml)
+        .expect("invalid workspace config should be written");
+      let error = config
+        .reload()
+        .expect_err("invalid workspace identity must reject reload");
+
+      assert!(error.to_string().contains("Invalid configuration"));
+      assert_eq!(
+        config
+          .value
+          .workspaces
+          .iter()
+          .map(|workspace| workspace.name.clone())
+          .collect::<Vec<_>>(),
+        previous_names
+      );
+      assert_eq!(config.value_str, previous_value_str);
+    }
+
+    fs::remove_dir_all(&test_root)
+      .expect("source-local reload test directory should be removed");
+  }
+
+  #[test]
+  fn workspace_default_layout_is_optional_and_accepts_every_layout() {
+    let legacy: ParsedConfig = serde_yaml::from_str(
+      "workspaces:\n  - name: legacy\n",
+    )
+    .expect("workspace configs without default_layout must remain valid");
+    assert_eq!(legacy.workspaces[0].default_layout, None);
+
+    let yaml = r"
+workspaces:
+  - name: bsp
+    default_layout: bsp
+  - name: split-horizontal
+    default_layout: split_horizontal
+  - name: split-vertical
+    default_layout: split_vertical
+  - name: columns
+    default_layout: columns
+  - name: rows
+    default_layout: rows
+  - name: grid
+    default_layout: grid
+  - name: vertical-stack
+    default_layout: vertical_stack
+  - name: horizontal-stack
+    default_layout: horizontal_stack
+";
+    let config: ParsedConfig = serde_yaml::from_str(yaml)
+      .expect("every public workspace layout name must parse");
+
+    assert_eq!(
+      config
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.default_layout.clone().unwrap())
+        .collect::<Vec<_>>(),
+      vec![
+        WorkspaceLayout::Bsp,
+        WorkspaceLayout::SplitHorizontal,
+        WorkspaceLayout::SplitVertical,
+        WorkspaceLayout::Columns,
+        WorkspaceLayout::Rows,
+        WorkspaceLayout::Grid,
+        WorkspaceLayout::VerticalStack,
+        WorkspaceLayout::HorizontalStack,
+      ]
+    );
+  }
+
+  #[test]
+  fn invalid_workspace_default_layout_reports_the_value_and_choices() {
+    let error = serde_yaml::from_str::<ParsedConfig>(
+      "workspaces:\n  - name: invalid\n    default_layout: diagonal\n",
+    )
+    .expect_err(
+      "unknown workspace layouts must fail configuration parsing",
+    )
+    .to_string();
+
+    assert!(error.contains("diagonal"));
+    assert!(error.contains("bsp"));
+    assert!(error.contains("horizontal_stack"));
   }
 
   #[test]
@@ -503,13 +910,17 @@ mod tests {
 
   #[test]
   fn normalized_effect_values_must_stay_in_range() {
-    let mut config = ParsedConfig::default();
-    config.window_effects.focused_window.transparency.opacity.0 = 1.5;
-
-    let error = config
-      .validate()
-      .expect_err("opacity above one must be rejected");
-    assert!(error.contains("transparency.opacity"));
+    for value in
+      [".nan", ".inf", "-.inf", "-0.1", "1.1", "'-1%'", "'101%'"]
+    {
+      let yaml = format!(
+        "window_effects:\n  focused_window:\n    transparency:\n      opacity: {value}\n"
+      );
+      assert!(
+        serde_yaml::from_str::<ParsedConfig>(&yaml).is_err(),
+        "accepted config opacity {value}"
+      );
+    }
   }
 
   #[test]
@@ -783,7 +1194,8 @@ animations:
       path: PathBuf::new(),
       window_rules_by_event: UserConfig::window_rules_by_event(
         &config_value,
-      ),
+      )
+      .expect("test window-rule regexes should compile"),
       compiled_tab_title_overrides: Vec::new(),
       value: config_value,
       value_str: String::new(),
@@ -850,6 +1262,133 @@ animations:
       "Flow.Launcher",
       "Flow.Launcher"
     )));
+  }
+
+  fn force_manage_match_config(match_type: MatchType) -> UserConfig {
+    test_config(vec![WindowRuleConfig {
+      commands: vec![InvokeCommand::ForceManage],
+      match_window: vec![WindowMatchConfig {
+        window_process: Some(match_type),
+        ..WindowMatchConfig::default()
+      }],
+      on: vec![WindowRuleEvent::Manage],
+      run_once: true,
+    }])
+  }
+
+  #[test]
+  fn compiled_window_rule_matchers_preserve_all_match_semantics() {
+    for (match_type, matching, non_matching) in [
+      (
+        MatchType::Equals {
+          equals: "terminal".to_string(),
+        },
+        "terminal",
+        "terminal-preview",
+      ),
+      (
+        MatchType::Includes {
+          includes: "term".to_string(),
+        },
+        "terminal",
+        "browser",
+      ),
+      (
+        MatchType::Regex {
+          regex: "^term(inal)?$".to_string(),
+        },
+        "terminal",
+        "terminal-preview",
+      ),
+      (
+        MatchType::NotEquals {
+          not_equals: "browser".to_string(),
+        },
+        "terminal",
+        "browser",
+      ),
+      (
+        MatchType::NotRegex {
+          not_regex: "^browser".to_string(),
+        },
+        "terminal",
+        "browser-preview",
+      ),
+    ] {
+      let config = force_manage_match_config(match_type);
+      assert!(
+        config.is_force_managed(&test_properties(matching, "Window"))
+      );
+      assert!(
+        !config.is_force_managed(&test_properties(non_matching, "Window"))
+      );
+    }
+  }
+
+  #[test]
+  fn window_rule_regex_is_stored_compiled_and_reused() {
+    let config = force_manage_match_config(MatchType::Regex {
+      regex: "^terminal-[0-9]+$".to_string(),
+    });
+    let rule = &config.window_rules_by_event[&WindowRuleEvent::Manage][0];
+    let Some(CompiledMatchType::Regex(regex)) =
+      &rule.match_window[0].process
+    else {
+      panic!("runtime rule must own the compiled regex");
+    };
+    assert_eq!(regex.as_str(), "^terminal-[0-9]+$");
+
+    for index in 0..10_000 {
+      assert!(config.is_force_managed(&test_properties(
+        &format!("terminal-{index}"),
+        "Window"
+      )));
+    }
+  }
+
+  #[test]
+  fn invalid_window_rule_regex_reload_preserves_active_generation() {
+    let test_root = std::env::current_dir()
+      .expect("test working directory should exist")
+      .join("target")
+      .join(format!("perf003-reload-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&test_root)
+      .expect("source-local reload test directory should be created");
+    let config_path = test_root.join("config.yaml");
+    let valid_yaml = r"
+window_rules:
+  - commands: ['force-manage']
+    match:
+      - window_process:
+          regex: '^terminal$'
+";
+    fs::write(&config_path, valid_yaml)
+      .expect("valid regex config should be written");
+
+    let mut config = UserConfig::new(Some(config_path.clone()))
+      .expect("valid regex config should load");
+    let previous_value_str = config.value_str.clone();
+    assert!(
+      config.is_force_managed(&test_properties("terminal", "Terminal"))
+    );
+
+    let invalid_yaml = valid_yaml.replace("^terminal$", "(");
+    fs::write(&config_path, invalid_yaml)
+      .expect("invalid regex config should be written");
+    let error = config
+      .reload()
+      .expect_err("invalid window-rule regex must reject reload");
+
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("window_rules[0].match[0].window_process"));
+    assert!(diagnostic.contains("unclosed group"));
+    assert_eq!(config.value_str, previous_value_str);
+    assert!(
+      config.is_force_managed(&test_properties("terminal", "Terminal"))
+    );
+
+    fs::remove_dir_all(&test_root)
+      .expect("source-local reload test directory should be removed");
   }
 
   /// Configs written before the `blur_behind` -> `backdrop` key rename

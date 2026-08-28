@@ -16,6 +16,10 @@ pub fn set_workspace_layout(
   layout: WorkspaceLayout,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
+  let previous_tiling_direction = container
+    .workspace()
+    .context("No workspace.")?
+    .tiling_direction();
   let workspace =
     set_layout_on_owning_workspace(&container, layout.clone())?;
 
@@ -31,6 +35,14 @@ pub fn set_workspace_layout(
     direction_container: workspace.to_dto()?,
     new_layout: layout,
   });
+
+  let new_tiling_direction = workspace.tiling_direction();
+  if previous_tiling_direction != new_tiling_direction {
+    state.emit_event(WmEvent::TilingDirectionChanged {
+      direction_container: workspace.to_dto()?,
+      new_tiling_direction,
+    });
+  }
 
   Ok(())
 }

@@ -1,4 +1,7 @@
 animations:
+  # For every animation family, `enabled: false` or `duration_ms: 0` skips
+  # animation setup and applies the final native state immediately.
+  # Hard ranges: duration_ms 0..10000; move/resize threshold_px 0..100000.
   # Animation settings for pure window translations (position changes only).
   window_move:
     enabled: true
@@ -160,6 +163,8 @@ general:
   show_all_in_taskbar: false
 
 gaps:
+  # Lengths use whole-input decimal syntax. Hard ranges are
+  # -100000px..100000px and -1000%..1000%; invalid values reject the config.
   # Whether to scale the gaps with the DPI of the monitor.
   scale_with_dpi: true
 
@@ -318,6 +323,8 @@ window_behavior:
       shown_on_top: false
 
 workspaces:
+  # Workspace names must be nonempty, have no leading/trailing whitespace,
+  # and be unique by exact case-sensitive comparison. Internal spaces are OK.
   - name: "1"
     # Optional display label used by integrations and status bars.
     # display_name: "Main"
@@ -325,6 +332,10 @@ workspaces:
     # bind_to_monitor: 0
     # Keep this workspace alive even when it contains no windows.
     # keep_alive: true
+    # Optional initial layout. A layout selected at runtime takes precedence
+    # until GlazeWM exits. Accepted values: bsp, split_horizontal,
+    # split_vertical, columns, rows, grid, vertical_stack, horizontal_stack.
+    # default_layout: "bsp"
   - name: "2"
   - name: "3"
   - name: "4"
