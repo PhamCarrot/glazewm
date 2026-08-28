@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "wm"
-version = "0.0.0"
+version = "0.0.6"
 dependencies = [
  "ambassador",
  "anyhow",
@@ -3315,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "wm-cli"
-version = "0.0.0"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3330,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "wm-common"
-version = "0.0.0"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -3343,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "wm-ipc-client"
-version = "0.0.0"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "wm-macros"
-version = "0.1.0"
+version = "0.0.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3365,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "wm-platform"
-version = "0.0.0"
+version = "0.0.6"
 dependencies = [
  "home",
  "libtest-mimic-collect",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "wm-watcher"
-version = "0.0.0"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "serde_json",

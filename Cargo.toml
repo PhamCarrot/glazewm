@@ -3,6 +3,9 @@ resolver = "2"
 members = ["packages/*"]
 default-members = ["packages/wm", "packages/wm-cli"]
 
+[workspace.package]
+version = "0.0.6"
+
 [workspace.dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
 clap = { version = "4", features = ["derive"] }

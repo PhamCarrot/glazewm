@@ -17,7 +17,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-19
           targets: x86_64-pc-windows-msvc
 
       - uses: swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
@@ -28,8 +28,14 @@ jobs:
         shell: pwsh
         run: cargo test --workspace --lib --bins --tests
 
+      - name: Validate source release identity
+        shell: pwsh
+        run: ./resources/scripts/test-release-identity.ps1
+
       - name: Build release executables
         shell: pwsh
-        env:
-          VERSION_NUMBER: 0.0.0-source
         run: cargo build --locked --release --workspace
+
+      - name: Validate built release identity
+        shell: pwsh
+        run: ./resources/scripts/test-release-identity.ps1 -ReleaseDirectory target/release

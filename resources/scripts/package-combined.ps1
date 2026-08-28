@@ -1,5 +1,4 @@
 param(
-  [Parameter(Mandatory = $true)]
   [ValidatePattern('^\d+\.\d+\.\d+$')]
   [string]$VersionNumber,
 
@@ -76,6 +75,29 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Push-Location $repoRoot
 
 try {
+  $metadataJson = (& cargo metadata --locked --no-deps --format-version 1) -join "`n"
+  Assert-LastExitCode 'Reading Cargo workspace metadata'
+  $metadata = $metadataJson | ConvertFrom-Json
+  $workspaceVersions = @(
+    $metadata.packages |
+      Where-Object { $metadata.workspace_members -contains $_.id } |
+      ForEach-Object { $_.version } |
+      Sort-Object -Unique
+  )
+  if ($workspaceVersions.Count -ne 1) {
+    throw 'Workspace packages must share one authoritative release version.'
+  }
+
+  $sourceVersion = [string]$workspaceVersions[0]
+  if ($VersionNumber -and $VersionNumber -ne $sourceVersion) {
+    throw "Requested package version $VersionNumber does not match authoritative workspace version $sourceVersion."
+  }
+  $VersionNumber = $sourceVersion
+
+  & (Join-Path $repoRoot 'resources\scripts\test-release-identity.ps1') `
+    -ExpectedVersion $VersionNumber
+  Assert-LastExitCode 'Source release identity validation'
+
   $releaseSuffix = if ($UiAccess) { '-uiaccess' } else { '' }
   $releaseName = "glazewm-combined-v$VersionNumber-windows-x64$releaseSuffix"
   $outDir = Join-Path $repoRoot 'out'
@@ -92,15 +114,11 @@ try {
   New-Item -ItemType Directory -Path $stageCliDir -Force | Out-Null
   New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-  $env:VERSION_NUMBER = $VersionNumber
-
-  Write-Host 'Running focused release checks...'
-  & cargo test -p wm-common
-  Assert-LastExitCode 'wm-common tests'
-  & cargo test -p wm
-  Assert-LastExitCode 'wm tests'
-  & cargo check -p wm-platform
-  Assert-LastExitCode 'wm-platform check'
+  Write-Host 'Running locked release checks...'
+  & cargo fmt --all -- --check
+  Assert-LastExitCode 'Rust formatting check'
+  & cargo test --workspace --locked -- --test-threads=1
+  Assert-LastExitCode 'Locked workspace tests'
 
   if ($UiAccess -and !$SigningCertificateThumbprint) {
     throw 'A UIAccess package requires -SigningCertificateThumbprint.'
@@ -109,12 +127,31 @@ try {
   $signTool = if ($UiAccess) { Resolve-SignTool } else { $null }
 
   Write-Host 'Building optimized Windows binaries...'
-  $buildArgs = @('build', '--locked', '--release', '--workspace')
+  $buildArgs = @(
+    'build',
+    '--locked',
+    '--release',
+    '-p', 'wm',
+    '-p', 'wm-watcher',
+    '-p', 'wm-cli'
+  )
+
   if ($UiAccess) {
     $buildArgs += @('--features', 'wm/ui_access')
   }
   & cargo @buildArgs
   Assert-LastExitCode 'Cargo release build'
+
+  & (Join-Path $repoRoot 'resources\scripts\test-release-identity.ps1') `
+    -ExpectedVersion $VersionNumber `
+    -ReleaseDirectory (Join-Path $repoRoot 'target\release')
+  Assert-LastExitCode 'Built release identity validation'
+
+  # Inspect the binary produced by the command above, never a stale artifact
+  # left in target\release by an earlier ordinary/UIAccess build.
+  $wmBinary = Join-Path $repoRoot 'target\release\glazewm.exe'
+  $manifestBytes = [IO.File]::ReadAllBytes($wmBinary)
+  $manifestText = [Text.Encoding]::ASCII.GetString($manifestBytes)
 
   $rootBinaries = @(
     'target\release\glazewm.exe',
@@ -130,11 +167,13 @@ try {
 
     Sign-PackageFiles -Paths $binariesToSign -SignTool $signTool
 
-    $manifestBytes = [IO.File]::ReadAllBytes($binariesToSign[0])
-    $manifestText = [Text.Encoding]::ASCII.GetString($manifestBytes)
     if ($manifestText -notmatch 'uiAccess="true"') {
       throw 'glazewm.exe was not built with uiAccess="true".'
     }
+  }
+  elseif ($manifestText -notmatch 'uiAccess="false"' -or
+      $manifestText -match 'uiAccess="true"') {
+    throw 'Ordinary glazewm.exe does not contain the required uiAccess="false" manifest.'
   }
 
   foreach ($relativePath in $rootBinaries) {
