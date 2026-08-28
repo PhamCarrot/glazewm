@@ -29,6 +29,10 @@ use crate::{
   Dispatcher, DispatcherExtWindows, Point,
 };
 
+fn should_emit_repeated_input_failure(failure_count: u64) -> bool {
+  failure_count == 1 || failure_count.is_multiple_of(64)
+}
+
 /// Data shared with the window procedure callback.
 struct CallbackData {
   event_tx: mpsc::UnboundedSender<MouseEvent>,
@@ -38,6 +42,9 @@ struct CallbackData {
 
   /// Timestamp of the last emitted `Move` event for throttling.
   last_move_emission: Option<Instant>,
+
+  /// Number of raw-input failures, used only to bound diagnostics.
+  input_failure_count: u64,
 }
 
 /// Platform-specific implementation of [`MouseListener`].
@@ -58,6 +65,7 @@ impl MouseListener {
       event_tx,
       pressed: PressedButtons::default(),
       last_move_emission: None,
+      input_failure_count: 0,
     }));
 
     let callback_id = Self::register_callback(
@@ -141,7 +149,17 @@ impl MouseListener {
           &enabled_events,
           &mut callback_data,
         ) {
-          tracing::warn!("Failed to handle WM_INPUT message: {}", err);
+          callback_data.input_failure_count =
+            callback_data.input_failure_count.saturating_add(1);
+          let failure_count = callback_data.input_failure_count;
+          if should_emit_repeated_input_failure(failure_count) {
+            tracing::warn!(
+              failure_count,
+              error = %err,
+              "Failed to handle raw mouse input; repeated native failures \
+               are rate-limited."
+            );
+          }
         }
 
         Some(0)
@@ -322,5 +340,18 @@ impl Drop for MouseListener {
     if let Err(err) = self.terminate() {
       tracing::warn!("Failed to terminate mouse listener: {}", err);
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::should_emit_repeated_input_failure;
+
+  #[test]
+  fn raw_input_failure_diagnostics_are_strictly_rate_limited() {
+    let emitted: Vec<_> = (1..=130)
+      .filter(|count| should_emit_repeated_input_failure(*count))
+      .collect();
+    assert_eq!(emitted, vec![1, 64, 128]);
   }
 }

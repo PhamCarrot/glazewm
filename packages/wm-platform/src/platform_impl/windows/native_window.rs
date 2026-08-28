@@ -1,11 +1,14 @@
-use std::time::Duration;
+use std::{mem::size_of, sync::OnceLock, time::Duration};
 
 use tokio::task;
 use tracing::warn;
 use windows::{
-  core::PWSTR,
+  core::{PCWSTR, PWSTR},
   Win32::{
-    Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
+    Foundation::{
+      CloseHandle, GetLastError, SetLastError, BOOL, FILETIME, HANDLE,
+      HWND, LPARAM, POINT, RECT, WIN32_ERROR,
+    },
     Graphics::Dwm::{
       DwmGetWindowAttribute, DwmSetWindowAttribute, DWMSBT_AUTO,
       DWMSBT_MAINWINDOW, DWMSBT_TABBEDWINDOW, DWMWA_BORDER_COLOR,
@@ -13,8 +16,14 @@ use windows::{
       DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE,
       DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
     },
+    Security::{
+      GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+      IsValidSid, TokenIntegrityLevel, TokenUIAccess,
+      TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    },
     System::Threading::{
-      OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+      GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+      QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
       PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::{
@@ -23,20 +32,21 @@ use windows::{
       },
       WindowsAndMessaging::{
         EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow,
-        GetForegroundWindow, GetLayeredWindowAttributes, GetShellWindow,
-        GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-        IsZoomed, SendNotifyMessageW, SetForegroundWindow,
-        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
-        SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
-        GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, GW_OWNER, HWND_NOTOPMOST,
-        HWND_TOP, HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS,
-        LWA_ALPHA, LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-        SW_SHOWNA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
+        GetForegroundWindow, GetLayeredWindowAttributes, GetPropW,
+        GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+        IsWindowVisible, IsZoomed, RemovePropW, SendNotifyMessageW,
+        SetForegroundWindow, SetLayeredWindowAttributes, SetPropW,
+        SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+        ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
+        GW_HWNDPREV, GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
+        SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA,
+        WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+        WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
         WS_EX_TOPMOST, WS_THICKFRAME,
       },
     },
@@ -46,8 +56,21 @@ use windows::{
 use super::com::{IApplicationView, COM_INIT};
 use crate::{
   BackdropStyle, Color, CornerStyle, Delta, Dispatcher, LengthValue,
-  OpacityValue, Point, Rect, RectDelta, WindowId, WindowZOrder,
+  NativeWindowRecoveryIdentity, OpacityValue, Point, Rect, RectDelta,
+  WindowId, WindowZOrder,
 };
+
+const RECOVERY_MARKER_VALUE: HANDLE = HANDLE(1);
+
+fn recovery_marker_wide(marker: &str) -> crate::Result<Vec<u16>> {
+  if marker.is_empty() || marker.contains('\0') {
+    return Err(crate::Error::Platform(
+      "Window recovery marker must be nonempty and contain no null byte."
+        .to_string(),
+    ));
+  }
+  Ok(marker.encode_utf16().chain(Some(0)).collect())
+}
 
 /// Magic number used to identify programmatic mouse inputs from our own
 /// process.
@@ -57,6 +80,125 @@ pub(crate) const FOREGROUND_INPUT_IDENTIFIER: u32 = 6379;
 #[derive(Clone, Debug)]
 pub(crate) struct NativeWindow {
   pub(crate) handle: isize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessSecurityContext {
+  integrity_rid: u32,
+  has_ui_access: bool,
+}
+
+/// Owns a real process or token handle. Pseudo handles are never wrapped.
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+  fn drop(&mut self) {
+    unsafe {
+      _ = CloseHandle(self.0);
+    }
+  }
+}
+
+fn can_control_process(
+  current: ProcessSecurityContext,
+  target: ProcessSecurityContext,
+) -> bool {
+  current.has_ui_access || current.integrity_rid >= target.integrity_rid
+}
+
+fn process_security_context(
+  process_handle: HANDLE,
+) -> crate::Result<ProcessSecurityContext> {
+  let mut token_handle = HANDLE::default();
+  unsafe {
+    OpenProcessToken(process_handle, TOKEN_QUERY, &raw mut token_handle)
+  }?;
+  let token_handle = OwnedHandle(token_handle);
+
+  let mut has_ui_access = 0_u32;
+  let mut returned_length = 0_u32;
+  unsafe {
+    GetTokenInformation(
+      token_handle.0,
+      TokenUIAccess,
+      Some((&raw mut has_ui_access).cast()),
+      u32::try_from(size_of::<u32>())?,
+      &raw mut returned_length,
+    )?;
+  }
+
+  // First ask Windows for the variable-size integrity-label buffer. The
+  // expected insufficient-buffer result is intentionally ignored; the
+  // returned length is authoritative for the second call.
+  returned_length = 0;
+  unsafe {
+    _ = GetTokenInformation(
+      token_handle.0,
+      TokenIntegrityLevel,
+      None,
+      0,
+      &raw mut returned_length,
+    );
+  }
+  if returned_length == 0 {
+    return Err(crate::Error::Platform(
+      "Windows returned an empty process integrity label.".to_string(),
+    ));
+  }
+
+  // `Vec<usize>` supplies pointer alignment suitable for
+  // `TOKEN_MANDATORY_LABEL` while still allocating the exact byte length
+  // requested by Windows.
+  let word_size = size_of::<usize>();
+  let word_count = usize::try_from(returned_length)?.div_ceil(word_size);
+  let mut integrity_buffer = vec![0_usize; word_count];
+  unsafe {
+    GetTokenInformation(
+      token_handle.0,
+      TokenIntegrityLevel,
+      Some(integrity_buffer.as_mut_ptr().cast()),
+      returned_length,
+      &raw mut returned_length,
+    )?;
+  }
+
+  let label =
+    unsafe { &*integrity_buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+  if !unsafe { IsValidSid(label.Label.Sid) }.as_bool() {
+    return Err(crate::Error::Platform(
+      "Windows returned an invalid process integrity SID.".to_string(),
+    ));
+  }
+  let sub_authority_count =
+    unsafe { *GetSidSubAuthorityCount(label.Label.Sid) };
+  if sub_authority_count == 0 {
+    return Err(crate::Error::Platform(
+      "Windows returned an invalid process integrity SID.".to_string(),
+    ));
+  }
+  let integrity_rid = unsafe {
+    *GetSidSubAuthority(
+      label.Label.Sid,
+      u32::from(sub_authority_count - 1),
+    )
+  };
+
+  Ok(ProcessSecurityContext {
+    integrity_rid,
+    has_ui_access: has_ui_access != 0,
+  })
+}
+
+fn current_process_security_context(
+) -> crate::Result<ProcessSecurityContext> {
+  static CURRENT: OnceLock<ProcessSecurityContext> = OnceLock::new();
+  if let Some(context) = CURRENT.get() {
+    return Ok(*context);
+  }
+
+  let context = process_security_context(unsafe { GetCurrentProcess() })?;
+  _ = CURRENT.set(context);
+  Ok(context)
 }
 
 impl NativeWindow {
@@ -70,6 +212,40 @@ impl NativeWindow {
   #[must_use]
   pub(crate) fn id(&self) -> WindowId {
     WindowId(self.handle)
+  }
+
+  pub(crate) fn is_accessible_by_current_process(
+    &self,
+  ) -> crate::Result<bool> {
+    let mut process_id = 0_u32;
+    unsafe {
+      GetWindowThreadProcessId(self.hwnd(), Some(&raw mut process_id));
+    }
+    if process_id == 0 {
+      return Err(crate::Error::WindowNotFound);
+    }
+
+    let process_handle = match unsafe {
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+    } {
+      Ok(handle) => OwnedHandle(handle),
+      Err(err) => {
+        let err = crate::Error::from(err);
+        return if err.is_access_denied() {
+          Ok(false)
+        } else {
+          Err(err)
+        };
+      }
+    };
+
+    let target = match process_security_context(process_handle.0) {
+      Ok(context) => context,
+      Err(err) if err.is_access_denied() => return Ok(false),
+      Err(err) => return Err(err),
+    };
+    let current = current_process_security_context()?;
+    Ok(can_control_process(current, target))
   }
 
   /// Implements [`NativeWindow::title`].
@@ -329,6 +505,102 @@ impl NativeWindow {
     Ok(class_name)
   }
 
+  pub(crate) fn recovery_identity(
+    &self,
+  ) -> crate::Result<NativeWindowRecoveryIdentity> {
+    let mut process_id = 0_u32;
+    let thread_id = unsafe {
+      GetWindowThreadProcessId(self.hwnd(), Some(&raw mut process_id))
+    };
+    if thread_id == 0 || process_id == 0 {
+      return Err(crate::Error::WindowNotFound);
+    }
+
+    let process_handle = OwnedHandle(unsafe {
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+    }?);
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+      GetProcessTimes(
+        process_handle.0,
+        &raw mut creation,
+        &raw mut exit,
+        &raw mut kernel,
+        &raw mut user,
+      )?;
+    }
+    let process_creation_time = (u64::from(creation.dwHighDateTime) << 32)
+      | u64::from(creation.dwLowDateTime);
+    let class_name = self.class_name()?;
+
+    // Re-read the HWND owner after the fallible process/class queries so a
+    // destroy/reuse race cannot silently combine fields from two windows.
+    let mut confirmed_process_id = 0_u32;
+    let confirmed_thread_id = unsafe {
+      GetWindowThreadProcessId(
+        self.hwnd(),
+        Some(&raw mut confirmed_process_id),
+      )
+    };
+    if confirmed_thread_id != thread_id
+      || confirmed_process_id != process_id
+    {
+      return Err(crate::Error::WindowNotFound);
+    }
+
+    Ok(NativeWindowRecoveryIdentity {
+      process_id,
+      thread_id,
+      process_creation_time,
+      class_name,
+    })
+  }
+
+  pub(crate) fn set_recovery_marker(
+    &self,
+    marker: &str,
+  ) -> crate::Result<()> {
+    let marker = recovery_marker_wide(marker)?;
+    unsafe {
+      SetPropW(
+        self.hwnd(),
+        PCWSTR(marker.as_ptr()),
+        RECOVERY_MARKER_VALUE,
+      )?;
+    }
+    Ok(())
+  }
+
+  pub(crate) fn has_recovery_marker(
+    &self,
+    marker: &str,
+  ) -> crate::Result<bool> {
+    if !unsafe { IsWindow(self.hwnd()) }.as_bool() {
+      return Err(crate::Error::WindowNotFound);
+    }
+    let marker = recovery_marker_wide(marker)?;
+    Ok(
+      unsafe { GetPropW(self.hwnd(), PCWSTR(marker.as_ptr())) }
+        == RECOVERY_MARKER_VALUE,
+    )
+  }
+
+  pub(crate) fn remove_recovery_marker(
+    &self,
+    marker: &str,
+  ) -> crate::Result<bool> {
+    if !self.has_recovery_marker(marker)? {
+      return Ok(false);
+    }
+    let marker = recovery_marker_wide(marker)?;
+    let removed =
+      unsafe { RemovePropW(self.hwnd(), PCWSTR(marker.as_ptr())) }?;
+    Ok(removed == RECOVERY_MARKER_VALUE)
+  }
+
   /// Implements [`NativeWindowWindowsExt::frame_with_shadows`].
   pub(crate) fn frame_with_shadows(&self) -> crate::Result<Rect> {
     let mut rect = RECT::default();
@@ -479,11 +751,8 @@ impl NativeWindow {
         })?;
 
         // Ref: https://github.com/Ciantic/AltTabAccessor/issues/1#issuecomment-1426877843
-        unsafe { view.set_cloak(1, if cloaked { 2 } else { 0 }) }
-          .ok()
-          .map_err(|_| {
-            crate::Error::Platform("Failed to cloak window.".to_string())
-          })
+        unsafe { view.set_cloak(1, if cloaked { 2 } else { 0 }) }.ok()?;
+        Ok(())
       })
     })
   }
@@ -628,8 +897,14 @@ impl NativeWindow {
     };
 
     if new_style != style {
-      unsafe {
+      let set_style_result = unsafe {
+        SetLastError(WIN32_ERROR(0));
         SetWindowLongPtrW(self.hwnd(), GWL_STYLE, new_style);
+        GetLastError()
+      };
+      set_style_result?;
+
+      let frame_result = unsafe {
         SetWindowPos(
           self.hwnd(),
           HWND_NOTOPMOST,
@@ -646,7 +921,37 @@ impl NativeWindow {
             | SWP_NOCOPYBITS
             | SWP_NOSENDCHANGING
             | SWP_ASYNCWINDOWPOS,
-        )?;
+        )
+      };
+
+      if let Err(error) = frame_result {
+        // Roll the style back before returning the frame-refresh failure.
+        // The rollback is best effort: the original error remains
+        // authoritative, and the command layer will isolate a
+        // concurrently destroyed HWND.
+        unsafe {
+          SetLastError(WIN32_ERROR(0));
+          SetWindowLongPtrW(self.hwnd(), GWL_STYLE, style);
+          let _ = GetLastError();
+          let _ = SetWindowPos(
+            self.hwnd(),
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED
+              | SWP_NOMOVE
+              | SWP_NOSIZE
+              | SWP_NOZORDER
+              | SWP_NOOWNERZORDER
+              | SWP_NOACTIVATE
+              | SWP_NOCOPYBITS
+              | SWP_NOSENDCHANGING
+              | SWP_ASYNCWINDOWPOS,
+          );
+        }
+        return Err(error.into());
       }
     }
 
@@ -719,6 +1024,32 @@ impl NativeWindow {
     }
 
     Ok(())
+  }
+
+  pub(crate) fn transparency(&self) -> crate::Result<OpacityValue> {
+    if !self.has_window_style_ex(WS_EX_LAYERED) {
+      return Ok(OpacityValue::from_alpha(u8::MAX));
+    }
+
+    let mut alpha = u8::MAX;
+    let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+    unsafe {
+      GetLayeredWindowAttributes(
+        self.hwnd(),
+        None,
+        Some(&raw mut alpha),
+        Some(&raw mut flags),
+      )?;
+    }
+
+    if flags.contains(LWA_COLORKEY) && !flags.contains(LWA_ALPHA) {
+      return Err(crate::Error::Platform(
+        "Window uses color-key transparency without an alpha value."
+          .to_string(),
+      ));
+    }
+
+    Ok(OpacityValue::from_alpha(alpha))
   }
 
   /// Implements [`NativeWindowWindowsExt::adjust_transparency`].
@@ -950,4 +1281,55 @@ fn desktop_window() -> NativeWindow {
   };
 
   NativeWindow::new(handle.0)
+}
+
+#[cfg(test)]
+mod tests {
+  use windows::Win32::System::Threading::GetCurrentProcess;
+
+  use super::{
+    can_control_process, current_process_security_context,
+    process_security_context, ProcessSecurityContext,
+  };
+
+  fn security(
+    integrity_rid: u32,
+    has_ui_access: bool,
+  ) -> ProcessSecurityContext {
+    ProcessSecurityContext {
+      integrity_rid,
+      has_ui_access,
+    }
+  }
+
+  #[test]
+  fn integrity_policy_allows_equal_or_lower_targets() {
+    let medium = security(0x2000, false);
+    assert!(can_control_process(medium, security(0x1000, false)));
+    assert!(can_control_process(medium, security(0x2000, false)));
+  }
+
+  #[test]
+  fn integrity_policy_rejects_higher_target_without_uiaccess() {
+    assert!(!can_control_process(
+      security(0x2000, false),
+      security(0x3000, false),
+    ));
+  }
+
+  #[test]
+  fn uiaccess_policy_allows_higher_integrity_target() {
+    assert!(can_control_process(
+      security(0x2000, true),
+      security(0x3000, false),
+    ));
+  }
+
+  #[test]
+  fn current_process_security_query_is_stable() {
+    let direct =
+      process_security_context(unsafe { GetCurrentProcess() }).unwrap();
+    assert_eq!(current_process_security_context().unwrap(), direct);
+    assert_ne!(direct.integrity_rid, 0);
+  }
 }

@@ -6,6 +6,14 @@ use std::{
   },
   thread::ThreadId,
 };
+#[cfg(target_os = "windows")]
+use std::{
+  path::PathBuf,
+  sync::{
+    mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
+    OnceLock,
+  },
+};
 
 #[cfg(target_os = "macos")]
 use objc2::MainThreadMarker;
@@ -26,15 +34,15 @@ use windows::{
   core::PCWSTR,
   Win32::{
     Foundation::POINT,
-    System::Environment::ExpandEnvironmentStringsW,
+    System::{
+      Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
+      Environment::ExpandEnvironmentStringsW,
+    },
     UI::{
       Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
       },
-      Shell::{
-        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
-        SHELLEXECUTEINFOW,
-      },
+      Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW},
       WindowsAndMessaging::{
         GetCursorPos, MessageBoxW, SetCursorPos, SystemParametersInfoW,
         ANIMATIONINFO, MB_ICONERROR, MB_OK, MB_SYSTEMMODAL,
@@ -45,6 +53,154 @@ use windows::{
     },
   },
 };
+
+#[cfg(target_os = "windows")]
+const SHELL_EXECUTE_MASK: u32 = SEE_MASK_NOASYNC;
+
+/// A short burst may contain several startup/keybinding commands, but an
+/// unbounded queue could turn a stuck Shell call into unbounded memory
+/// growth.
+#[cfg(target_os = "windows")]
+const SHELL_LAUNCH_QUEUE_CAPACITY: usize = 16;
+
+#[cfg(target_os = "windows")]
+struct ShellLaunchRequest {
+  program: String,
+  args: String,
+  directory: PathBuf,
+  hide_window: bool,
+  stopped: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "windows")]
+struct ShellLaunchWorker {
+  sender: SyncSender<ShellLaunchRequest>,
+}
+
+#[cfg(target_os = "windows")]
+static SHELL_LAUNCH_WORKER: OnceLock<Result<ShellLaunchWorker, String>> =
+  OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn execute_shell_request(
+  request: &ShellLaunchRequest,
+) -> crate::Result<()> {
+  let program_wide = request
+    .program
+    .encode_utf16()
+    .chain(Some(0))
+    .collect::<Vec<_>>();
+  let args_wide = request
+    .args
+    .encode_utf16()
+    .chain(Some(0))
+    .collect::<Vec<_>>();
+  let directory_wide = request
+    .directory
+    .to_string_lossy()
+    .encode_utf16()
+    .chain(Some(0))
+    .collect::<Vec<_>>();
+
+  let mut exec_info = SHELLEXECUTEINFOW {
+    #[allow(clippy::cast_possible_truncation)]
+    cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+    lpFile: PCWSTR(program_wide.as_ptr()),
+    lpParameters: PCWSTR(args_wide.as_ptr()),
+    lpDirectory: PCWSTR(directory_wide.as_ptr()),
+    nShow: if request.hide_window {
+      SW_HIDE
+    } else {
+      SW_NORMAL
+    }
+    .0 as _,
+    // GlazeWM never waits on the launched process, so do not request a
+    // process handle. `NOASYNC` is safe here because this dedicated worker
+    // may block without stalling the WM/event loop.
+    fMask: SHELL_EXECUTE_MASK,
+    ..Default::default()
+  };
+
+  unsafe { ShellExecuteExW(&raw mut exec_info) }
+    .map_err(crate::Error::from)
+}
+
+#[cfg(target_os = "windows")]
+fn run_shell_launch_worker(receiver: Receiver<ShellLaunchRequest>) {
+  while let Ok(request) = receiver.recv() {
+    // Once shutdown begins, discard queued work instead of starting a new
+    // application after the WM has stopped accepting commands. An already
+    // running Shell call cannot be canceled, but it never blocks shutdown.
+    if request.stopped.load(Ordering::SeqCst) {
+      continue;
+    }
+    if let Err(err) = execute_shell_request(&request) {
+      tracing::error!(
+        "Asynchronous shell launch failed for '{}' with args '{}': {err}",
+        request.program,
+        request.args
+      );
+    }
+  }
+}
+
+#[cfg(target_os = "windows")]
+fn create_shell_launch_worker() -> Result<ShellLaunchWorker, String> {
+  let (sender, receiver) = sync_channel(SHELL_LAUNCH_QUEUE_CAPACITY);
+  let (ready_tx, ready_rx) = sync_channel(1);
+  std::thread::Builder::new()
+    .name("glazewm-shell-launch".to_string())
+    .spawn(move || {
+      let com_result =
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+      match com_result {
+        Ok(()) => {
+          let _ = ready_tx.send(Ok(()));
+          run_shell_launch_worker(receiver);
+          unsafe { CoUninitialize() };
+        }
+        Err(err) => {
+          let _ = ready_tx.send(Err(format!(
+            "Unable to initialize COM on shell-launch worker: {err}"
+          )));
+        }
+      }
+    })
+    .map_err(|err| {
+      format!("Unable to spawn shell-launch worker: {err}")
+    })?;
+
+  ready_rx
+    .recv_timeout(std::time::Duration::from_secs(1))
+    .map_err(|err| {
+      format!("Shell-launch worker did not initialize: {err}")
+    })??;
+  Ok(ShellLaunchWorker { sender })
+}
+
+#[cfg(target_os = "windows")]
+fn shell_launch_worker() -> crate::Result<&'static ShellLaunchWorker> {
+  SHELL_LAUNCH_WORKER
+    .get_or_init(create_shell_launch_worker)
+    .as_ref()
+    .map_err(|err| crate::Error::Thread(err.clone()))
+}
+
+#[cfg(target_os = "windows")]
+fn try_queue_shell_request(
+  sender: &SyncSender<ShellLaunchRequest>,
+  request: ShellLaunchRequest,
+) -> crate::Result<()> {
+  match sender.try_send(request) {
+    Ok(()) => Ok(()),
+    Err(TrySendError::Full(_)) => Err(crate::Error::Platform(format!(
+      "Shell-launch queue is full (capacity {SHELL_LAUNCH_QUEUE_CAPACITY})."
+    ))),
+    Err(TrySendError::Disconnected(_)) => Err(crate::Error::Thread(
+      "Shell-launch worker is unavailable.".to_string(),
+    )),
+  }
+}
 
 #[cfg(target_os = "macos")]
 use crate::platform_impl::Application;
@@ -105,6 +261,11 @@ impl DispatcherExtMacOs for Dispatcher {
 /// Windows-specific extensions for `Dispatcher`.
 #[cfg(target_os = "windows")]
 pub trait DispatcherExtWindows {
+  /// Starts the bounded shell-launch worker ahead of the first command.
+  /// Initialization failure is retained so later launch attempts fail
+  /// immediately instead of blocking or repeatedly spawning workers.
+  fn initialize_shell_launch_worker(&self) -> crate::Result<()>;
+
   /// Returns the handle of the event loop's message window.
   ///
   /// # Platform-specific
@@ -162,7 +323,8 @@ pub trait DispatcherExtWindows {
   /// unified, cross-platform way.
   fn expand_env_strings(&self, input: &str) -> crate::Result<String>;
 
-  /// Runs the specified program using `ShellExecuteExW`.
+  /// Queues the specified program for `ShellExecuteExW` on a dedicated,
+  /// bounded worker.
   ///
   /// If `hide_window` is `true`, the spawned process window is hidden.
   ///
@@ -170,8 +332,13 @@ pub trait DispatcherExtWindows {
   ///
   /// This method is only available on Windows.
   ///
+  /// Returns after the request is enqueued. Queue saturation and worker
+  /// loss are returned immediately; a later native launch failure is
+  /// logged by the worker because it can no longer be returned to the
+  /// initiating command.
+  ///
   /// TODO: Remove this. Use `shell_util::Shell::spawn` instead.
-  fn shell_execute_ex(
+  fn queue_shell_execute_ex(
     &self,
     program: &str,
     args: &str,
@@ -182,6 +349,10 @@ pub trait DispatcherExtWindows {
 
 #[cfg(target_os = "windows")]
 impl DispatcherExtWindows for Dispatcher {
+  fn initialize_shell_launch_worker(&self) -> crate::Result<()> {
+    shell_launch_worker().map(|_| ())
+  }
+
   fn message_window_handle(&self) -> isize {
     self.source.as_ref().unwrap().message_window_handle
   }
@@ -272,35 +443,24 @@ impl DispatcherExtWindows for Dispatcher {
     Ok(String::from_utf16_lossy(&buffer[..(size - 1) as usize]))
   }
 
-  fn shell_execute_ex(
+  fn queue_shell_execute_ex(
     &self,
     program: &str,
     args: &str,
     directory: &Path,
     hide_window: bool,
   ) -> crate::Result<()> {
-    let program_wide =
-      program.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-    let args_wide = args.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-    let directory_wide = directory
-      .to_string_lossy()
-      .encode_utf16()
-      .chain(Some(0))
-      .collect::<Vec<_>>();
-
-    let mut exec_info = SHELLEXECUTEINFOW {
-      #[allow(clippy::cast_possible_truncation)]
-      cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-      lpFile: PCWSTR(program_wide.as_ptr()),
-      lpParameters: PCWSTR(args_wide.as_ptr()),
-      lpDirectory: PCWSTR(directory_wide.as_ptr()),
-      nShow: if hide_window { SW_HIDE } else { SW_NORMAL }.0 as _,
-      fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
-      ..Default::default()
+    if self.stopped.load(Ordering::SeqCst) {
+      return Err(crate::Error::EventLoopStopped);
+    }
+    let request = ShellLaunchRequest {
+      program: program.to_string(),
+      args: args.to_string(),
+      directory: directory.to_path_buf(),
+      hide_window,
+      stopped: self.stopped.clone(),
     };
-
-    unsafe { ShellExecuteExW(&raw mut exec_info) }
-      .map_err(crate::Error::from)
+    try_queue_shell_request(&shell_launch_worker()?.sender, request)
   }
 }
 
@@ -717,6 +877,78 @@ mod tests {
   use std::sync::{Arc, Mutex};
 
   use crate::EventLoop;
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn shell_execute_does_not_request_an_unused_process_handle() {
+    use windows::Win32::UI::Shell::{
+      SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
+    };
+
+    assert_eq!(super::SHELL_EXECUTE_MASK & SEE_MASK_NOCLOSEPROCESS, 0);
+    assert_ne!(super::SHELL_EXECUTE_MASK & SEE_MASK_NOASYNC, 0);
+  }
+
+  #[cfg(target_os = "windows")]
+  fn shell_request(
+    program: &str,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+  ) -> super::ShellLaunchRequest {
+    super::ShellLaunchRequest {
+      program: program.to_string(),
+      args: String::new(),
+      directory: std::path::PathBuf::from(r"C:\"),
+      hide_window: true,
+      stopped,
+    }
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn bounded_shell_queue_reports_saturation_immediately() {
+    let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    super::try_queue_shell_request(
+      &sender,
+      shell_request("first.exe", stopped.clone()),
+    )
+    .unwrap();
+    let result = super::try_queue_shell_request(
+      &sender,
+      shell_request("second.exe", stopped),
+    );
+    assert!(matches!(result, Err(crate::Error::Platform(_))));
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn bounded_shell_queue_reports_worker_loss_immediately() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    drop(receiver);
+    let result = super::try_queue_shell_request(
+      &sender,
+      shell_request(
+        "never.exe",
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+      ),
+    );
+    assert!(matches!(result, Err(crate::Error::Thread(_))));
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn shell_worker_discards_queued_launch_after_shutdown() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    sender
+      .send(shell_request("must-not-launch.exe", stopped))
+      .unwrap();
+    drop(sender);
+    let worker = std::thread::spawn(move || {
+      super::run_shell_launch_worker(receiver);
+    });
+    worker.join().unwrap();
+  }
 
   #[test]
   fn dispatch_after_stop_fails() {

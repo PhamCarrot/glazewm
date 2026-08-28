@@ -1,4 +1,8 @@
-use std::sync::OnceLock;
+use std::sync::{
+  atomic::{AtomicBool, AtomicU64, Ordering},
+  mpsc::{Receiver, TryRecvError},
+  Arc, Mutex, MutexGuard, OnceLock,
+};
 
 use windows::{
   core::w,
@@ -17,7 +21,7 @@ use windows::{
 
 use crate::{
   platform_impl::{
-    composition::BlurVisual,
+    composition::{composition_admission_available, BlurVisual},
     swca::{
       apply_swca_accent, ACCENT_ENABLE_ACRYLICBLURBEHIND,
       ACCENT_ENABLE_HOSTBACKDROP,
@@ -25,6 +29,69 @@ use crate::{
   },
   BlurOverlayParams, Rect, SurrogateBatch,
 };
+
+static NEXT_COMPOSITION_GENERATION: AtomicU64 = AtomicU64::new(1);
+static PENDING_COMPOSITION_OVERLAYS: OnceLock<
+  Mutex<Vec<Arc<PendingCompositionOverlay>>>,
+> = OnceLock::new();
+
+struct PendingCompositionOverlay {
+  generation: u64,
+  hwnd: isize,
+  receiver: Mutex<Receiver<windows::core::Result<BlurVisual>>>,
+  owner_alive: AtomicBool,
+  consumed: AtomicBool,
+}
+
+fn pending_composition_overlays(
+) -> &'static Mutex<Vec<Arc<PendingCompositionOverlay>>> {
+  PENDING_COMPOSITION_OVERLAYS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+  mutex
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Performs the one synchronous actor initialization before the WM starts
+/// accepting native or IPC work. Runtime overlay creation remains
+/// nonblocking.
+#[must_use]
+pub fn initialize_blur_overlay_composition_actor() -> bool {
+  super::platform_impl::composition::initialize_composition_actor()
+}
+
+/// Wakes when at least one hidden composition host finished actor setup.
+pub async fn wait_for_blur_overlay_composition() {
+  super::platform_impl::composition::wait_for_composition_ready().await;
+}
+
+/// Destroys actor-completed hidden hosts whose logical overlay disappeared
+/// before readiness. Must run on the WM thread that created those HWNDs.
+pub fn reap_orphaned_blur_overlay_composition() {
+  let mut pending = lock_unpoisoned(pending_composition_overlays());
+  pending.retain(|entry| {
+    if entry.consumed.load(Ordering::Acquire) {
+      return false;
+    }
+    if entry.owner_alive.load(Ordering::Acquire) {
+      return true;
+    }
+    match lock_unpoisoned(&entry.receiver).try_recv() {
+      Ok(_) | Err(TryRecvError::Disconnected) => {
+        // SAFETY: The hidden host was created on this WM thread and never
+        // transferred to a visible owner.
+        unsafe {
+          let _ = DestroyWindow(HWND(entry.hwnd));
+        }
+        entry.consumed.store(true, Ordering::Release);
+        false
+      }
+      Err(TryRecvError::Empty) => true,
+    }
+  });
+}
 
 /// Ensures the blur-overlay window class is registered exactly once per
 /// process.
@@ -130,10 +197,21 @@ fn apply_hostbackdrop(hwnd: HWND) {
 /// created overlay window. On any failure, destroys `hwnd` (since it was
 /// created with `WS_EX_NOREDIRECTIONBITMAP`, unusable for the SWCA
 /// fallback) so the caller can create a fresh window for that path.
-fn try_create_composition(
+fn queue_composition_upgrade(
   rect: &Rect,
   params: BlurOverlayParams,
-) -> Option<(HWND, BlurVisual)> {
+) -> Option<Arc<PendingCompositionOverlay>> {
+  reap_orphaned_blur_overlay_composition();
+  if !composition_admission_available(
+    lock_unpoisoned(pending_composition_overlays()).len(),
+  ) {
+    tracing::warn!(
+      "Composition overlay admission is full; retaining the visible SWCA \
+       fallback."
+    );
+    return None;
+  }
+
   let hwnd = match create_window(rect, true) {
     Ok(hwnd) => hwnd,
     Err(err) => {
@@ -145,13 +223,28 @@ fn try_create_composition(
   };
 
   apply_hostbackdrop(hwnd);
-
-  match BlurVisual::create(hwnd, rect, params) {
-    Ok(visual) => Some((hwnd, visual)),
+  match super::platform_impl::composition::queue_blur_visual(
+    hwnd,
+    rect.clone(),
+    params,
+  ) {
+    Ok(receiver) => {
+      let pending = Arc::new(PendingCompositionOverlay {
+        generation: NEXT_COMPOSITION_GENERATION
+          .fetch_add(1, Ordering::Relaxed),
+        hwnd: hwnd.0,
+        receiver: Mutex::new(receiver),
+        owner_alive: AtomicBool::new(true),
+        consumed: AtomicBool::new(false),
+      });
+      lock_unpoisoned(pending_composition_overlays())
+        .push(Arc::clone(&pending));
+      Some(pending)
+    }
     Err(err) => {
       tracing::warn!(
-        "Composition blur pipeline unavailable, falling back to SWCA \
-         acrylic: {err}."
+        "Composition actor rejected blur setup; retaining SWCA acrylic: \
+         {err}."
       );
       // SAFETY: `hwnd` was just created above and not yet handed to a
       // caller; safe to destroy immediately on this failure path.
@@ -215,6 +308,7 @@ pub struct NativeBlurOverlay {
   /// `Some` when the Composition pipeline is active for this overlay;
   /// `None` when running the SWCA fallback.
   composition: Option<BlurVisual>,
+  pending_composition: Option<Arc<PendingCompositionOverlay>>,
 }
 
 /// Generates a `NativeBlurOverlay` setter for a single `f32` knob shared
@@ -260,18 +354,12 @@ impl NativeBlurOverlay {
     rect: &Rect,
     params: BlurOverlayParams,
   ) -> crate::Result<Self> {
-    let (hwnd, composition) =
-      if let Some((hwnd, visual)) = try_create_composition(rect, params) {
-        (hwnd, Some(visual))
-      } else {
-        let hwnd = create_window(rect, false)?;
-        apply_swca_accent(
-          hwnd,
-          ACCENT_ENABLE_ACRYLICBLURBEHIND,
-          params.tint,
-        );
-        (hwnd, None)
-      };
+    // Always provide a cheap visible fallback first. The richer
+    // Composition host is built hidden on the actor and promoted on a
+    // later WM turn.
+    let hwnd = create_window(rect, false)?;
+    apply_swca_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, params.tint);
+    let pending_composition = queue_composition_upgrade(rect, params);
 
     // SAFETY: `hwnd` is a valid window just created above.
     if let Err(e) = unsafe {
@@ -293,13 +381,122 @@ impl NativeBlurOverlay {
       params,
       rect: rect.clone(),
       is_visible: true,
-      composition,
+      composition: None,
+      pending_composition,
     })
+  }
+
+  /// Promotes an actor-built hidden composition host without waiting.
+  /// Returns true only when a readiness result was consumed.
+  pub fn finish_composition_upgrade(&mut self) -> bool {
+    let Some(pending) = self.pending_composition.as_ref() else {
+      return false;
+    };
+    let result = match lock_unpoisoned(&pending.receiver).try_recv() {
+      Ok(result) => result,
+      Err(TryRecvError::Empty) => return false,
+      Err(TryRecvError::Disconnected) => Err(windows::core::Error::new(
+        windows::Win32::Foundation::E_FAIL,
+        "Composition actor disconnected before readiness.".into(),
+      )),
+    };
+
+    let Some(pending) = self.pending_composition.take() else {
+      return false;
+    };
+    pending.consumed.store(true, Ordering::Release);
+    match result {
+      Ok(mut visual) => {
+        if let Err(error) = visual.set_rect(&self.rect) {
+          tracing::warn!(
+            "Composition overlay readiness resize failed: {error}."
+          );
+        }
+        if let Err(error) = visual.set_tint(self.params.tint) {
+          tracing::warn!(
+            "Composition overlay readiness tint failed: {error}."
+          );
+        }
+        if let Err(error) =
+          visual.set_corner_radius(self.params.corner_radius)
+        {
+          tracing::warn!(
+            "Composition overlay readiness corner update failed: {error}."
+          );
+        }
+        if let Err(error) = visual.set_opacity(self.params.opacity) {
+          tracing::warn!(
+            "Composition overlay readiness opacity failed: {error}."
+          );
+        }
+        let _ = visual.set_blur_amount(self.params.blur_amount);
+        let _ = visual.set_saturation(self.params.saturation);
+
+        let flags = SWP_NOACTIVATE
+          | SWP_NOSENDCHANGING
+          | if self.is_visible {
+            SWP_SHOWWINDOW
+          } else {
+            windows::Win32::UI::WindowsAndMessaging::SWP_HIDEWINDOW
+          };
+        // Show the ready replacement before removing fallback coverage.
+        let show_result = unsafe {
+          SetWindowPos(
+            HWND(pending.hwnd),
+            HWND_BOTTOM,
+            self.rect.x(),
+            self.rect.y(),
+            self.rect.width(),
+            self.rect.height(),
+            flags,
+          )
+        };
+        if let Err(error) = show_result {
+          tracing::warn!(
+            "Composition overlay promotion failed; retaining SWCA fallback: \
+             {error}."
+          );
+          unsafe {
+            let _ = DestroyWindow(HWND(pending.hwnd));
+          }
+          return true;
+        }
+
+        let fallback = self.hwnd();
+        unsafe {
+          let _ = ShowWindow(fallback, SW_HIDE);
+          let _ = DestroyWindow(fallback);
+        }
+        self.hwnd = pending.hwnd;
+        self.composition = Some(visual);
+        tracing::debug!(
+          "Promoted blur overlay composition generation {}.",
+          pending.generation
+        );
+      }
+      Err(error) => {
+        tracing::warn!(
+          "Composition blur setup failed; retaining visible SWCA fallback: \
+           {error}."
+        );
+        unsafe {
+          let _ = DestroyWindow(HWND(pending.hwnd));
+        }
+      }
+    }
+    true
   }
 
   /// Returns the `HWND` for this overlay.
   fn hwnd(&self) -> HWND {
     HWND(self.hwnd)
+  }
+
+  /// Returns the raw host HWND used to associate batch failures with this
+  /// overlay's owner.
+  #[must_use]
+  pub fn handle(&self) -> isize {
+    self.hwnd
   }
 
   /// Returns whether the overlay window is currently shown.
@@ -320,6 +517,7 @@ impl NativeBlurOverlay {
   ///
   /// [`hide`]: NativeBlurOverlay::hide
   pub fn set_rect(&mut self, rect: &Rect) {
+    self.finish_composition_upgrade();
     if self.is_visible && &self.rect == rect {
       return;
     }
@@ -372,6 +570,7 @@ impl NativeBlurOverlay {
   ///
   /// [`set_rect`]: NativeBlurOverlay::set_rect
   pub fn defer_rect(&mut self, batch: &mut SurrogateBatch, rect: &Rect) {
+    self.finish_composition_upgrade();
     if !self.is_visible {
       self.set_rect(rect);
       return;
@@ -394,6 +593,7 @@ impl NativeBlurOverlay {
 
   /// Updates the ABGR tint; re-applies only when the value changes.
   pub fn set_tint(&mut self, tint: u32) {
+    self.finish_composition_upgrade();
     if self.params.tint == tint {
       return;
     }
@@ -463,6 +663,7 @@ impl NativeBlurOverlay {
   /// for the call sites that already have a full `BlurOverlayParams`
   /// rather than one field at a time.
   pub fn apply(&mut self, params: BlurOverlayParams) {
+    self.finish_composition_upgrade();
     self.set_tint(params.tint);
     self.set_blur_amount(params.blur_amount);
     self.set_corner_radius(params.corner_radius);
@@ -472,6 +673,7 @@ impl NativeBlurOverlay {
 
   /// Hides the overlay without destroying it.
   pub fn hide(&mut self) {
+    self.finish_composition_upgrade();
     self.is_visible = false;
     // SAFETY: `self.hwnd()` is a valid window handle.
     unsafe {
@@ -482,6 +684,16 @@ impl NativeBlurOverlay {
 
 impl Drop for NativeBlurOverlay {
   fn drop(&mut self) {
+    if let Some(pending) = self.pending_composition.take() {
+      pending.owner_alive.store(false, Ordering::Release);
+      match lock_unpoisoned(&pending.receiver).try_recv() {
+        Ok(_) | Err(TryRecvError::Disconnected) => unsafe {
+          let _ = DestroyWindow(HWND(pending.hwnd));
+          pending.consumed.store(true, Ordering::Release);
+        },
+        Err(TryRecvError::Empty) => {}
+      }
+    }
     // Drop the Composition visual tree (if any) before destroying the
     // window it's rooted to.
     self.composition.take();
@@ -490,6 +702,94 @@ impl Drop for NativeBlurOverlay {
     // at most once.
     unsafe {
       let _ = DestroyWindow(self.hwnd());
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+  };
+
+  use windows::Win32::{
+    Foundation::{E_FAIL, HWND},
+    UI::WindowsAndMessaging::{
+      IsWindow, IsWindowVisible, SetWindowPos, HWND_BOTTOM,
+      SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_SHOWWINDOW,
+    },
+  };
+
+  use super::{
+    create_window, NativeBlurOverlay, PendingCompositionOverlay,
+  };
+  use crate::{BlurOverlayParams, Rect};
+
+  fn test_params() -> BlurOverlayParams {
+    BlurOverlayParams {
+      tint: 0x0100_0000,
+      blur_amount: 24.0,
+      corner_radius: 8.0,
+      opacity: 0.8,
+      saturation: 1.0,
+    }
+  }
+
+  #[test]
+  fn failed_composition_readiness_preserves_visible_swca_fallback() {
+    let rect = Rect::from_xy(-20_000, -20_000, 160, 100);
+    for generation in 1..=50 {
+      let fallback = create_window(&rect, false)
+        .expect("test fallback host should be created");
+      let pending_host = create_window(&rect, true)
+        .expect("test composition host should be created");
+      unsafe {
+        SetWindowPos(
+          fallback,
+          HWND_BOTTOM,
+          rect.x(),
+          rect.y(),
+          rect.width(),
+          rect.height(),
+          SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW,
+        )
+        .expect("test fallback host should be shown");
+      }
+      let (sender, receiver) = mpsc::sync_channel(1);
+      sender
+        .send(Err(windows::core::Error::new(
+          E_FAIL,
+          "injected composition setup failure".into(),
+        )))
+        .expect("test failure result should be queued");
+      let pending = Arc::new(PendingCompositionOverlay {
+        generation,
+        hwnd: pending_host.0,
+        receiver: Mutex::new(receiver),
+        owner_alive: AtomicBool::new(true),
+        consumed: AtomicBool::new(false),
+      });
+      let mut overlay = NativeBlurOverlay {
+        hwnd: fallback.0,
+        params: test_params(),
+        rect: rect.clone(),
+        is_visible: true,
+        composition: None,
+        pending_composition: Some(Arc::clone(&pending)),
+      };
+
+      assert!(unsafe { IsWindowVisible(fallback).as_bool() });
+      assert!(overlay.finish_composition_upgrade());
+      assert_eq!(overlay.handle(), fallback.0);
+      assert!(overlay.composition.is_none());
+      assert!(overlay.pending_composition.is_none());
+      assert!(pending.consumed.load(Ordering::Acquire));
+      assert!(unsafe { IsWindowVisible(fallback).as_bool() });
+      assert!(!unsafe { IsWindow(HWND(pending_host.0)).as_bool() });
+
+      drop(overlay);
+      assert!(!unsafe { IsWindow(HWND(fallback.0)).as_bool() });
     }
   }
 }

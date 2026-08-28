@@ -28,7 +28,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionKind {
   /// Move/resize sessions may sample a gap color and recover a stale DWM
-  /// thumbnail by re-registering it.
+  /// thumbnail by re-registering only while the surrogate is still hidden
+  /// before visual handoff. Visible sessions fail to the real window.
   MoveResize,
   /// Open/close handoffs remain transparent and fail closed to the real
   /// window instead of exposing a visible thumbnail re-registration gap.
@@ -40,9 +41,59 @@ impl SessionKind {
     matches!(self, Self::MoveResize)
   }
 
-  const fn allows_thumbnail_reregistration(self) -> bool {
-    matches!(self, Self::MoveResize)
+  const fn allows_thumbnail_reregistration(
+    self,
+    visual_handoff_complete: bool,
+  ) -> bool {
+    matches!(self, Self::MoveResize) && !visual_handoff_complete
   }
+}
+
+const fn should_enable_sampled_gap(
+  kind: SessionKind,
+  is_move_only: bool,
+  visual_handoff_complete: bool,
+) -> bool {
+  matches!(kind, SessionKind::MoveResize)
+    && !is_move_only
+    && visual_handoff_complete
+}
+
+fn compatible_readiness_policy(
+  kind: SessionKind,
+  visual_handoff_complete: bool,
+  session_cloaked: bool,
+  session_hwnd: isize,
+  source_hwnd: isize,
+  thumbnail_healthy: bool,
+  session_opacity: u8,
+  effect_opacity: u8,
+  session_corner: CornerStyle,
+  corner_style: CornerStyle,
+  session_blur: Option<BlurOverlayParams>,
+  blur_overlay: Option<BlurOverlayParams>,
+) -> bool {
+  kind == SessionKind::MoveResize
+    && !visual_handoff_complete
+    && !session_cloaked
+    && session_hwnd == source_hwnd
+    && thumbnail_healthy
+    && session_opacity == effect_opacity
+    && session_corner == corner_style
+    && session_blur == blur_overlay
+}
+
+fn readiness_redirect_geometry(
+  was_move_only: bool,
+  current_rect: &Rect,
+  new_target: &Rect,
+) -> (bool, bool) {
+  let is_move_only = was_move_only
+    && current_rect.width() == new_target.width()
+    && current_rect.height() == new_target.height();
+  let is_growing = new_target.width() >= current_rect.width()
+    && new_target.height() >= current_rect.height();
+  (is_move_only, is_growing)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -141,6 +192,8 @@ pub struct ResizeSession {
   /// fade component, so the thumbnail matches the real window's
   /// `SetLayeredWindowAttributes` opacity throughout the move/resize.
   pub effect_opacity: u8,
+  /// Corner policy captured when the surrogate host was created.
+  corner_style: CornerStyle,
   /// Backdrop color applied to the surrogate, either passed in via
   /// [`SessionOptions`] or freshly sampled at session start.
   ///
@@ -194,6 +247,10 @@ pub struct ResizeSession {
   /// to fire on the first `Frozen` frame (where the cloak state is
   /// unknown) and after the session is torn down.
   session_cloaked: bool,
+  /// `true` only after the transparent surrogate has survived its staged
+  /// compositor-readiness ticks and the real source window was cloaked.
+  /// Visible thumbnail re-registration is forbidden from this point on.
+  visual_handoff_complete: bool,
   /// Whether the latest [`pre_commit`] confirmed that the real window
   /// reached `target_rect`.
   ///
@@ -279,7 +336,8 @@ impl ResizeSession {
     // sample costs two GPU→CPU `BitBlt` readbacks, which stack up when
     // a relayout begins many sessions in the same keypress. Falls back
     // to transparent (no backdrop) when sampling fails.
-    let edge_color = if !options.kind.uses_sampled_gap_color()
+    let edge_color = if is_move_only
+      || !options.kind.uses_sampled_gap_color()
       || options.blur_overlay.is_some()
     {
       None
@@ -303,7 +361,7 @@ impl ResizeSession {
       hwnd,
       source_rect,
       source_rect,
-      edge_color.as_ref(),
+      None,
       effect_opacity,
       options.initially_visible,
       border_inset,
@@ -328,6 +386,7 @@ impl ResizeSession {
       thumbnail_healthy: true,
       border_inset,
       effect_opacity,
+      corner_style: options.corner_style,
       edge_color,
       is_move_only,
       is_growing,
@@ -335,6 +394,7 @@ impl ResizeSession {
       handoff_done: is_growing,
       poll_parity: false,
       session_cloaked: false,
+      visual_handoff_complete: false,
       pre_commit_succeeded: false,
       pending_thumbnail_dims: None,
       blur_overlay: options.blur_overlay,
@@ -375,6 +435,71 @@ impl ResizeSession {
   #[must_use]
   pub fn target_rect(&self) -> &Rect {
     &self.target_rect
+  }
+
+  /// Updates only the final real-window target while a failed surrogate
+  /// is being recovered. No thumbnail work is attempted on this path.
+  pub fn update_recovery_target(&mut self, target_rect: Rect) {
+    self.target_rect = target_rect;
+    self.pre_commit_succeeded = false;
+  }
+
+  /// Returns the source HWND retained by this session, or zero after
+  /// [`pre_commit`] observes that the source was destroyed.
+  #[must_use]
+  pub fn source_handle(&self) -> isize {
+    self.hwnd
+  }
+
+  /// Returns this session's surrogate host HWND when one exists.
+  #[must_use]
+  pub fn surrogate_handle(&self) -> Option<isize> {
+    self.surrogate.as_ref().map(|surrogate| surrogate.hwnd().0)
+  }
+
+  /// Whether a hidden move/resize surrogate can absorb a target redirect
+  /// without recreating its host or restarting its readiness epoch.
+  #[must_use]
+  pub fn is_compatible_readiness_redirect(
+    &self,
+    source_hwnd: isize,
+    effect_opacity: u8,
+    corner_style: CornerStyle,
+    blur_overlay: Option<BlurOverlayParams>,
+  ) -> bool {
+    compatible_readiness_policy(
+      self.kind,
+      self.visual_handoff_complete,
+      self.session_cloaked,
+      self.hwnd,
+      source_hwnd,
+      self.thumbnail_healthy,
+      self.effect_opacity,
+      effect_opacity,
+      self.corner_style,
+      corner_style,
+      self.blur_overlay,
+      blur_overlay,
+    )
+  }
+
+  /// Coalesces geometry while the source is still visible and the hidden
+  /// surrogate is warming up. This deliberately performs no native source
+  /// resize and no thumbnail re-registration.
+  pub fn redirect_during_readiness(
+    &mut self,
+    current_rect: &Rect,
+    new_target: &Rect,
+  ) {
+    (self.is_move_only, self.is_growing) = readiness_redirect_geometry(
+      self.is_move_only,
+      current_rect,
+      new_target,
+    );
+    self.target_rect = new_target.clone();
+    self.handoff_done = false;
+    self.pre_commit_succeeded = false;
+    self.pending_thumbnail_dims = None;
   }
 
   /// Whether [`pre_commit`] confirmed the final native position.
@@ -431,6 +556,66 @@ impl ResizeSession {
     self.session_cloaked = true;
   }
 
+  /// Completes a staged move/resize visibility transfer after the caller
+  /// has successfully cloaked the real source window.
+  ///
+  /// Pure moves keep the host transparent. Resize sessions enable their
+  /// sampled gap color only now, after the thumbnail has already remained
+  /// visible for one compositor-paced interval. Growing sessions post
+  /// their one asynchronous target reposition so DWM can capture resized
+  /// content.
+  pub fn complete_move_resize_handoff(&mut self) -> bool {
+    if self.kind != SessionKind::MoveResize || self.hwnd == 0 {
+      return false;
+    }
+
+    self.session_cloaked = true;
+    self.visual_handoff_complete = true;
+
+    if should_enable_sampled_gap(
+      self.kind,
+      self.is_move_only,
+      self.visual_handoff_complete,
+    ) {
+      if let Some(surrogate) = &self.surrogate {
+        if !surrogate.set_backdrop_color(self.edge_color.as_ref()) {
+          tracing::warn!(
+            "Failed to enable sampled move/resize gap backdrop for source \
+             HWND {}; continuing with the valid thumbnail animation.",
+            self.hwnd
+          );
+        }
+      }
+    }
+
+    if !self.is_growing {
+      return true;
+    }
+
+    let mut flags = SWP_NOACTIVATE
+      | SWP_NOSENDCHANGING
+      | SWP_NOZORDER
+      | SWP_ASYNCWINDOWPOS;
+    if !self.is_move_only {
+      flags |= SWP_FRAMECHANGED;
+    }
+
+    // SAFETY: The caller has just cloaked `HWND(self.hwnd)`. The request
+    // is asynchronous, so this never waits on the target app's thread.
+    unsafe {
+      SetWindowPos(
+        HWND(self.hwnd),
+        HWND(0),
+        self.target_rect.x(),
+        self.target_rect.y(),
+        self.target_rect.width(),
+        self.target_rect.height(),
+        flags,
+      )
+      .is_ok()
+    }
+  }
+
   /// Whether a surrogate overlay with a valid DWM thumbnail is active.
   ///
   /// Returns `false` when surrogate creation failed, or when the surrogate
@@ -469,6 +654,13 @@ impl ResizeSession {
   pub fn show(&mut self) {
     if let Some(ref mut surrogate) = self.surrogate {
       surrogate.set_visible(true);
+    }
+  }
+
+  /// Hides the surrogate before failure cleanup unregisters its thumbnail.
+  pub fn hide(&mut self) {
+    if let Some(ref mut surrogate) = self.surrogate {
+      surrogate.set_visible(false);
     }
   }
 
@@ -577,7 +769,9 @@ impl ResizeSession {
           safe_w,
           safe_h,
           self.border_inset,
-          self.kind.allows_thumbnail_reregistration(),
+          self
+            .kind
+            .allows_thumbnail_reregistration(self.visual_handoff_complete),
         );
       }
     }
@@ -647,7 +841,9 @@ impl ResizeSession {
         target_dims.0,
         target_dims.1,
         self.border_inset,
-        self.kind.allows_thumbnail_reregistration(),
+        self
+          .kind
+          .allows_thumbnail_reregistration(self.visual_handoff_complete),
       );
     }
   }
@@ -686,7 +882,7 @@ impl ResizeSession {
     batch: &mut SurrogateBatch,
     current_rect: &Rect,
     opacity: u8,
-  ) {
+  ) -> bool {
     // Apply deferred thumbnail dims before `sync_registration` so the
     // short-circuit check (`content_size == target_dims`) succeeds on this
     // tick rather than falling back to `GetWindowRect`.
@@ -697,7 +893,9 @@ impl ResizeSession {
           w,
           h,
           self.border_inset,
-          self.kind.allows_thumbnail_reregistration(),
+          self
+            .kind
+            .allows_thumbnail_reregistration(self.visual_handoff_complete),
         );
       }
     }
@@ -708,6 +906,7 @@ impl ResizeSession {
       surrogate.defer_reposition(batch, &logical);
       self.thumbnail_healthy &= surrogate.set_window_opacity(opacity);
     }
+    self.thumbnail_healthy
   }
 
   /// Updates the surrogate, clamping its visible area to `monitor_rect`.
@@ -931,7 +1130,9 @@ impl ResizeSession {
             safe_w,
             safe_h,
             self.border_inset,
-            self.kind.allows_thumbnail_reregistration(),
+            self.kind.allows_thumbnail_reregistration(
+              self.visual_handoff_complete,
+            ),
           );
         }
       }
@@ -1027,7 +1228,9 @@ impl ResizeSession {
           w,
           h,
           self.border_inset,
-          self.kind.allows_thumbnail_reregistration(),
+          self
+            .kind
+            .allows_thumbnail_reregistration(self.visual_handoff_complete),
         );
       }
     }
@@ -1048,7 +1251,9 @@ impl ResizeSession {
           logical.width(),
           logical.height(),
           self.border_inset,
-          self.kind.allows_thumbnail_reregistration(),
+          self
+            .kind
+            .allows_thumbnail_reregistration(self.visual_handoff_complete),
         );
       }
       if let Err(err) = surrogate.update(&logical, self.effect_opacity) {
@@ -1298,18 +1503,109 @@ pub(crate) fn compute_border_inset(hwnd: HWND) -> RECT {
 
 #[cfg(test)]
 mod tests {
-  use super::{centered_thumbnail_rect, SessionKind};
+  use super::{
+    centered_thumbnail_rect, compatible_readiness_policy,
+    readiness_redirect_geometry, should_enable_sampled_gap, SessionKind,
+  };
+  use crate::{CornerStyle, Rect};
 
   #[test]
-  fn move_resize_keeps_sampled_gap_and_reregistration() {
+  fn move_resize_reregisters_only_before_visible_handoff() {
     assert!(SessionKind::MoveResize.uses_sampled_gap_color());
-    assert!(SessionKind::MoveResize.allows_thumbnail_reregistration());
+    assert!(SessionKind::MoveResize.allows_thumbnail_reregistration(false));
+    assert!(!SessionKind::MoveResize.allows_thumbnail_reregistration(true));
   }
 
   #[test]
   fn open_close_is_transparent_and_never_reregisters() {
     assert!(!SessionKind::OpenClose.uses_sampled_gap_color());
-    assert!(!SessionKind::OpenClose.allows_thumbnail_reregistration());
+    assert!(!SessionKind::OpenClose.allows_thumbnail_reregistration(false));
+  }
+
+  #[test]
+  fn sampled_gap_is_resize_only_and_post_readiness() {
+    assert!(!should_enable_sampled_gap(
+      SessionKind::MoveResize,
+      true,
+      true
+    ));
+    assert!(!should_enable_sampled_gap(
+      SessionKind::MoveResize,
+      false,
+      false
+    ));
+    assert!(should_enable_sampled_gap(
+      SessionKind::MoveResize,
+      false,
+      true
+    ));
+    assert!(!should_enable_sampled_gap(
+      SessionKind::OpenClose,
+      false,
+      true
+    ));
+  }
+
+  #[test]
+  fn compatible_geometry_redirect_preserves_readiness_policy() {
+    assert!(compatible_readiness_policy(
+      SessionKind::MoveResize,
+      false,
+      false,
+      10,
+      10,
+      true,
+      230,
+      230,
+      CornerStyle::Rounded,
+      CornerStyle::Rounded,
+      None,
+      None,
+    ));
+    assert!(!compatible_readiness_policy(
+      SessionKind::MoveResize,
+      false,
+      false,
+      10,
+      11,
+      true,
+      230,
+      230,
+      CornerStyle::Rounded,
+      CornerStyle::Rounded,
+      None,
+      None,
+    ));
+    assert!(!compatible_readiness_policy(
+      SessionKind::MoveResize,
+      false,
+      false,
+      10,
+      10,
+      true,
+      230,
+      255,
+      CornerStyle::Rounded,
+      CornerStyle::Rounded,
+      None,
+      None,
+    ));
+  }
+
+  #[test]
+  fn readiness_redirect_geometry_tracks_latest_direction_without_native_work(
+  ) {
+    let current = Rect::from_xy(0, 0, 400, 300);
+    let grow = Rect::from_xy(10, 10, 600, 500);
+    let shrink = Rect::from_xy(20, 20, 300, 200);
+    assert_eq!(
+      readiness_redirect_geometry(true, &current, &grow),
+      (false, true)
+    );
+    assert_eq!(
+      readiness_redirect_geometry(false, &current, &shrink),
+      (false, false)
+    );
   }
 
   #[test]

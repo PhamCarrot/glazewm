@@ -14,6 +14,15 @@ pub enum PlatformEvent {
 
 #[derive(Clone, Debug)]
 pub enum WindowEvent {
+  /// The bounded native listener discarded event history under extreme
+  /// lifecycle pressure. Consumers must reconcile current native/window
+  /// manager state before processing newer queued events.
+  ///
+  /// This is emitted only by the Windows listener's overflow fallback.
+  ReconcileRequested {
+    notification: WindowEventNotification,
+  },
+
   /// Window gained focus.
   Focused {
     window: NativeWindow,
@@ -79,7 +88,7 @@ pub enum WindowEvent {
 
 impl WindowEvent {
   /// Get the window handle if available (not available for
-  /// `WindowEvent::Destroyed`).
+  /// `WindowEvent::Destroyed` and `WindowEvent::ReconcileRequested`).
   #[must_use]
   pub fn window(&self) -> Option<&NativeWindow> {
     match self {
@@ -90,7 +99,7 @@ impl WindowEvent {
       | Self::MinimizeEnded { window, .. }
       | Self::Shown { window, .. }
       | Self::TitleChanged { window, .. } => Some(window),
-      Self::Destroyed { .. } => None,
+      Self::Destroyed { .. } | Self::ReconcileRequested { .. } => None,
     }
   }
 
@@ -98,7 +107,8 @@ impl WindowEvent {
   #[must_use]
   pub fn notification(&self) -> &WindowEventNotification {
     match self {
-      Self::Focused { notification, .. }
+      Self::ReconcileRequested { notification, .. }
+      | Self::Focused { notification, .. }
       | Self::Hidden { notification, .. }
       | Self::MovedOrResized { notification, .. }
       | Self::Minimized { notification, .. }

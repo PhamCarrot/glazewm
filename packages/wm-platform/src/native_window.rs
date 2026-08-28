@@ -10,6 +10,21 @@ use windows::Win32::{
   },
 };
 
+/// Stable-enough native identity used only for bounded crash recovery.
+///
+/// The process creation time distinguishes PID reuse, while the thread and
+/// class narrow same-process HWND reuse. Callers should pair this with a
+/// per-logical-window recovery marker because Windows does not provide an
+/// owning reference that pins an HWND against reuse.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWindowRecoveryIdentity {
+  pub process_id: u32,
+  pub thread_id: u32,
+  pub process_creation_time: u64,
+  pub class_name: String,
+}
+
 use crate::{platform_impl, Rect};
 #[cfg(target_os = "macos")]
 use crate::{platform_impl::AXUIElementExt, ThreadBound};
@@ -158,12 +173,37 @@ pub trait NativeWindowWindowsExt {
   /// This method is only available on Windows.
   fn hwnd(&self) -> HWND;
 
+  /// Whether the current process can safely manage this window across the
+  /// Windows integrity boundary.
+  ///
+  /// A process with a valid UIAccess token may manage higher-integrity
+  /// windows. Otherwise, the current process must have an integrity level
+  /// at least as high as the window owner. Protected processes whose
+  /// security token cannot be queried are treated as inaccessible.
+  fn is_accessible_by_current_process(&self) -> crate::Result<bool>;
+
   /// Gets the class name of the window.
   ///
   /// # Platform-specific
   ///
   /// This method is only available on Windows.
   fn class_name(&self) -> crate::Result<String>;
+
+  /// Captures process/thread/class identity for later crash-recovery
+  /// revalidation.
+  fn recovery_identity(
+    &self,
+  ) -> crate::Result<NativeWindowRecoveryIdentity>;
+
+  /// Attaches a nonzero watcher recovery marker to this exact HWND.
+  fn set_recovery_marker(&self, marker: &str) -> crate::Result<()>;
+
+  /// Returns whether this exact HWND still owns the watcher recovery
+  /// marker.
+  fn has_recovery_marker(&self, marker: &str) -> crate::Result<bool>;
+
+  /// Removes the watcher marker if this exact HWND still owns it.
+  fn remove_recovery_marker(&self, marker: &str) -> crate::Result<bool>;
 
   /// Gets the window's frame, including the window's shadow borders.
   ///
@@ -327,6 +367,11 @@ pub trait NativeWindowWindowsExt {
     opacity_value: &OpacityValue,
   ) -> crate::Result<()>;
 
+  /// Gets the effective layered-window opacity. Non-layered windows are
+  /// opaque. Color-key-only windows are rejected because changing their
+  /// alpha would alter a different transparency model.
+  fn transparency(&self) -> crate::Result<OpacityValue>;
+
   /// Adjusts the window's transparency by a relative delta.
   ///
   /// # Platform-specific
@@ -386,8 +431,30 @@ impl NativeWindowWindowsExt for NativeWindow {
     self.inner.hwnd()
   }
 
+  fn is_accessible_by_current_process(&self) -> crate::Result<bool> {
+    self.inner.is_accessible_by_current_process()
+  }
+
   fn class_name(&self) -> crate::Result<String> {
     self.inner.class_name()
+  }
+
+  fn recovery_identity(
+    &self,
+  ) -> crate::Result<NativeWindowRecoveryIdentity> {
+    self.inner.recovery_identity()
+  }
+
+  fn set_recovery_marker(&self, marker: &str) -> crate::Result<()> {
+    self.inner.set_recovery_marker(marker)
+  }
+
+  fn has_recovery_marker(&self, marker: &str) -> crate::Result<bool> {
+    self.inner.has_recovery_marker(marker)
+  }
+
+  fn remove_recovery_marker(&self, marker: &str) -> crate::Result<bool> {
+    self.inner.remove_recovery_marker(marker)
   }
 
   fn frame_with_shadows(&self) -> crate::Result<Rect> {
@@ -475,6 +542,10 @@ impl NativeWindowWindowsExt for NativeWindow {
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
     self.inner.set_transparency(opacity_value)
+  }
+
+  fn transparency(&self) -> crate::Result<OpacityValue> {
+    self.inner.transparency()
   }
 
   fn adjust_transparency(

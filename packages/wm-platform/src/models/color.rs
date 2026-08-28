@@ -56,14 +56,28 @@ impl<'de> Deserialize<'de> for Color {
     D: Deserializer<'de>,
   {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StructuredColor {
+      r: u8,
+      g: u8,
+      b: u8,
+      a: u8,
+    }
+
+    #[derive(Deserialize)]
     #[serde(untagged)]
     enum ColorDe {
-      Struct { r: u8, g: u8, b: u8, a: u8 },
+      Struct(StructuredColor),
       String(String),
     }
 
     match ColorDe::deserialize(deserializer)? {
-      ColorDe::Struct { r, g, b, a } => Ok(Self { r, g, b, a }),
+      ColorDe::Struct(value) => Ok(Self {
+        r: value.r,
+        g: value.g,
+        b: value.b,
+        a: value.a,
+      }),
       ColorDe::String(str) => {
         Self::from_str(&str).map_err(serde::de::Error::custom)
       }

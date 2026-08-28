@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use std::collections::HashMap;
 use std::collections::VecDeque;
 #[cfg(target_os = "windows")]
 use std::sync::{Arc, Mutex};
@@ -28,8 +30,267 @@ enum CoalescibleEvent {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LatestEventLane {
+  Visibility,
+  Minimize,
+  Focus,
+  Motion,
+  Title,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LatestEventKey {
+  window_id: WindowId,
+  generation: u64,
+  lane: LatestEventLane,
+}
+
+#[cfg(target_os = "windows")]
+struct LatestEventRecord {
+  sequence: u64,
+  event: WindowEvent,
+}
+
+#[cfg(target_os = "windows")]
+enum NativeEventToken {
+  Latest { key: LatestEventKey, sequence: u64 },
+  Barrier(WindowEvent),
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Default)]
+struct WindowGeneration {
+  generation: u64,
+  destroy_pending: bool,
+}
+
+/// Fixed-capacity native event history plus bounded latest-state records.
+///
+/// Replaceable state updates retain only the newest value for an HWND and
+/// generation. Destroy is an explicit generation barrier. If pressure
+/// cannot be represented without losing a barrier, history is cleared and
+/// one out-of-band reconciliation request is delivered before newer
+/// events.
+#[cfg(target_os = "windows")]
+struct NativeEventQueue {
+  order: VecDeque<NativeEventToken>,
+  latest: HashMap<LatestEventKey, LatestEventRecord>,
+  generations: HashMap<WindowId, WindowGeneration>,
+  next_sequence: u64,
+  reconcile_pending: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl NativeEventQueue {
+  fn new() -> Self {
+    Self {
+      order: VecDeque::with_capacity(MAX_NATIVE_EVENT_QUEUE),
+      latest: HashMap::new(),
+      generations: HashMap::new(),
+      next_sequence: 1,
+      reconcile_pending: false,
+    }
+  }
+
+  fn len(&self) -> usize {
+    self.order.len()
+  }
+
+  fn push(&mut self, event: WindowEvent, limit: usize) {
+    let limit = limit.max(1);
+
+    match event {
+      WindowEvent::Destroyed { window_id, .. } => {
+        if self
+          .generations
+          .get(&window_id)
+          .is_some_and(|generation| generation.destroy_pending)
+        {
+          return;
+        }
+
+        self.latest.retain(|key, _| key.window_id != window_id);
+        self.compact_stale_tokens();
+        if self.order.len() >= limit {
+          self.begin_overflow_reconciliation();
+        }
+        let generation = self.generations.entry(window_id).or_default();
+        generation.generation = generation.generation.wrapping_add(1);
+        generation.destroy_pending = true;
+        self.order.push_back(NativeEventToken::Barrier(event));
+      }
+      WindowEvent::MovedOrResized {
+        is_interactive_start: true,
+        ..
+      }
+      | WindowEvent::MovedOrResized {
+        is_interactive_end: true,
+        ..
+      }
+      | WindowEvent::ReconcileRequested { .. } => {
+        self.push_barrier(event, limit);
+      }
+      event => self.push_latest(event, limit),
+    }
+  }
+
+  fn push_latest(&mut self, event: WindowEvent, limit: usize) {
+    let Some((window_id, lane)) = latest_event_identity(&event) else {
+      self.push_barrier(event, limit);
+      return;
+    };
+
+    if lane == LatestEventLane::Focus {
+      self
+        .latest
+        .retain(|key, _| key.lane != LatestEventLane::Focus);
+    }
+    if matches!(event, WindowEvent::Shown { .. }) {
+      self
+        .generations
+        .entry(window_id)
+        .or_default()
+        .destroy_pending = false;
+    }
+    let generation = self
+      .generations
+      .get(&window_id)
+      .copied()
+      .unwrap_or_default()
+      .generation;
+    let key = LatestEventKey {
+      window_id,
+      generation,
+      lane,
+    };
+
+    self.compact_stale_tokens();
+    if self.order.len() >= limit {
+      if let Some(record) = self.latest.get_mut(&key) {
+        // The existing token will deliver this newest state. Under
+        // capacity pressure preserving bounded latest state is
+        // preferable to adding another ordering token.
+        record.event = event;
+        return;
+      }
+      if matches!(lane, LatestEventLane::Motion | LatestEventLane::Title) {
+        return;
+      }
+      self.begin_overflow_reconciliation();
+    }
+
+    let sequence = self.take_sequence();
+    self
+      .latest
+      .insert(key, LatestEventRecord { sequence, event });
+    self
+      .order
+      .push_back(NativeEventToken::Latest { key, sequence });
+  }
+
+  fn push_barrier(&mut self, event: WindowEvent, limit: usize) {
+    self.compact_stale_tokens();
+    if self.order.len() >= limit {
+      self.begin_overflow_reconciliation();
+    }
+    self.order.push_back(NativeEventToken::Barrier(event));
+  }
+
+  fn begin_overflow_reconciliation(&mut self) {
+    self.order.clear();
+    self.latest.clear();
+    self.generations.clear();
+    self.reconcile_pending = true;
+  }
+
+  fn take_sequence(&mut self) -> u64 {
+    let sequence = self.next_sequence;
+    self.next_sequence = self.next_sequence.wrapping_add(1);
+    if self.next_sequence == 0 {
+      self.next_sequence = 1;
+      self.reconcile_pending = true;
+    }
+    sequence
+  }
+
+  fn compact_stale_tokens(&mut self) {
+    self.order.retain(|token| match token {
+      NativeEventToken::Latest { key, sequence } => self
+        .latest
+        .get(key)
+        .is_some_and(|record| record.sequence == *sequence),
+      NativeEventToken::Barrier(_) => true,
+    });
+  }
+
+  fn pop(&mut self) -> Option<WindowEvent> {
+    if self.reconcile_pending {
+      self.reconcile_pending = false;
+      return Some(WindowEvent::ReconcileRequested {
+        notification: crate::WindowEventNotification(None),
+      });
+    }
+
+    while let Some(token) = self.order.pop_front() {
+      let event = match token {
+        NativeEventToken::Latest { key, sequence } => {
+          let is_current = self
+            .latest
+            .get(&key)
+            .is_some_and(|record| record.sequence == sequence);
+          if !is_current {
+            continue;
+          }
+          self.latest.remove(&key).map(|record| record.event)
+        }
+        NativeEventToken::Barrier(event) => Some(event),
+      };
+      if self.order.is_empty() && self.latest.is_empty() {
+        self.generations.clear();
+      }
+      if event.is_some() {
+        return event;
+      }
+    }
+
+    self.latest.clear();
+    self.generations.clear();
+    None
+  }
+}
+
+#[cfg(target_os = "windows")]
+fn latest_event_identity(
+  event: &WindowEvent,
+) -> Option<(WindowId, LatestEventLane)> {
+  match event {
+    WindowEvent::Focused { window, .. } => {
+      Some((window.id(), LatestEventLane::Focus))
+    }
+    WindowEvent::Hidden { window, .. }
+    | WindowEvent::Shown { window, .. } => {
+      Some((window.id(), LatestEventLane::Visibility))
+    }
+    WindowEvent::MovedOrResized { window, .. } => {
+      Some((window.id(), LatestEventLane::Motion))
+    }
+    WindowEvent::Minimized { window, .. }
+    | WindowEvent::MinimizeEnded { window, .. } => {
+      Some((window.id(), LatestEventLane::Minimize))
+    }
+    WindowEvent::TitleChanged { window, .. } => {
+      Some((window.id(), LatestEventLane::Title))
+    }
+    WindowEvent::Destroyed { .. }
+    | WindowEvent::ReconcileRequested { .. } => None,
+  }
+}
+
+#[cfg(target_os = "windows")]
 struct NativeEventQueueShared {
-  events: Mutex<VecDeque<WindowEvent>>,
+  queue: Mutex<NativeEventQueue>,
   notify: Notify,
 }
 
@@ -53,39 +314,14 @@ impl NativeWindowEventSender {
   }
 
   fn send_with_limit(&self, event: WindowEvent, limit: usize) {
-    let mut events = self
+    let mut queue = self
       .shared
-      .events
+      .queue
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    if let Some(key) = WindowListener::coalescible_key(&event) {
-      if events
-        .back()
-        .and_then(WindowListener::coalescible_key)
-        .is_some_and(|previous| previous == key)
-      {
-        *events
-          .back_mut()
-          .expect("native event queue unexpectedly empty") = event;
-        return;
-      }
-
-      if events.len() >= limit {
-        return;
-      }
-    } else if events.len() >= limit {
-      if let Some(index) = events.iter().position(|queued| {
-        WindowListener::coalescible_key(queued).is_some()
-      }) {
-        events.remove(index);
-      }
-      // When the queue contains lifecycle events only, allow it to exceed
-      // the soft limit rather than losing a show/hide/focus/destroy event.
-    }
-
-    events.push_back(event);
-    drop(events);
+    queue.push(event, limit);
+    debug_assert!(queue.len() <= limit.max(1));
+    drop(queue);
     self.shared.notify.notify_one();
   }
 }
@@ -102,10 +338,10 @@ impl NativeWindowEventReceiver {
       let notified = self.shared.notify.notified();
       if let Some(event) = self
         .shared
-        .events
+        .queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pop_front()
+        .pop()
       {
         return Some(event);
       }
@@ -118,7 +354,7 @@ impl NativeWindowEventReceiver {
 fn native_window_event_channel(
 ) -> (NativeWindowEventSender, NativeWindowEventReceiver) {
   let shared = Arc::new(NativeEventQueueShared {
-    events: Mutex::new(VecDeque::new()),
+    queue: Mutex::new(NativeEventQueue::new()),
     notify: Notify::new(),
   });
   (
@@ -258,6 +494,20 @@ mod tests {
     }
   }
 
+  fn shown(handle: isize) -> WindowEvent {
+    WindowEvent::Shown {
+      window: window(handle),
+      notification: WindowEventNotification(None),
+    }
+  }
+
+  fn destroyed(handle: isize) -> WindowEvent {
+    WindowEvent::Destroyed {
+      window_id: WindowId(handle),
+      notification: WindowEventNotification(None),
+    }
+  }
+
   #[test]
   fn coalesces_only_adjacent_noisy_events_for_the_same_window() {
     let mut pending = VecDeque::new();
@@ -327,36 +577,111 @@ mod tests {
 
     let queued = receiver
       .shared
-      .events
+      .queue
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(queued.len(), 2);
-    assert!(queued
-      .iter()
-      .all(|event| matches!(event, WindowEvent::MovedOrResized { .. })));
     drop(queued);
 
     sender.send_with_limit(hidden(3), 2);
-    let queued = receiver
+    let mut queued = receiver
       .shared
-      .events
+      .queue
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(queued.len(), 2);
-    assert!(matches!(queued.back(), Some(WindowEvent::Hidden { .. })));
+    assert_eq!(queued.len(), 1);
+    assert!(matches!(
+      queued.pop(),
+      Some(WindowEvent::ReconcileRequested { .. })
+    ));
+    assert!(matches!(queued.pop(), Some(WindowEvent::Hidden { .. })));
   }
 
   #[test]
-  fn native_queue_never_drops_lifecycle_only_pressure() {
+  fn native_queue_hard_bounds_lifecycle_only_pressure() {
     let (sender, receiver) = native_window_event_channel();
     sender.send_with_limit(hidden(1), 1);
     sender.send_with_limit(hidden(2), 1);
 
-    let queued = receiver
+    let mut queued = receiver
       .shared
-      .events
+      .queue
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(queued.len(), 2);
+    assert_eq!(queued.len(), 1);
+    assert!(matches!(
+      queued.pop(),
+      Some(WindowEvent::ReconcileRequested { .. })
+    ));
+    assert!(matches!(queued.pop(), Some(WindowEvent::Hidden { .. })));
+    assert_eq!(queued.len(), 0);
+  }
+
+  #[test]
+  fn destroy_is_a_generation_barrier_for_reused_numeric_hwnd() {
+    let (sender, receiver) = native_window_event_channel();
+    sender.send_with_limit(shown(42), 8);
+    sender.send_with_limit(destroyed(42), 8);
+    sender.send_with_limit(shown(42), 8);
+
+    let mut queued = receiver
+      .shared
+      .queue
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(matches!(
+      queued.pop(),
+      Some(WindowEvent::Destroyed {
+        window_id: WindowId(42),
+        ..
+      })
+    ));
+    assert!(matches!(
+      queued.pop(),
+      Some(WindowEvent::Shown { ref window, .. }) if window.id() == WindowId(42)
+    ));
+    assert_eq!(queued.len(), 0);
+  }
+
+  #[test]
+  fn hundred_thousand_mixed_events_stay_within_fixed_capacity() {
+    const LIMIT: usize = 64;
+    let (sender, receiver) = native_window_event_channel();
+
+    for index in 0..100_000_isize {
+      let handle = (index % 257) + 1;
+      let event = match index % 5 {
+        0 => moved(handle, false, false),
+        1 => title(handle),
+        2 => hidden(handle),
+        3 => shown(handle),
+        _ => destroyed(handle),
+      };
+      sender.send_with_limit(event, LIMIT);
+      let queued = receiver
+        .shared
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+      assert!(queued.len() <= LIMIT);
+      assert!(queued.latest.len() <= LIMIT);
+      assert!(queued.generations.len() <= LIMIT);
+    }
+
+    let mut queued = receiver
+      .shared
+      .queue
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(matches!(
+      queued.pop(),
+      Some(WindowEvent::ReconcileRequested { .. })
+    ));
+    while queued.pop().is_some() {
+      assert!(queued.len() <= LIMIT);
+    }
+    assert_eq!(queued.len(), 0);
+    assert!(queued.latest.is_empty());
+    assert!(queued.generations.is_empty());
   }
 }

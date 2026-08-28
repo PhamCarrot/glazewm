@@ -24,7 +24,9 @@ use windows::{
 };
 
 use crate::{
-  platform_impl::swca::{apply_swca_accent, ACCENT_ENABLE_GRADIENT},
+  platform_impl::swca::{
+    apply_swca_accent, ACCENT_DISABLED, ACCENT_ENABLE_GRADIENT,
+  },
   Color, CornerStyle, Rect,
 };
 
@@ -103,9 +105,9 @@ fn apply_corner_preference(hwnd: HWND, corner_style: &CornerStyle) {
 /// the DWM thumbnail is genuinely see-through.
 ///
 /// This is a no-op when the API is unavailable (pre-Windows 10 1607).
-fn apply_backdrop(hwnd: HWND, color: Option<&Color>) {
+fn apply_backdrop(hwnd: HWND, color: Option<&Color>) -> bool {
   let Some(c) = color else {
-    return;
+    return apply_swca_accent(hwnd, ACCENT_DISABLED, 0);
   };
 
   // The undocumented `gradient_color` field uses ABGR byte order:
@@ -115,7 +117,7 @@ fn apply_backdrop(hwnd: HWND, color: Option<&Color>) {
     | (u32::from(c.g) << 8)
     | u32::from(c.r);
 
-  apply_swca_accent(hwnd, ACCENT_ENABLE_GRADIENT, abgr);
+  apply_swca_accent(hwnd, ACCENT_ENABLE_GRADIENT, abgr)
 }
 
 /// Registers a DWM thumbnail of `source_hwnd` onto `dest_hwnd`.
@@ -216,6 +218,27 @@ pub struct SurrogateBatch {
   entries: Vec<(isize, Rect)>,
 }
 
+/// Outcome of committing a [`SurrogateBatch`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SurrogateBatchResult {
+  /// `true` when every entry was committed by one successful
+  /// `DeferWindowPos` transaction.
+  pub atomic: bool,
+  /// HWNDs whose individual fallback `SetWindowPos` call failed.
+  pub failed_hwnds: Vec<isize>,
+  /// Why the atomic transaction was abandoned, when fallback ran.
+  pub fallback_reason: Option<SurrogateBatchFallbackReason>,
+}
+
+/// Native transaction stage that caused a batch to use individual
+/// fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurrogateBatchFallbackReason {
+  Begin,
+  Defer,
+  End,
+}
+
 fn surrogate_batch_flags() -> SET_WINDOW_POS_FLAGS {
   // `SWP_NOSENDCHANGING` is intentionally excluded. Although accepted by
   // `SetWindowPos`, Windows returns `ERROR_INVALID_PARAMETER` when it is
@@ -256,9 +279,10 @@ impl SurrogateBatch {
   ///
   /// Falls back to individual `SetWindowPos` calls when the transaction
   /// fails (e.g. a surrogate window was destroyed mid-frame).
-  pub fn commit(self) {
+  #[must_use]
+  pub fn commit(self) -> SurrogateBatchResult {
     if self.entries.is_empty() {
-      return;
+      return SurrogateBatchResult::default();
     }
 
     let flags = surrogate_batch_flags();
@@ -270,7 +294,11 @@ impl SurrogateBatch {
     let deferred = unsafe {
       let Ok(mut hdwp) = BeginDeferWindowPos(self.entries.len() as i32)
       else {
-        return Self::commit_individually(&self.entries, flags);
+        return Self::commit_individually(
+          &self.entries,
+          flags,
+          SurrogateBatchFallbackReason::Begin,
+        );
       };
 
       for (hwnd, rect) in &self.entries {
@@ -288,7 +316,11 @@ impl SurrogateBatch {
           // The transaction (including prior entries) is invalidated on
           // failure; redo everything individually.
           Err(_) => {
-            return Self::commit_individually(&self.entries, flags);
+            return Self::commit_individually(
+              &self.entries,
+              flags,
+              SurrogateBatchFallbackReason::Defer,
+            );
           }
         }
       }
@@ -297,7 +329,16 @@ impl SurrogateBatch {
     };
 
     if !deferred {
-      Self::commit_individually(&self.entries, flags);
+      return Self::commit_individually(
+        &self.entries,
+        flags,
+        SurrogateBatchFallbackReason::End,
+      );
+    }
+    SurrogateBatchResult {
+      atomic: true,
+      failed_hwnds: Vec::new(),
+      fallback_reason: None,
     }
   }
 
@@ -306,21 +347,50 @@ impl SurrogateBatch {
   fn commit_individually(
     entries: &[(isize, Rect)],
     flags: SET_WINDOW_POS_FLAGS,
-  ) {
-    for (hwnd, rect) in entries {
-      // SAFETY: See `commit` — failures for stale handles are ignored.
+    reason: SurrogateBatchFallbackReason,
+  ) -> SurrogateBatchResult {
+    Self::commit_individually_with(entries, reason, |hwnd, rect| {
+      // SAFETY: See `commit` — stale handles report failure.
       unsafe {
-        let _ = SetWindowPos(
-          HWND(*hwnd),
+        SetWindowPos(
+          HWND(hwnd),
           HWND(0),
           rect.x(),
           rect.y(),
           rect.width(),
           rect.height(),
           flags,
-        );
+        )
+        .is_ok()
+      }
+    })
+  }
+
+  fn commit_individually_with(
+    entries: &[(isize, Rect)],
+    reason: SurrogateBatchFallbackReason,
+    position: impl FnMut(isize, &Rect) -> bool,
+  ) -> SurrogateBatchResult {
+    let failed_hwnds =
+      Self::collect_individual_failures(entries, position);
+    SurrogateBatchResult {
+      atomic: false,
+      failed_hwnds,
+      fallback_reason: Some(reason),
+    }
+  }
+
+  fn collect_individual_failures(
+    entries: &[(isize, Rect)],
+    mut position: impl FnMut(isize, &Rect) -> bool,
+  ) -> Vec<isize> {
+    let mut failed = Vec::new();
+    for (hwnd, rect) in entries {
+      if !position(*hwnd, rect) {
+        failed.push(*hwnd);
       }
     }
+    failed
   }
 }
 
@@ -417,9 +487,9 @@ impl NativeSurrogate {
   ///
   /// When `initially_visible` is `false`, the surrogate window is created
   /// hidden; the caller must call [`set_visible`] to reveal it. Pass
-  /// `true` for surrogate types that must appear immediately (e.g.
-  /// resize sessions). Workspace-switch surrogates pass `false` to avoid
-  /// a one-frame flash before the caller explicitly shows the window.
+  /// `true` only for callers that already own a safe visible handoff.
+  /// Readiness-staged move/resize, open/close, and workspace-switch
+  /// surrogates pass `false` to avoid exposing an unready host.
   ///
   /// `border_inset` shrinks the surrogate from the physical rect to the
   /// logical (visible-content) rect, preventing the surrogate from
@@ -508,7 +578,7 @@ impl NativeSurrogate {
       }
     }
 
-    apply_backdrop(hwnd, surrogate_color);
+    let _ = apply_backdrop(hwnd, surrogate_color);
     apply_corner_preference(hwnd, corner_style);
 
     // Register the DWM thumbnail at `thumbnail_rect` dimensions. For
@@ -609,6 +679,15 @@ impl NativeSurrogate {
     }
   }
 
+  /// Changes the surrogate host backdrop without touching its thumbnail.
+  ///
+  /// Move/resize handoffs use this to keep the host transparent while its
+  /// DWM thumbnail becomes composition-ready, then enable resize gap fill
+  /// only after the real source window has been cloaked.
+  pub fn set_backdrop_color(&self, color: Option<&Color>) -> bool {
+    apply_backdrop(HWND(self.hwnd), color)
+  }
+
   /// Repositions the surrogate overlay to `rect` without touching the DWM
   /// thumbnail properties.
   ///
@@ -689,6 +768,12 @@ impl NativeSurrogate {
     }
   }
 
+  /// Returns the last opacity submitted for this thumbnail.
+  #[must_use]
+  pub fn window_opacity(&self) -> u8 {
+    self.last_opacity
+  }
+
   /// Updates the DWM thumbnail source and destination rects in a single
   /// call.
   ///
@@ -731,8 +816,11 @@ impl NativeSurrogate {
   /// round-trip, which is paid on every keypress during a key-held
   /// resize.
   ///
-  /// Falls back to a full [`reregister_thumbnail`] if the update fails
-  /// (e.g. the thumbnail handle has become stale). No-op when no
+  /// Falls back to a full [`reregister_thumbnail`] only when
+  /// `allow_reregistration` is true. Move/resize callers permit that only
+  /// while hidden before visual handoff; visible move/resize and all
+  /// open/close handoffs return failure so their owner can reveal the real
+  /// window without exposing an unregister/register gap. No-op when no
   /// thumbnail was registered.
   ///
   /// [`reregister_thumbnail`]: NativeSurrogate::reregister_thumbnail
@@ -897,5 +985,58 @@ mod tests {
     assert_ne!(flags.0 & SWP_NOACTIVATE.0, 0);
     assert_ne!(flags.0 & SWP_NOCOPYBITS.0, 0);
     assert_ne!(flags.0 & SWP_NOZORDER.0, 0);
+  }
+
+  #[test]
+  fn successful_fallback_reports_no_failed_handles() {
+    let entries = [
+      (11, Rect::from_xy(0, 0, 10, 10)),
+      (22, Rect::from_xy(10, 0, 10, 10)),
+    ];
+    let result = SurrogateBatch::commit_individually_with(
+      &entries,
+      SurrogateBatchFallbackReason::Begin,
+      |_, _| true,
+    );
+    assert!(!result.atomic);
+    assert_eq!(
+      result.fallback_reason,
+      Some(SurrogateBatchFallbackReason::Begin)
+    );
+    assert!(result.failed_hwnds.is_empty());
+  }
+
+  #[test]
+  fn partial_individual_fallback_reports_only_failed_hwnds() {
+    let entries = [
+      (11, Rect::from_xy(0, 0, 10, 10)),
+      (22, Rect::from_xy(10, 0, 10, 10)),
+      (33, Rect::from_xy(20, 0, 10, 10)),
+    ];
+    let result = SurrogateBatch::commit_individually_with(
+      &entries,
+      SurrogateBatchFallbackReason::Defer,
+      |hwnd, _| hwnd != 22,
+    );
+    assert_eq!(result.failed_hwnds, vec![22]);
+    assert_eq!(
+      result.fallback_reason,
+      Some(SurrogateBatchFallbackReason::Defer)
+    );
+  }
+
+  #[test]
+  fn end_transaction_failure_preserves_structured_reason() {
+    let entries = [(44, Rect::from_xy(0, 0, 10, 10))];
+    let result = SurrogateBatch::commit_individually_with(
+      &entries,
+      SurrogateBatchFallbackReason::End,
+      |_, _| false,
+    );
+    assert_eq!(result.failed_hwnds, vec![44]);
+    assert_eq!(
+      result.fallback_reason,
+      Some(SurrogateBatchFallbackReason::End)
+    );
   }
 }

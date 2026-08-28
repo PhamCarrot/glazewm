@@ -68,6 +68,89 @@ fn transition_opacity(
   (f32::from(opacity) * fraction.clamp(0.0, 1.0)).round() as u8
 }
 
+fn redirect_fade_opacity(start: u8, progress: f32) -> u8 {
+  (f32::from(start) * (1.0 - progress.clamp(0.0, 1.0))).round() as u8
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceSurrogateFrame {
+  source: RECT,
+  destination: Rect,
+}
+
+#[derive(Clone, Debug)]
+struct RedirectRevealFrame {
+  frame: WorkspaceSurrogateFrame,
+  opacity: u8,
+}
+
+fn translated_redirect_frame(
+  frame: &WorkspaceSurrogateFrame,
+  viewport: &Rect,
+  axis: SlideAxis,
+  offset: i32,
+) -> Option<WorkspaceSurrogateFrame> {
+  let mut moved = frame.destination.clone();
+  match axis {
+    SlideAxis::Horizontal => {
+      moved.left += offset;
+      moved.right += offset;
+    }
+    SlideAxis::Vertical => {
+      moved.top += offset;
+      moved.bottom += offset;
+    }
+  }
+
+  let clipped = Rect::from_ltrb(
+    moved.left.max(viewport.left),
+    moved.top.max(viewport.top),
+    moved.right.min(viewport.right),
+    moved.bottom.min(viewport.bottom),
+  );
+  if clipped.width() <= 0 || clipped.height() <= 0 {
+    return None;
+  }
+
+  let destination_width = moved.width();
+  let destination_height = moved.height();
+  let source_width = frame.source.right - frame.source.left;
+  let source_height = frame.source.bottom - frame.source.top;
+  if destination_width <= 0
+    || destination_height <= 0
+    || source_width <= 0
+    || source_height <= 0
+  {
+    return None;
+  }
+
+  let source_x_per_destination =
+    source_width as f32 / destination_width as f32;
+  let source_y_per_destination =
+    source_height as f32 / destination_height as f32;
+  let crop_left = clipped.left - moved.left;
+  let crop_top = clipped.top - moved.top;
+  let crop_right = moved.right - clipped.right;
+  let crop_bottom = moved.bottom - clipped.bottom;
+  let source = RECT {
+    left: frame.source.left
+      + (crop_left as f32 * source_x_per_destination).round() as i32,
+    top: frame.source.top
+      + (crop_top as f32 * source_y_per_destination).round() as i32,
+    right: frame.source.right
+      - (crop_right as f32 * source_x_per_destination).round() as i32,
+    bottom: frame.source.bottom
+      - (crop_bottom as f32 * source_y_per_destination).round() as i32,
+  };
+
+  (source.right > source.left && source.bottom > source.top).then_some(
+    WorkspaceSurrogateFrame {
+      source,
+      destination: clipped,
+    },
+  )
+}
+
 /// Positioning strategy for a [`WorkspaceSurrogate`].
 enum SurrogateMode {
   /// The surrogate spans the whole monitor viewport, created once and
@@ -144,9 +227,29 @@ pub struct WorkspaceSurrogate {
   /// "screen rect" applies there), and `None` whenever the visible
   /// strip is currently empty (fully off-screen, or zoomed to nothing).
   current_rect: Option<Rect>,
+  /// Thumbnail opacity captured when an incompatible rapid workspace
+  /// redirect begins fading this retained coverage over the synchronized
+  /// latest real workspace.
+  redirect_fade_opacity: Option<u8>,
+  /// Exact source/destination geometry most recently submitted to DWM.
+  /// This is captured once when a directional redirect begins so the
+  /// retained composition can continue from its current frame rather than
+  /// being recomputed from configured animation endpoints.
+  last_frame: Option<WorkspaceSurrogateFrame>,
+  /// Captured directional-reveal origin. `None` for a surrogate which was
+  /// already hidden when the incompatible redirect was admitted.
+  redirect_reveal_frame: Option<RedirectRevealFrame>,
+  /// Host visibility as last requested through this owner.
+  visible: bool,
 }
 
 impl WorkspaceSurrogate {
+  /// Returns the raw surrogate host HWND for batch-failure ownership.
+  #[must_use]
+  pub fn handle(&self) -> isize {
+    self.inner.hwnd().0
+  }
+
   /// Creates a hidden surrogate for a workspace-switch animation.
   ///
   /// `viewport` is the monitor rect; `rect` is the source window's screen
@@ -277,7 +380,99 @@ impl WorkspaceSurrogate {
       mode,
       border_inset,
       current_rect: None,
+      redirect_fade_opacity: None,
+      last_frame: None,
+      redirect_reveal_frame: None,
+      visible: false,
     })
+  }
+
+  /// Captures the current visual opacity as the start of a redirect fade.
+  pub fn begin_redirect_fade(&mut self) {
+    self.redirect_fade_opacity = Some(self.inner.window_opacity());
+  }
+
+  /// Fades retained rapid-switch coverage toward transparency.
+  ///
+  /// Returns `false` when the thumbnail update fails. The caller can then
+  /// drop this obsolete coverage because the latest real workspace is
+  /// already positioned and visible underneath it.
+  pub fn update_redirect_fade(&mut self, progress: f32) -> bool {
+    let start = self
+      .redirect_fade_opacity
+      .unwrap_or_else(|| self.inner.window_opacity());
+    let opacity = redirect_fade_opacity(start, progress);
+    self.inner.set_window_opacity(opacity)
+  }
+
+  /// Captures the exact currently submitted thumbnail frame and opacity
+  /// for an incompatible directional reveal.
+  ///
+  /// A hidden participant contributes no pixels and therefore needs no
+  /// frame. A visible host without recorded geometry is unsafe to move;
+  /// returning `false` lets the caller preserve the opacity-only native
+  /// fallback instead.
+  pub fn begin_redirect_reveal(&mut self) -> bool {
+    if !self.visible {
+      self.redirect_reveal_frame = None;
+      return true;
+    }
+
+    let Some(frame) = self.last_frame.clone() else {
+      return false;
+    };
+    self.redirect_reveal_frame = Some(RedirectRevealFrame {
+      frame,
+      opacity: self.inner.window_opacity(),
+    });
+    true
+  }
+
+  /// Translates the retained frame from its captured position while
+  /// fading it toward transparency.
+  ///
+  /// Geometry and opacity are updated without unregistering or
+  /// re-registering the visible thumbnail. Live/acrylic hosts are queued
+  /// into `batch`; pinned hosts remain fixed to the monitor viewport and
+  /// move only their DWM destination rectangle.
+  pub fn update_redirect_reveal(
+    &mut self,
+    axis: SlideAxis,
+    direction: i32,
+    distance: i32,
+    progress: f32,
+    batch: &mut SurrogateBatch,
+  ) -> bool {
+    let Some(snapshot) = self.redirect_reveal_frame.clone() else {
+      return true;
+    };
+    let progress = progress.clamp(0.0, 1.0);
+    let offset =
+      (-(direction.signum()) as f32 * distance.max(0) as f32 * progress)
+        .round() as i32;
+    let Some(frame) = translated_redirect_frame(
+      &snapshot.frame,
+      &self.viewport,
+      axis,
+      offset,
+    ) else {
+      self.inner.set_visible(false);
+      self.visible = false;
+      self.current_rect = None;
+      self.last_frame = None;
+      return true;
+    };
+
+    let geometry_ok = self.apply_visible_rect_checked(
+      Some(batch),
+      frame.source,
+      frame.destination.left,
+      frame.destination.top,
+      frame.destination.right,
+      frame.destination.bottom,
+    );
+    let opacity = redirect_fade_opacity(snapshot.opacity, progress);
+    geometry_ok && self.inner.set_window_opacity(opacity)
   }
 
   /// Live on-screen rect for the current animation frame, when in
@@ -293,6 +488,13 @@ impl WorkspaceSurrogate {
   #[must_use]
   pub fn is_live(&self) -> bool {
     matches!(self.mode, SurrogateMode::Live)
+  }
+
+  fn hide_frame(&mut self) {
+    self.inner.set_visible(false);
+    self.visible = false;
+    self.current_rect = None;
+    self.last_frame = None;
   }
 
   /// Hides the DWM thumbnail without destroying it or hiding the surrogate
@@ -486,8 +688,7 @@ impl WorkspaceSurrogate {
     let Some(destination) =
       zoom_rect(&self.rect, eased_progress, is_incoming)
     else {
-      self.inner.set_visible(false);
-      self.current_rect = None;
+      self.hide_frame();
       return;
     };
 
@@ -555,7 +756,23 @@ impl WorkspaceSurrogate {
     vis_right: i32,
     vis_bottom: i32,
   ) {
-    match self.mode {
+    let _ = self.apply_visible_rect_checked(
+      batch, rc_src, vis_left, vis_top, vis_right, vis_bottom,
+    );
+  }
+
+  fn apply_visible_rect_checked(
+    &mut self,
+    batch: Option<&mut SurrogateBatch>,
+    rc_src: RECT,
+    vis_left: i32,
+    vis_top: i32,
+    vis_right: i32,
+    vis_bottom: i32,
+  ) -> bool {
+    let destination =
+      Rect::from_ltrb(vis_left, vis_top, vis_right, vis_bottom);
+    let thumbnail_ok = match self.mode {
       SurrogateMode::PinnedViewport => {
         let rc_dst = RECT {
           left: vis_left - self.viewport.left,
@@ -563,7 +780,7 @@ impl WorkspaceSurrogate {
           right: vis_right - self.viewport.left,
           bottom: vis_bottom - self.viewport.top,
         };
-        self.inner.set_thumbnail_rects(rc_src, rc_dst);
+        self.inner.set_thumbnail_rects(rc_src, rc_dst)
       }
       SurrogateMode::Live => {
         let w = vis_right - vis_left;
@@ -574,20 +791,25 @@ impl WorkspaceSurrogate {
           right: w,
           bottom: h,
         };
-        self.inner.set_thumbnail_rects(rc_src, rc_dst);
+        let thumbnail_ok = self.inner.set_thumbnail_rects(rc_src, rc_dst);
 
-        let target =
-          Rect::from_ltrb(vis_left, vis_top, vis_right, vis_bottom);
         match batch {
-          Some(b) => self.inner.defer_reposition(b, &target),
+          Some(b) => self.inner.defer_reposition(b, &destination),
           None => {
-            let _ = self.inner.reposition(&target);
+            let _ = self.inner.reposition(&destination);
           }
         }
-        self.current_rect = Some(target);
+        self.current_rect = Some(destination.clone());
+        thumbnail_ok
       }
-    }
+    };
+    self.last_frame = Some(WorkspaceSurrogateFrame {
+      source: rc_src,
+      destination,
+    });
     self.inner.set_visible(true);
+    self.visible = true;
+    thumbnail_ok
   }
 
   /// Shared implementation for [`update_slide_zoom`].
@@ -623,8 +845,7 @@ impl WorkspaceSurrogate {
     let scale = 1.0 - zoom_factor * zoom_t;
 
     if scale <= 0.0 {
-      self.inner.set_visible(false);
-      self.current_rect = None;
+      self.hide_frame();
       return;
     }
 
@@ -671,8 +892,7 @@ impl WorkspaceSurrogate {
     let vis_bottom = final_bottom.min(monitor_bottom);
 
     if vis_left >= vis_right || vis_top >= vis_bottom {
-      self.inner.set_visible(false);
-      self.current_rect = None;
+      self.hide_frame();
       return;
     }
 
@@ -761,8 +981,7 @@ impl WorkspaceSurrogate {
     let vis_end = (current + axis_size).min(monitor_end);
 
     if vis_start >= vis_end {
-      self.inner.set_visible(false);
-      self.current_rect = None;
+      self.hide_frame();
       return;
     }
 
@@ -867,5 +1086,134 @@ mod tests {
     assert_eq!(transition_opacity(200, 0.25, 1.0, true), 200);
     assert_eq!(transition_opacity(200, 0.25, 0.0, false), 200);
     assert_eq!(transition_opacity(200, 0.25, 1.0, false), 50);
+  }
+
+  #[test]
+  fn redirect_fade_opacity_is_bounded_and_reaches_transparency() {
+    assert_eq!(redirect_fade_opacity(200, -1.0), 200);
+    assert_eq!(redirect_fade_opacity(200, 0.5), 100);
+    assert_eq!(redirect_fade_opacity(200, 1.0), 0);
+    assert_eq!(redirect_fade_opacity(200, 2.0), 0);
+  }
+
+  fn test_redirect_frame(rect: Rect) -> WorkspaceSurrogateFrame {
+    WorkspaceSurrogateFrame {
+      source: RECT {
+        left: 0,
+        top: 0,
+        right: rect.width(),
+        bottom: rect.height(),
+      },
+      destination: rect,
+    }
+  }
+
+  #[test]
+  fn redirect_reveal_first_frame_is_exactly_the_last_submitted_frame() {
+    let viewport = Rect::from_xy(0, 0, 1_000, 800);
+    let original = test_redirect_frame(Rect::from_xy(100, 200, 400, 300));
+    let translated = translated_redirect_frame(
+      &original,
+      &viewport,
+      SlideAxis::Horizontal,
+      0,
+    )
+    .unwrap();
+
+    assert_eq!(translated.destination, original.destination);
+    assert_eq!(translated.source.left, original.source.left);
+    assert_eq!(translated.source.top, original.source.top);
+    assert_eq!(translated.source.right, original.source.right);
+    assert_eq!(translated.source.bottom, original.source.bottom);
+  }
+
+  #[test]
+  fn redirects_at_50_100_and_200_ms_never_reset_to_configured_endpoints() {
+    let viewport = Rect::from_xy(0, 0, 1_920, 1_080);
+    let configured_start = 500;
+    let configured_end = 100;
+
+    for elapsed_ms in [50_i32, 100, 200] {
+      let progress = elapsed_ms as f32 / 360.0;
+      let current_left = (configured_start as f32
+        + (configured_end - configured_start) as f32 * progress)
+        .round() as i32;
+      let captured =
+        test_redirect_frame(Rect::from_xy(current_left, 100, 400, 600));
+      let first_reveal = translated_redirect_frame(
+        &captured,
+        &viewport,
+        SlideAxis::Horizontal,
+        0,
+      )
+      .unwrap();
+
+      assert_eq!(first_reveal.destination, captured.destination);
+      assert_ne!(first_reveal.destination.left, configured_start);
+      assert_ne!(first_reveal.destination.left, configured_end);
+    }
+  }
+
+  #[test]
+  fn redirect_reveal_applies_one_common_monotonic_translation() {
+    let viewport = Rect::from_xy(0, 0, 1_000, 800);
+    let first = test_redirect_frame(Rect::from_xy(300, 100, 200, 200));
+    let second = test_redirect_frame(Rect::from_xy(550, 100, 200, 200));
+    let offsets = [0, -40, -80, -120];
+    let mut previous_left = first.destination.left;
+
+    for offset in offsets {
+      let moved_first = translated_redirect_frame(
+        &first,
+        &viewport,
+        SlideAxis::Horizontal,
+        offset,
+      )
+      .unwrap();
+      let moved_second = translated_redirect_frame(
+        &second,
+        &viewport,
+        SlideAxis::Horizontal,
+        offset,
+      )
+      .unwrap();
+      assert_eq!(
+        moved_first.destination.left - first.destination.left,
+        moved_second.destination.left - second.destination.left
+      );
+      assert!(moved_first.destination.left <= previous_left);
+      previous_left = moved_first.destination.left;
+    }
+  }
+
+  #[test]
+  fn redirect_reveal_clips_from_the_captured_source_without_endpoint_reset(
+  ) {
+    let viewport = Rect::from_xy(0, 0, 1_000, 800);
+    let original = test_redirect_frame(Rect::from_xy(100, 200, 400, 300));
+    let translated = translated_redirect_frame(
+      &original,
+      &viewport,
+      SlideAxis::Horizontal,
+      -200,
+    )
+    .unwrap();
+
+    assert_eq!(translated.destination, Rect::from_xy(0, 200, 300, 300));
+    assert_eq!(translated.source.left, 100);
+    assert_eq!(translated.source.right, 400);
+    assert_eq!(translated.source.top, 0);
+    assert_eq!(translated.source.bottom, 300);
+  }
+
+  #[test]
+  fn redirect_reveal_opacity_never_increases() {
+    let values: Vec<u8> = [0.0, 0.1, 0.35, 0.7, 1.0]
+      .into_iter()
+      .map(|progress| redirect_fade_opacity(213, progress))
+      .collect();
+    assert!(values.windows(2).all(|pair| pair[1] <= pair[0]));
+    assert_eq!(values[0], 213);
+    assert_eq!(values.last(), Some(&0));
   }
 }

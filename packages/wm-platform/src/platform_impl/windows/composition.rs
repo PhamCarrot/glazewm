@@ -32,8 +32,10 @@
 
 use std::{
   cell::RefCell,
-  sync::{mpsc, OnceLock},
-  time::Duration,
+  sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc, Arc, Mutex, MutexGuard, OnceLock,
+  },
 };
 
 use windows::{
@@ -47,7 +49,7 @@ use windows::{
     DispatcherQueue, DispatcherQueueController, DispatcherQueueHandler,
   },
   Win32::{
-    Foundation::{E_INVALIDARG, HWND},
+    Foundation::{E_FAIL, E_INVALIDARG, HWND},
     System::WinRT::{
       Composition::ICompositorDesktopInterop,
       Graphics::Direct2D::{
@@ -69,6 +71,27 @@ use windows::{
 };
 
 use crate::{BlurOverlayParams, Rect};
+
+static COMPOSITION_READY: tokio::sync::Notify =
+  tokio::sync::Notify::const_new();
+
+pub(crate) const MAX_PENDING_COMPOSITION_OVERLAYS: usize = 128;
+
+pub(crate) fn composition_admission_available(
+  pending_count: usize,
+) -> bool {
+  pending_count < MAX_PENDING_COMPOSITION_OVERLAYS
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+  mutex
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(crate) async fn wait_for_composition_ready() {
+  COMPOSITION_READY.notified().await;
+}
 
 /// `CLSID_D2D1GaussianBlur`, the built-in D2D1 Gaussian-blur effect.
 const CLSID_D2D1_GAUSSIAN_BLUR: GUID =
@@ -241,16 +264,57 @@ struct CompositionThread {
   /// composition object's async completions (see the module docs).
   _controller: DispatcherQueueController,
   queue: DispatcherQueue,
-  compositor: Compositor,
+}
+
+static COMPOSITION_THREAD: OnceLock<Option<CompositionThread>> =
+  OnceLock::new();
+static COMPOSITION_WARMUP_QUEUED: AtomicBool = AtomicBool::new(false);
+
+enum ActorCompositorState {
+  Uninitialized,
+  Ready(Compositor),
+  Failed,
+}
+
+thread_local! {
+  static ACTOR_COMPOSITOR: RefCell<ActorCompositorState> =
+    const { RefCell::new(ActorCompositorState::Uninitialized) };
+}
+
+fn actor_compositor() -> windows::core::Result<Compositor> {
+  ACTOR_COMPOSITOR.with(|state| {
+    let mut state = state.borrow_mut();
+    match &*state {
+      ActorCompositorState::Ready(compositor) => Ok(compositor.clone()),
+      ActorCompositorState::Failed => Err(windows::core::Error::new(
+        E_FAIL,
+        "Composition actor initialization previously failed.".into(),
+      )),
+      ActorCompositorState::Uninitialized => match Compositor::new() {
+        Ok(compositor) => {
+          *state = ActorCompositorState::Ready(compositor.clone());
+          Ok(compositor)
+        }
+        Err(error) => {
+          *state = ActorCompositorState::Failed;
+          Err(error)
+        }
+      },
+    }
+  })
+}
+
+fn warm_composition_actor() -> windows::core::Result<()> {
+  let compositor = actor_compositor()?;
+  let backdrop = compositor.CreateHostBackdropBrush()?;
+  let _ = build_effect_brush(&compositor, &backdrop, 30.0, 1.0)?;
+  Ok(())
 }
 
 /// Lazily initializes the composition thread on first use, caching failure
 /// too (as `None`) so later overlay creations don't retry an unavailable
 /// pipeline on every call. Falls back to the SWCA path on failure.
 fn composition_thread() -> Option<&'static CompositionThread> {
-  static COMPOSITION_THREAD: OnceLock<Option<CompositionThread>> =
-    OnceLock::new();
-
   COMPOSITION_THREAD
     .get_or_init(|| match init_composition_thread() {
       Ok(thread) => Some(thread),
@@ -265,45 +329,95 @@ fn composition_thread() -> Option<&'static CompositionThread> {
     .as_ref()
 }
 
-fn init_composition_thread() -> crate::Result<CompositionThread> {
-  let controller = DispatcherQueueController::CreateOnDedicatedThread()?;
-  let queue = controller.DispatcherQueue()?;
-  let compositor = run_on_composition_thread(&queue, Compositor::new)?;
-
-  Ok(CompositionThread {
-    _controller: controller,
-    queue,
-    compositor,
-  })
+/// Starts the composition actor and queues an optional warmup before the
+/// WM accepts native or IPC events. It never waits for `Compositor::new`.
+pub(crate) fn initialize_composition_actor() -> bool {
+  let Some(thread) = composition_thread() else {
+    return false;
+  };
+  if COMPOSITION_WARMUP_QUEUED
+    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+    .is_ok()
+  {
+    let handler = DispatcherQueueHandler::new(move || {
+      if let Err(error) = warm_composition_actor() {
+        tracing::warn!(
+          "Composition actor warmup failed; retaining SWCA acrylic: {error}."
+        );
+      }
+      Ok(())
+    });
+    match thread.queue.TryEnqueue(&handler) {
+      Ok(true) => {}
+      Ok(false) => {
+        COMPOSITION_WARMUP_QUEUED.store(false, Ordering::Release);
+        tracing::warn!(
+          "Composition actor rejected warmup; retaining SWCA acrylic."
+        );
+      }
+      Err(error) => {
+        COMPOSITION_WARMUP_QUEUED.store(false, Ordering::Release);
+        tracing::warn!(
+          "Composition actor warmup queue failed; retaining SWCA acrylic: \
+           {error}."
+        );
+      }
+    }
+  }
+  true
 }
 
-/// Runs `f` on the composition thread via its dispatcher queue and blocks
-/// the calling thread for the result. Used for the one-time,
-/// async-sensitive construction calls (`Compositor::new`, and per-overlay
-/// visual-tree building, which touches the effect factory) -- see the
-/// module docs for why these specifically must run there.
-fn run_on_composition_thread<T, F>(
-  queue: &DispatcherQueue,
-  f: F,
-) -> crate::Result<T>
-where
-  T: Send + 'static,
-  F: FnOnce() -> windows::core::Result<T> + Send + 'static,
-{
-  let (tx, rx) = mpsc::channel();
-  let mut slot = Some(f);
-
+/// Queues one per-overlay visual-tree build without waiting on the caller.
+/// The actor owns the expensive effect-factory work; the returned receiver
+/// is polled by the WM on a normal readiness wakeup.
+pub(crate) fn queue_blur_visual(
+  hwnd: HWND,
+  rect: Rect,
+  params: BlurOverlayParams,
+) -> crate::Result<mpsc::Receiver<windows::core::Result<BlurVisual>>> {
+  let thread = COMPOSITION_THREAD
+    .get()
+    .and_then(Option::as_ref)
+    .ok_or_else(|| {
+      crate::Error::Platform(
+        "Composition actor was not initialized before event admission."
+          .to_string(),
+      )
+    })?;
+  let queue = thread.queue.clone();
+  let actor_queue = queue.clone();
+  let hwnd_raw = hwnd.0;
+  let (sender, receiver) = mpsc::sync_channel(1);
+  let mut work = Some(move || {
+    let result = actor_compositor().and_then(|compositor| {
+      build_visual_tree(
+        &compositor,
+        &actor_queue,
+        HWND(hwnd_raw),
+        &rect,
+        params,
+      )
+    });
+    let _ = sender.send(result);
+    COMPOSITION_READY.notify_one();
+  });
   let handler = DispatcherQueueHandler::new(move || {
-    if let Some(f) = slot.take() {
-      let _ = tx.send(f());
+    if let Some(work) = work.take() {
+      work();
     }
     Ok(())
   });
+  ensure_composition_work_queued(thread.queue.TryEnqueue(&handler)?)?;
+  Ok(receiver)
+}
 
-  ensure_composition_work_queued(queue.TryEnqueue(&handler)?)?;
-
-  let result = rx.recv_timeout(Duration::from_secs(5))?;
-  Ok(result?)
+fn init_composition_thread() -> crate::Result<CompositionThread> {
+  let controller = DispatcherQueueController::CreateOnDedicatedThread()?;
+  let queue = controller.DispatcherQueue()?;
+  Ok(CompositionThread {
+    _controller: controller,
+    queue,
+  })
 }
 
 fn ensure_composition_work_queued(queued: bool) -> crate::Result<()> {
@@ -349,7 +463,6 @@ pub(crate) struct BlurVisual {
   blur_sprite: SpriteVisual,
   tint_sprite: SpriteVisual,
 
-  effect_brush: CompositionEffectBrush,
   tint_brush: CompositionColorBrush,
   rounded_geometry: CompositionRoundedRectangleGeometry,
 
@@ -358,35 +471,156 @@ pub(crate) struct BlurVisual {
   blur_amount: f32,
   /// Current saturation. See `blur_amount`.
   saturation: f32,
+  effect_updates: Arc<EffectUpdateSlot>,
+}
+
+#[derive(Clone, Copy)]
+struct EffectUpdateRequest {
+  generation: u64,
+  blur_amount: f32,
+  saturation: f32,
+}
+
+struct EffectUpdateSlot {
+  latest: Mutex<EffectUpdateRequest>,
+  next_generation: AtomicU64,
+  queued: AtomicBool,
+  alive: AtomicBool,
+  failure_count: AtomicU64,
+}
+
+impl EffectUpdateSlot {
+  fn new(blur_amount: f32, saturation: f32) -> Self {
+    Self {
+      latest: Mutex::new(EffectUpdateRequest {
+        generation: 0,
+        blur_amount,
+        saturation,
+      }),
+      next_generation: AtomicU64::new(1),
+      queued: AtomicBool::new(false),
+      alive: AtomicBool::new(true),
+      failure_count: AtomicU64::new(0),
+    }
+  }
+
+  fn rate_limited_failure(&self) -> Option<u64> {
+    let previous = self
+      .failure_count
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_add(1)
+      })
+      .ok()?;
+    let occurrence = previous + 1;
+    (occurrence == 1 || occurrence.is_multiple_of(64))
+      .then_some(occurrence)
+  }
+
+  fn publish(&self, blur_amount: f32, saturation: f32) -> bool {
+    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+    *lock_unpoisoned(&self.latest) = EffectUpdateRequest {
+      generation,
+      blur_amount,
+      saturation,
+    };
+    self
+      .queued
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .is_ok()
+  }
+}
+
+fn enqueue_effect_rebuild(
+  queue: &DispatcherQueue,
+  compositor: &Compositor,
+  host_backdrop: &CompositionBackdropBrush,
+  blur_sprite: &SpriteVisual,
+  updates: &Arc<EffectUpdateSlot>,
+) -> crate::Result<()> {
+  let queued_updates = Arc::clone(&updates);
+  let queued_queue = queue.clone();
+  let queued_compositor = compositor.clone();
+  let queued_backdrop = host_backdrop.clone();
+  let queued_sprite = blur_sprite.clone();
+  let handler = DispatcherQueueHandler::new(move || {
+    let request = *lock_unpoisoned(&queued_updates.latest);
+
+    if queued_updates.alive.load(Ordering::Acquire) {
+      match build_effect_brush(
+        &queued_compositor,
+        &queued_backdrop,
+        request.blur_amount,
+        request.saturation,
+      ) {
+        Ok(brush) => {
+          let still_latest = lock_unpoisoned(&queued_updates.latest)
+            .generation
+            == request.generation;
+          if still_latest && queued_updates.alive.load(Ordering::Acquire) {
+            if let Err(error) = queued_sprite.SetBrush(&brush) {
+              if let Some(failure_count) =
+                queued_updates.rate_limited_failure()
+              {
+                tracing::warn!(
+                  failure_count,
+                  error = %error,
+                  "Asynchronous composition effect handoff failed; repeated \
+                   failures are rate-limited."
+                );
+              }
+            }
+          }
+        }
+        Err(error) => {
+          if let Some(failure_count) =
+            queued_updates.rate_limited_failure()
+          {
+            tracing::warn!(
+              failure_count,
+              error = %error,
+              "Asynchronous composition effect rebuild failed; repeated \
+               failures are rate-limited."
+            );
+          }
+        }
+      }
+    }
+
+    queued_updates.queued.store(false, Ordering::Release);
+    let newer_request = lock_unpoisoned(&queued_updates.latest).generation
+      != request.generation;
+    if newer_request
+      && queued_updates.alive.load(Ordering::Acquire)
+      && queued_updates
+        .queued
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+      if let Err(error) = enqueue_effect_rebuild(
+        &queued_queue,
+        &queued_compositor,
+        &queued_backdrop,
+        &queued_sprite,
+        &queued_updates,
+      ) {
+        queued_updates.queued.store(false, Ordering::Release);
+        if let Some(failure_count) = queued_updates.rate_limited_failure()
+        {
+          tracing::warn!(
+            failure_count,
+            error = %error,
+            "Composition actor rejected the latest effect update; repeated \
+             failures are rate-limited."
+          );
+        }
+      }
+    }
+    Ok(())
+  });
+  ensure_composition_work_queued(queue.TryEnqueue(&handler)?)
 }
 
 impl BlurVisual {
-  /// Builds a new visual tree for `hwnd`, sized to `rect`, and roots it.
-  ///
-  /// Runs on the dedicated composition thread (see the module docs); the
-  /// returned `BlurVisual`'s composition objects are agile and can be
-  /// mutated from any thread afterwards.
-  pub(crate) fn create(
-    hwnd: HWND,
-    rect: &Rect,
-    params: BlurOverlayParams,
-  ) -> crate::Result<Self> {
-    let thread = composition_thread().ok_or_else(|| {
-      crate::Error::Platform(
-        "Composition pipeline unavailable.".to_string(),
-      )
-    })?;
-
-    let compositor = thread.compositor.clone();
-    let queue = thread.queue.clone();
-    let hwnd_raw = hwnd.0;
-    let rect = rect.clone();
-
-    run_on_composition_thread(&thread.queue, move || {
-      build_visual_tree(&compositor, &queue, HWND(hwnd_raw), &rect, params)
-    })
-  }
-
   /// Resizes the visual tree's clip and both child visuals to match
   /// `rect`. Does not reposition the `HWND` itself -- callers still
   /// issue their own `SetWindowPos`, exactly as with the SWCA path.
@@ -438,19 +672,12 @@ impl BlurVisual {
     &mut self,
     value: f32,
   ) -> crate::Result<()> {
-    let compositor = self.compositor.clone();
-    let host_backdrop = self.host_backdrop.clone();
-    let saturation = self.saturation;
-
-    let effect_brush =
-      run_on_composition_thread(&self.queue, move || {
-        build_effect_brush(&compositor, &host_backdrop, value, saturation)
-      })?;
-
-    self.blur_sprite.SetBrush(&effect_brush)?;
-    self.effect_brush = effect_brush;
+    #[allow(clippy::float_cmp)]
+    if self.blur_amount == value {
+      return Ok(());
+    }
     self.blur_amount = value;
-    Ok(())
+    self.queue_effect_rebuild()
   }
 
   /// Updates the live saturation by rebuilding the effect brush. Same
@@ -463,19 +690,12 @@ impl BlurVisual {
     &mut self,
     value: f32,
   ) -> crate::Result<()> {
-    let compositor = self.compositor.clone();
-    let host_backdrop = self.host_backdrop.clone();
-    let blur_amount = self.blur_amount;
-
-    let effect_brush =
-      run_on_composition_thread(&self.queue, move || {
-        build_effect_brush(&compositor, &host_backdrop, blur_amount, value)
-      })?;
-
-    self.blur_sprite.SetBrush(&effect_brush)?;
-    self.effect_brush = effect_brush;
+    #[allow(clippy::float_cmp)]
+    if self.saturation == value {
+      return Ok(());
+    }
     self.saturation = value;
-    Ok(())
+    self.queue_effect_rebuild()
   }
 
   /// Updates the clip's corner radius.
@@ -494,6 +714,32 @@ impl BlurVisual {
   pub(crate) fn set_opacity(&self, value: f32) -> crate::Result<()> {
     self.root.SetOpacity(value)?;
     Ok(())
+  }
+
+  fn queue_effect_rebuild(&self) -> crate::Result<()> {
+    if !self
+      .effect_updates
+      .publish(self.blur_amount, self.saturation)
+    {
+      return Ok(());
+    }
+    if let Err(error) = enqueue_effect_rebuild(
+      &self.queue,
+      &self.compositor,
+      &self.host_backdrop,
+      &self.blur_sprite,
+      &self.effect_updates,
+    ) {
+      self.effect_updates.queued.store(false, Ordering::Release);
+      return Err(error);
+    }
+    Ok(())
+  }
+}
+
+impl Drop for BlurVisual {
+  fn drop(&mut self) {
+    self.effect_updates.alive.store(false, Ordering::Release);
   }
 }
 
@@ -644,21 +890,143 @@ fn build_visual_tree(
     root,
     blur_sprite,
     tint_sprite,
-    effect_brush,
     tint_brush,
     rounded_geometry,
     blur_amount: params.blur_amount,
     saturation: params.saturation,
+    effect_updates: Arc::new(EffectUpdateSlot::new(
+      params.blur_amount,
+      params.saturation,
+    )),
   })
 }
 
 #[cfg(test)]
 mod tests {
-  use super::ensure_composition_work_queued;
+  use std::{
+    sync::{atomic::Ordering, mpsc},
+    time::{Duration, Instant},
+  };
+
+  use windows::{System::DispatcherQueueHandler, Win32::Foundation::HWND};
+
+  use super::{
+    composition_admission_available, composition_thread,
+    ensure_composition_work_queued, initialize_composition_actor,
+    queue_blur_visual, EffectUpdateSlot, MAX_PENDING_COMPOSITION_OVERLAYS,
+  };
+  use crate::{BlurOverlayParams, Rect};
+
+  #[test]
+  fn repeated_effect_failures_emit_bounded_diagnostics() {
+    let slot = EffectUpdateSlot::new(30.0, 1.0);
+    let emitted: Vec<_> = (1..=130)
+      .filter_map(|_| slot.rate_limited_failure())
+      .collect();
+    assert_eq!(emitted, vec![1, 64, 128]);
+  }
+
+  #[test]
+  fn composition_admission_is_strictly_bounded() {
+    assert!(composition_admission_available(0));
+    assert!(composition_admission_available(
+      MAX_PENDING_COMPOSITION_OVERLAYS - 1
+    ));
+    assert!(!composition_admission_available(
+      MAX_PENDING_COMPOSITION_OVERLAYS
+    ));
+    assert!(!composition_admission_available(usize::MAX));
+  }
 
   #[test]
   fn rejected_composition_work_fails_without_waiting() {
     assert!(ensure_composition_work_queued(false).is_err());
     assert!(ensure_composition_work_queued(true).is_ok());
+  }
+
+  #[test]
+  fn effect_updates_keep_one_queued_wake_and_latest_generation() {
+    let updates = EffectUpdateSlot::new(1.0, 1.0);
+    let mut queue_wakes = 0;
+    for index in 0_u16..10_000 {
+      queue_wakes += usize::from(updates.publish(f32::from(index), 2.0));
+    }
+
+    let latest = *super::lock_unpoisoned(&updates.latest);
+    assert_eq!(queue_wakes, 1);
+    assert_eq!(latest.generation, 10_000);
+    assert_eq!(latest.blur_amount, 9_999.0);
+    assert_eq!(latest.saturation, 2.0);
+    assert!(updates.queued.load(Ordering::Acquire));
+  }
+
+  #[test]
+  fn completed_generation_allows_exactly_one_new_actor_wake() {
+    let updates = EffectUpdateSlot::new(1.0, 1.0);
+    assert!(updates.publish(2.0, 1.0));
+    assert!(!updates.publish(3.0, 1.0));
+    updates.queued.store(false, Ordering::Release);
+    assert!(updates.publish(4.0, 1.0));
+    assert!(!updates.publish(5.0, 1.0));
+  }
+
+  #[test]
+  fn overlay_setup_queue_does_not_wait_for_a_busy_actor() {
+    let thread = composition_thread()
+      .expect("composition actor should initialize on supported Windows");
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let mut work = Some(move || {
+      let _ = entered_tx.send(());
+      let _ = release_rx.recv_timeout(Duration::from_secs(2));
+    });
+    let blocker = DispatcherQueueHandler::new(move || {
+      if let Some(work) = work.take() {
+        work();
+      }
+      Ok(())
+    });
+    assert!(thread
+      .queue
+      .TryEnqueue(&blocker)
+      .expect("composition actor should accept the test blocker"));
+    entered_rx
+      .recv_timeout(Duration::from_secs(2))
+      .expect("composition actor should begin the test blocker");
+
+    let initialization_started = Instant::now();
+    assert!(initialize_composition_actor());
+    let initialization_elapsed = initialization_started.elapsed();
+    let started = Instant::now();
+    let receiver = queue_blur_visual(
+      HWND::default(),
+      Rect::from_xy(0, 0, 100, 100),
+      BlurOverlayParams {
+        tint: 0,
+        blur_amount: 20.0,
+        corner_radius: 8.0,
+        opacity: 1.0,
+        saturation: 1.0,
+      },
+    )
+    .expect("busy actor should still accept bounded overlay work");
+    let queue_elapsed = started.elapsed();
+    let _ = release_tx.send(());
+
+    assert!(
+      initialization_elapsed < Duration::from_millis(50),
+      "actor warmup blocked its caller for {initialization_elapsed:?}"
+    );
+    assert!(
+      queue_elapsed < Duration::from_millis(50),
+      "overlay setup blocked on the actor for {queue_elapsed:?}"
+    );
+    assert!(
+      receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("queued invalid-HWND build should finish")
+        .is_err(),
+      "an invalid HWND must fail instead of creating a visual"
+    );
   }
 }

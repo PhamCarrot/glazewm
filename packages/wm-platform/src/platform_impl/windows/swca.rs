@@ -8,6 +8,9 @@ use windows::{
   },
 };
 
+/// Accent state: disabled, restoring the destination's transparent glass.
+pub(crate) const ACCENT_DISABLED: u32 = 0;
+
 /// Accent state: solid-color fill, used for surrogate backdrops.
 pub(crate) const ACCENT_ENABLE_GRADIENT: u32 = 1;
 

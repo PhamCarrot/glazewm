@@ -7,9 +7,12 @@ mod dispatcher;
 mod display;
 mod error;
 mod event_loop;
+mod ipc_peer;
 mod keybinding_listener;
 mod models;
 mod mouse_listener;
+#[cfg(target_os = "windows")]
+mod native_blur_overlay;
 #[cfg(target_os = "windows")]
 mod native_surrogate;
 mod native_window;
@@ -22,9 +25,12 @@ pub use dispatcher::*;
 pub use display::*;
 pub use error::*;
 pub use event_loop::*;
+pub use ipc_peer::*;
 pub use keybinding_listener::*;
 pub use models::*;
 pub use mouse_listener::*;
+#[cfg(target_os = "windows")]
+pub use native_surrogate::*;
 pub use native_window::*;
 pub use platform_event::*;
 pub use thread_bound::*;

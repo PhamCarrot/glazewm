@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::LengthValue;
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RectDelta {
   /// The delta in x-coordinates on the left of the rectangle.
   pub left: LengthValue,

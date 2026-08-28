@@ -7,6 +7,7 @@ mod display;
 mod display_listener;
 mod error;
 mod event_loop;
+mod ipc_peer;
 mod keybinding_listener;
 mod models;
 mod mouse_listener;
@@ -25,6 +26,7 @@ pub use display::*;
 pub use display_listener::*;
 pub use error::*;
 pub use event_loop::*;
+pub use ipc_peer::*;
 pub use keybinding_listener::*;
 pub use models::*;
 pub use mouse_listener::*;
@@ -32,11 +34,18 @@ pub use native_window::*;
 #[cfg(target_os = "windows")]
 mod native_blur_overlay;
 #[cfg(target_os = "windows")]
-pub use native_blur_overlay::NativeBlurOverlay;
+pub use native_blur_overlay::{
+  initialize_blur_overlay_composition_actor,
+  reap_orphaned_blur_overlay_composition,
+  wait_for_blur_overlay_composition, NativeBlurOverlay,
+};
 #[cfg(target_os = "windows")]
 mod native_surrogate;
 #[cfg(target_os = "windows")]
-pub use native_surrogate::{NativeSurrogate, SurrogateBatch};
+pub use native_surrogate::{
+  NativeSurrogate, SurrogateBatch, SurrogateBatchFallbackReason,
+  SurrogateBatchResult,
+};
 #[cfg(target_os = "windows")]
 mod resize_session;
 #[cfg(target_os = "windows")]

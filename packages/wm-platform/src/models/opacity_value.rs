@@ -6,6 +6,20 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct OpacityValue(pub f32);
 
 impl OpacityValue {
+  /// Constructs an opacity from a normalized finite value.
+  ///
+  /// This is the validation boundary shared by command parsing and config
+  /// deserialization. Invalid values must never reach a native alpha
+  /// update, where they could otherwise make a real window unexpectedly
+  /// transparent.
+  pub fn try_new(value: f32) -> Result<Self, crate::ParseError> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+      Ok(Self(value))
+    } else {
+      Err(crate::ParseError::Opacity(value.to_string()))
+    }
+  }
+
   #[must_use]
   pub fn to_alpha(&self) -> u8 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -59,17 +73,18 @@ impl FromStr for OpacityValue {
   fn from_str(unparsed: &str) -> Result<Self, crate::ParseError> {
     let unparsed = unparsed.trim();
 
-    if unparsed.ends_with('%') {
-      let percentage = unparsed
-        .trim_end_matches('%')
+    if let Some(raw_percentage) = unparsed.strip_suffix('%') {
+      let percentage = raw_percentage
         .parse::<f32>()
         .map_err(|_| crate::ParseError::Opacity(unparsed.to_string()))?;
 
-      Ok(Self(percentage / 100.0))
+      Self::try_new(percentage / 100.0)
+        .map_err(|_| crate::ParseError::Opacity(unparsed.to_string()))
     } else {
-      unparsed
+      let value = unparsed
         .parse::<f32>()
-        .map(Self)
+        .map_err(|_| crate::ParseError::Opacity(unparsed.to_string()))?;
+      Self::try_new(value)
         .map_err(|_| crate::ParseError::Opacity(unparsed.to_string()))
     }
   }
@@ -89,10 +104,38 @@ impl<'de> Deserialize<'de> for OpacityValue {
     }
 
     match OpacityValueDe::deserialize(deserializer)? {
-      OpacityValueDe::Number(num) => Ok(Self(num)),
+      OpacityValueDe::Number(num) => {
+        Self::try_new(num).map_err(serde::de::Error::custom)
+      }
       OpacityValueDe::String(str) => {
         Self::from_str(&str).map_err(serde::de::Error::custom)
       }
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn normalized_opacity_boundaries_are_accepted() {
+    assert_eq!(OpacityValue::try_new(0.0).unwrap(), OpacityValue(0.0));
+    assert_eq!(OpacityValue::try_new(1.0).unwrap(), OpacityValue(1.0));
+    assert_eq!(OpacityValue::from_str("0%").unwrap(), OpacityValue(0.0));
+    assert_eq!(OpacityValue::from_str("100%").unwrap(), OpacityValue(1.0));
+  }
+
+  #[test]
+  fn invalid_normalized_opacity_is_rejected() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+      assert!(OpacityValue::try_new(value).is_err(), "accepted {value}");
+    }
+
+    for value in
+      ["NaN", "inf", "-inf", "-0.1", "1.1", "-1%", "101%", "75%%"]
+    {
+      assert!(OpacityValue::from_str(value).is_err(), "accepted {value}");
     }
   }
 }
